@@ -543,6 +543,91 @@ async function main() {
     await deniedPage.waitForSelector('#info-modal:not([hidden])');
     await deniedContext.close();
 
+    // 19. iPhone Safari simulation: auto Share Sheet on shutter, NotAllowedError fallback to Preview Modal & iOS guidance
+    console.log('[e2e] checking iPhone Safari auto Share Sheet & manual save fallback flow');
+    const iosContext = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+      userAgent:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1',
+      permissions: ['camera'],
+    });
+    const iosPage = await iosContext.newPage();
+    iosPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(`[ios] ${msg.text()}`);
+    });
+    iosPage.on('pageerror', (err) => {
+      pageErrors.push(`[ios] ${err.message}`);
+    });
+    await iosPage.addInitScript(() => {
+      // Simulate legacy v1.1.0 persisted iOS setting (autoSave: false without autoSaveExplicit)
+      localStorage.setItem(
+        'qcam_settings_v1',
+        JSON.stringify({ aspectRatio: '4:3', autoSave: false, mode: 'standard' })
+      );
+      window.__SHARE_CALLS__ = [];
+      window.__SHARE_MODE__ = 'resolve';
+      navigator.canShare = (data) => Array.isArray(data?.files) && data.files.length === 1;
+      navigator.share = async (data) => {
+        const file = data?.files?.[0];
+        window.__SHARE_CALLS__.push({
+          keys: Object.keys(data || {}),
+          fileName: file?.name || '',
+          fileType: file?.type || '',
+          mode: window.__SHARE_MODE__,
+        });
+        if (window.__SHARE_MODE__ === 'expire') {
+          throw new DOMException('Transient activation expired', 'NotAllowedError');
+        }
+      };
+    });
+
+    await iosPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await iosPage.waitForFunction(() => {
+      const v = document.getElementById('camera-video');
+      return v && v.videoWidth > 0 && v.videoHeight > 0;
+    }, { timeout: 6000 });
+
+    // Confirm legacy iOS setting migrated autoSave to true automatically
+    assert.equal(await iosPage.evaluate(() => window.__QCAM__.settings.autoSave), true);
+
+    // Direct capture triggers Web Share immediately with strictly { files: [...] }
+    await iosPage.click('#btn-shutter');
+    await iosPage.waitForFunction(() => window.__SHARE_CALLS__.length === 1, { timeout: 6000 });
+    const firstShareCall = await iosPage.evaluate(() => window.__SHARE_CALLS__[0]);
+    assert.deepEqual(firstShareCall.keys, ['files']);
+    assert.equal(firstShareCall.fileType, 'image/jpeg');
+    assert.equal(await iosPage.locator('#preview-modal').isVisible(), false);
+
+    // Simulate NotAllowedError on next capture (e.g., slow burst) -> Preview Modal opens automatically with visible toast
+    await iosPage.waitForFunction(() => !window.__QCAM__.isCapturing, { timeout: 4000 });
+    await iosPage.evaluate(() => {
+      window.__SHARE_MODE__ = 'expire';
+    });
+    await iosPage.click('#btn-shutter');
+    await iosPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 6000 });
+    assert.ok(
+      (await iosPage.textContent('#btn-modal-save')).includes('写真'),
+      'iOS preview save button should clearly mention 写真'
+    );
+    assert.equal(await iosPage.locator('#modal-toast').isVisible(), true);
+
+    // Clicking the modal save button retries Share Sheet with fresh click gesture
+    await iosPage.evaluate(() => {
+      window.__SHARE_MODE__ = 'resolve';
+    });
+    await iosPage.click('#btn-modal-save');
+    await iosPage.waitForFunction(() => window.__SHARE_CALLS__.length === 3, { timeout: 4000 });
+    assert.ok((await iosPage.textContent('#modal-toast')).includes('写真'));
+
+    await iosPage.click('#btn-modal-close');
+    await iosPage.click('#btn-info');
+    await iosPage.waitForSelector('#info-modal:not([hidden])');
+    const iosGuideText = await iosPage.textContent('#permission-guide');
+    assert.ok(iosGuideText.includes('設定') && iosGuideText.includes('Safari') && iosGuideText.includes('許可'));
+    await iosContext.close();
+
     assert.deepEqual(consoleErrors, [], `Console errors encountered: ${consoleErrors.join('; ')}`);
     assert.deepEqual(pageErrors, [], `Page errors encountered: ${pageErrors.join('; ')}`);
 
@@ -553,6 +638,7 @@ async function main() {
       orientationEngine: orientationCheck.engine,
       compactStats,
       pwa: pwaStatus,
+      iosShareCalls: 3,
     }, null, 2));
   } finally {
     await browser.close();

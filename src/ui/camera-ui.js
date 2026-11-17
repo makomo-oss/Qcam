@@ -44,6 +44,7 @@ export class CameraUI {
       btnOverlayHelp: document.getElementById('btn-overlay-help'),
 
       saveToast: document.getElementById('save-toast'),
+      modalToast: document.getElementById('modal-toast'),
       zoomPresets: Array.from(document.querySelectorAll('.zoom-bar .zoom-preset')),
       zoomSlider: document.getElementById('zoom-slider'),
       zoomReadout: document.getElementById('zoom-readout'),
@@ -166,6 +167,11 @@ export class CameraUI {
 
     // Save toast clickable action (crucial for synchronous iOS Share Sheet trigger)
     this.els.saveToast.addEventListener('click', () => {
+      if (typeof this._toastClickHandler === 'function') {
+        this._toastClickHandler();
+      }
+    });
+    this.els.modalToast?.addEventListener('click', () => {
       if (typeof this._toastClickHandler === 'function') {
         this._toastClickHandler();
       }
@@ -515,11 +521,21 @@ export class CameraUI {
   showToast(message, { durationMs = 2800, onClick = null } = {}) {
     clearTimeout(this._toastTimer);
     this._toastClickHandler = onClick;
-    this.els.saveToast.textContent = message;
-    this.els.saveToast.hidden = false;
-    this.els.saveToast.style.cursor = onClick ? 'pointer' : 'default';
+
+    const inModal = !this.els.previewModal.hidden && Boolean(this.els.modalToast);
+    const targetEl = inModal ? this.els.modalToast : this.els.saveToast;
+    const otherEl = inModal ? this.els.saveToast : this.els.modalToast;
+    if (otherEl) {
+      otherEl.hidden = true;
+    }
+
+    targetEl.textContent = message;
+    targetEl.hidden = false;
+    targetEl.style.cursor = onClick ? 'pointer' : 'default';
+
     this._toastTimer = setTimeout(() => {
       this.els.saveToast.hidden = true;
+      if (this.els.modalToast) this.els.modalToast.hidden = true;
       this._toastClickHandler = null;
     }, durationMs);
   }
@@ -539,7 +555,7 @@ export class CameraUI {
     // OS-specific save UI guidance
     this.els.previewSaveHint.hidden = !platform.isIOS;
     this.els.btnModalSave.textContent = platform.isIOS
-      ? 'カメラロールへ保存 / 共有'
+      ? '「写真」へ保存 (共有シート)'
       : '端末に保存 (JPEG)';
     this.els.btnModalShare.hidden = platform.isIOS || !platform.supportsWebShareFiles;
 
@@ -568,6 +584,9 @@ export class CameraUI {
 
   closePreviewModal() {
     this.els.previewModal.hidden = true;
+    if (this.els.modalToast) {
+      this.els.modalToast.hidden = true;
+    }
     this.setPreviewZoom(1);
   }
 
@@ -641,8 +660,8 @@ export class CameraUI {
         isCurrent: Boolean(platform?.isIOS),
         title: 'iPhone / iPad (iOS Safari)',
         steps: [
-          'アドレスバー左側の「ぁあ」（またはサイト設定アイコン）をタップし、「Webサイトの設定」→「カメラ」を「許可」に変更すると次回から確認が省略されます。',
-          '「ホーム画面に追加」した PWA として起動している場合、iOS の仕様上起動ごとに確認が表示されることがあります（省略したい場合は通常の Safari でご利用ください）。',
+          '【最も確実・PWA対応】iPhone の「設定」アプリ →「アプリ」→「Safari」（iOS 17以前は「設定」→「Safari」）→「カメラ」を「許可」に変更すると、再読み込み時やホーム画面起動時も毎回確認が出なくなります。',
+          '【このサイトのみ（通常 Safari）】アドレスバー左のアイコン（「ぁあ」／メニュー）→「•••（Webサイトの設定）」→「カメラ」→「許可」に変更します。（※iOS の仕様上、ホーム画面に追加した PWA では個別設定が保持されない場合があります）',
         ],
       },
       {
@@ -650,8 +669,8 @@ export class CameraUI {
         isCurrent: Boolean(platform?.isAndroid),
         title: 'Android (Chrome)',
         steps: [
-          'カメラ許可ダイアログで「今回のみ」ではなく「サイトにアクセスするたびに許可」を選択してください。',
-          'あとから変更する場合はアドレスバー左のアイコン →「権限」→「カメラ」→「許可」に設定し直します。',
+          'カメラ許可ダイアログで「今回のみ」ではなく「サイトにアクセスするたびに許可」を選択すると、次回以降もそのまま起動します。',
+          'あとから変更する場合は、アドレスバー左のアイコン →「権限」→「カメラ」→「許可」を設定してください。',
         ],
       },
       {

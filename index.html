@@ -71,7 +71,7 @@
       <!-- Non-blocking Permission Persistence Tip Banner (shown on iOS/Chrome when OS re-prompts on reload) -->
       <div id="perm-hint-banner" class="perm-hint-banner" hidden role="status">
         <button id="btn-perm-hint-open" type="button" class="perm-hint-link">
-          再読み込み時のカメラ許可を省略する方法を見る
+          カメラ許可を今後も継続する設定方法を見る
         </button>
         <button id="btn-perm-hint-dismiss" type="button" class="perm-hint-close" aria-label="閉じる">×</button>
       </div>
@@ -211,6 +211,8 @@
       <img id="preview-image" class="preview-image" alt="撮影結果プレビュー">
     </div>
 
+    <button id="modal-toast" type="button" class="save-toast modal-toast" hidden aria-live="polite"></button>
+
     <div id="preview-filmstrip" class="preview-filmstrip" aria-label="撮影履歴"></div>
 
     <div class="modal-footer">
@@ -221,7 +223,7 @@
       </div>
 
       <p id="preview-save-hint" class="preview-save-hint" hidden>
-        iOS Safari では共有メニューの「画像を保存」または画像長押しでカメラロールに保存できます。
+        iPhone では OS の制限上、共有シートの「画像を保存」を選ぶか、上の写真を長押しして「“写真”に保存」を選んでカメラロールへ保存します。
       </p>
 
       <div class="modal-actions">
@@ -243,8 +245,8 @@
         <h3 class="sheet-subtitle">撮影設定</h3>
         <label class="toggle-row" for="toggle-auto-save">
           <span>
-            <strong>撮影直後に自動保存</strong>
-            <small>Android / PC で標準の即時ダウンロードを行います</small>
+            <strong>撮影直後に自動保存 / 保存シート表示</strong>
+            <small>Android / PC は即時ダウンロード、iPhone は共有シート（→「画像を保存」で写真アプリ）を自動表示</small>
           </span>
           <input id="toggle-auto-save" type="checkbox" checked>
         </label>
@@ -258,7 +260,7 @@
       </div>
 
       <div class="sheet-section">
-        <h3 class="sheet-subtitle">再読み込み時のカメラ許可を省略するには</h3>
+        <h3 class="sheet-subtitle">カメラ許可を今後も継続するには（OS別設定）</h3>
         <div id="permission-guide" class="permission-guide"></div>
       </div>
 

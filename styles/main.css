@@ -574,11 +574,11 @@ input:focus-visible {
 .save-toast {
   pointer-events: auto;
   max-width: calc(100% - 28px - env(safe-area-inset-left) - env(safe-area-inset-right));
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.35;
   padding: 7px 14px;
-  border-radius: 999px;
+  border-radius: 18px;
   background: var(--surface-glass-strong);
   border: 1px solid rgba(245, 158, 11, 0.45);
   backdrop-filter: blur(14px);
@@ -587,6 +587,15 @@ input:focus-visible {
   font-weight: 600;
   color: var(--text-primary);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.modal-toast {
+  position: fixed;
+  top: calc(58px + env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 65;
+  width: max-content;
 }
 
 .zoom-bar {
@@ -961,7 +970,9 @@ input:focus-visible {
 
 .preview-save-hint {
   margin: 0;
+  max-width: 420px;
   font-size: 12px;
+  line-height: 1.5;
   color: var(--text-secondary);
   text-align: center;
 }

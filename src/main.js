@@ -47,12 +47,19 @@ class QcamApp {
   constructor() {
     this.platform = detectPlatform(window);
     const saved = readJsonStorage(SETTINGS_STORAGE_KEY) || {};
+    const autoSave =
+      saved.autoSaveExplicit === true
+        ? Boolean(saved.autoSave)
+        : typeof saved.autoSave === 'boolean' && !this.platform.isIOS
+        ? saved.autoSave
+        : true;
     this.settings = {
       aspectRatio: saved.aspectRatio === '16:9' ? '16:9' : '4:3',
       gridVisible: Boolean(saved.gridVisible),
       timerSeconds: 0,
       mode: saved.mode === 'hq' ? 'hq' : 'standard',
-      autoSave: typeof saved.autoSave === 'boolean' ? saved.autoSave : !this.platform.isIOS,
+      autoSave,
+      autoSaveExplicit: Boolean(saved.autoSaveExplicit),
       mirrorFrontSave: Boolean(saved.mirrorFrontSave),
       facingMode: saved.facingMode === 'user' ? 'user' : 'environment',
     };
@@ -106,6 +113,7 @@ class QcamApp {
       gridVisible: this.settings.gridVisible,
       mode: this.settings.mode,
       autoSave: this.settings.autoSave,
+      autoSaveExplicit: Boolean(this.settings.autoSaveExplicit),
       mirrorFrontSave: this.settings.mirrorFrontSave,
       facingMode: this.settings.facingMode,
     });
@@ -291,7 +299,7 @@ class QcamApp {
       return;
     }
 
-    this._captureNow();
+    this._captureNow({ fromTimer: false });
   }
 
   _startCountdown(seconds) {
@@ -304,7 +312,7 @@ class QcamApp {
         clearInterval(this.countdownTimerId);
         this.countdownTimerId = null;
         this.ui.setCountdown(0);
-        this._captureNow();
+        this._captureNow({ fromTimer: true });
       } else {
         this.ui.setCountdown(this.countdownRemaining);
       }
@@ -318,7 +326,7 @@ class QcamApp {
     this.ui.setCountdown(0);
   }
 
-  async _captureNow() {
+  async _captureNow({ fromTimer = false } = {}) {
     if (this.isCapturing) return;
     if (!this.camera.stream) {
       this.ui.showToast('カメラが準備できていません');
@@ -378,12 +386,43 @@ class QcamApp {
       this._addSessionPhoto(photo);
 
       if (this.platform.isIOS) {
-        // On iOS Safari, navigator.share requires a synchronous user gesture.
-        // Offer a crisp clickable toast pill + thumbnail so one tap invokes the native Save Sheet.
-        this.ui.showToast(`撮影完了 (${totalTimeMs}ms) · タップして保存`, {
-          durationMs: 4800,
-          onClick: () => this._invokeIOSShareOrModal(photo),
-        });
+        if (this.settings.autoSave && !fromTimer) {
+          // Attempt direct Web Share Sheet while shutter tap's transient user activation is still active.
+          const shareRes = await shareOrSavePhoto(photo, this.platform, { preferShare: true });
+          if (shareRes.method === 'web-share' && shareRes.completed) {
+            this.ui.showToast(`共有 /「写真」へ保存しました (${totalTimeMs}ms)`, {
+              durationMs: 2800,
+            });
+          } else if (shareRes.cancelled) {
+            this.ui.showToast(`撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`, {
+              durationMs: 5500,
+              onClick: () => this._invokeIOSShareOrModal(photo),
+            });
+          } else if (!shareRes.busy) {
+            // If transient user activation expired (e.g., slow HQ burst) or Share Sheet unavailable,
+            // open the Preview Modal so 1-tap Share Sheet ("画像を保存") or long-press works immediately.
+            const idx = this.photos.findIndex((p) => p.id === photo.id);
+            this.currentGalleryIndex = idx >= 0 ? idx : 0;
+            this.ui.openPreviewModal(this.photos, this.currentGalleryIndex, this.platform);
+            this.ui.showToast(
+              shareRes.gestureExpired
+                ? '下のボタンで「画像を保存」または写真を長押ししてください'
+                : '写真を長押しして「“写真”に保存」を選択してください',
+              { durationMs: 5000 }
+            );
+          }
+        } else if (this.settings.autoSave && fromTimer) {
+          // Countdown timer runs after activation expires; open Preview Modal with 1-tap Photos save CTA.
+          this.ui.openPreviewModal(this.photos, this.currentGalleryIndex, this.platform);
+          this.ui.showToast('タイマー撮影完了 · 下のボタンから「写真」へ保存できます', {
+            durationMs: 4500,
+          });
+        } else {
+          this.ui.showToast(`撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`, {
+            durationMs: 5500,
+            onClick: () => this._invokeIOSShareOrModal(photo),
+          });
+        }
       } else if (this.settings.autoSave) {
         triggerAnchorDownload(photo.url, photo.filename);
         this.ui.showToast(`保存しました (${totalTimeMs}ms)`, { durationMs: 2400 });
@@ -400,7 +439,9 @@ class QcamApp {
 
   async _invokeIOSShareOrModal(photo) {
     const res = await shareOrSavePhoto(photo, this.platform, { preferShare: true });
-    if (!res.completed && !res.cancelled) {
+    if (res.method === 'web-share' && res.completed) {
+      this.ui.showToast('共有 /「写真」へ保存しました');
+    } else if (!res.completed && !res.cancelled && !res.busy) {
       const idx = this.photos.findIndex((p) => p.id === photo.id);
       this.currentGalleryIndex = idx >= 0 ? idx : 0;
       this.ui.openPreviewModal(this.photos, this.currentGalleryIndex, this.platform);
@@ -447,16 +488,23 @@ class QcamApp {
   async saveCurrentPhoto(preferShare = false) {
     const photo = this.photos[this.currentGalleryIndex];
     if (!photo) return;
-    const res = await shareOrSavePhoto(photo, this.platform, { preferShare });
+    const res = await shareOrSavePhoto(photo, this.platform, {
+      preferShare: preferShare || this.platform.isIOS,
+    });
     if (res.method === 'download' && res.completed) {
       this.ui.showToast('端末に保存しました');
+    } else if (res.method === 'web-share' && res.completed) {
+      this.ui.showToast('共有 /「写真」へ保存しました');
     } else if (res.method === 'ios-manual-hint') {
-      this.ui.showToast('画像を長押しして「写真に保存」を選択してください');
+      this.ui.showToast('プレビュー画像を長押しして「“写真”に保存」を選択してください');
     }
   }
 
   updateSetting(key, val) {
     this.settings[key] = val;
+    if (key === 'autoSave') {
+      this.settings.autoSaveExplicit = true;
+    }
     this._persistSettings();
   }
 
