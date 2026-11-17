@@ -4,11 +4,17 @@ import {
   classifyVideoDevice,
   formatBackLensDisplayName,
 } from '../utils/camera-lenses.js';
+import {
+  buildInitialConstraintAttempts,
+  computeTargetForCapabilities,
+  normalizeResolutionPreset,
+  shouldApplyResolutionUpgrade,
+} from '../utils/resolution.js';
 
 /**
  * Manages MediaDevices.getUserMedia, ImageCapture API, camera switching,
  * 0.5x ultra-wide lens selection, tap-to-focus / exposure, hardware + software zoom,
- * and frame extraction.
+ * per-device max resolution acquisition, and frame extraction.
  * Never requests or plays audio so shutter remains strictly silent.
  */
 const DEVICE_STORAGE_KEY = 'qcam_device_ids_v1';
@@ -41,7 +47,10 @@ export class CameraController {
     this.imageCapture = null;
     this.capabilities = {};
     this.photoCapabilities = null;
+    this._photoCapabilitiesPromise = null;
     this.facingMode = 'environment';
+    this.resolutionPreset = 'max';
+    this.aspectRatio = '4:3';
     this.targetZoom = 1.0;
     this.hardwareZoom = 1.0;
     this.softwareZoom = 1.0;
@@ -62,6 +71,18 @@ export class CameraController {
     this.minZoom = 1.0;
     this.blockedDeviceIds = new Set();
     this._lensSwitchPromise = null;
+    this._initializingStream = false;
+
+    this.video?.addEventListener?.('resize', () => {
+      if (
+        !this._initializingStream &&
+        this.stream &&
+        this.track?.readyState === 'live' &&
+        typeof this.onStreamInfo === 'function'
+      ) {
+        this.onStreamInfo(this.getStreamInfo());
+      }
+    });
   }
 
   _resetLensState(activeRole = 'wide') {
@@ -172,8 +193,15 @@ export class CameraController {
     return acquired;
   }
 
-  async start({ facingMode = this.facingMode, keepOldStreamDuringAcquire = false } = {}) {
+  async start({
+    facingMode = this.facingMode,
+    resolutionPreset = this.resolutionPreset,
+    aspectRatio = this.aspectRatio,
+    keepOldStreamDuringAcquire = false,
+  } = {}) {
     const startTs = performance.now();
+    this.resolutionPreset = normalizeResolutionPreset(resolutionPreset);
+    this.aspectRatio = aspectRatio === '16:9' ? '16:9' : '4:3';
 
     if (!this.platform.supportsMediaDevices) {
       throw new Error('お使いのブラウザはカメラ API（getUserMedia）に対応していません。');
@@ -190,32 +218,11 @@ export class CameraController {
       ...(preferredDeviceId ? { deviceId: { ideal: preferredDeviceId } } : {}),
     };
 
-    const constraintAttempts = [
-      {
-        audio: false,
-        video: {
-          ...baseVideo,
-          width: { ideal: 3840 },
-          height: { ideal: 2160 },
-        },
-      },
-      {
-        audio: false,
-        video: {
-          ...baseVideo,
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-        },
-      },
-      {
-        audio: false,
-        video: { facingMode: { ideal: facingMode } },
-      },
-      {
-        audio: false,
-        video: true,
-      },
-    ];
+    const constraintAttempts = buildInitialConstraintAttempts({
+      resolutionPreset: this.resolutionPreset,
+      aspectRatio: this.aspectRatio,
+      baseVideo,
+    });
 
     let stream = null;
     try {
@@ -242,37 +249,46 @@ export class CameraController {
       }
     }
 
-    this.facingMode = facingMode;
-    this.stream = stream;
-    this.track = stream.getVideoTracks()[0] || null;
-    const settings =
-      this.track && typeof this.track.getSettings === 'function'
-        ? this.track.getSettings()
-        : {};
-    this.activeDeviceId = settings.deviceId || null;
-    this.activeDeviceLabel = this.track?.label || '';
+    this._initializingStream = true;
+    try {
+      this.facingMode = facingMode;
+      this.stream = stream;
+      this.track = stream.getVideoTracks()[0] || null;
+      const settings =
+        this.track && typeof this.track.getSettings === 'function'
+          ? this.track.getSettings()
+          : {};
+      this.activeDeviceId = settings.deviceId || null;
+      this.activeDeviceLabel = this.track?.label || '';
 
-    this.video.srcObject = stream;
-    this.video.muted = true;
-    this.video.playsInline = true;
+      this.video.srcObject = stream;
+      this.video.muted = true;
+      this.video.playsInline = true;
 
-    await this._waitForVideoReady();
+      await this._waitForVideoReady();
 
-    this._inspectCapabilities();
-    await this._refreshLensCapabilities({ preserveStandardId: false });
+      this._inspectCapabilities();
+      await this._maybeApplyResolutionOnTrack({ onlyUpgrade: this.resolutionPreset === 'max' });
+      await Promise.all([
+        this._awaitPhotoCapabilities(80),
+        this._refreshLensCapabilities({ preserveStandardId: false }),
+      ]);
 
-    if (
-      this.activeDeviceId &&
-      (facingMode === 'user' || (facingMode === 'environment' && this.activeBackLens === 'wide'))
-    ) {
-      writeStoredDeviceId(facingMode, this.activeDeviceId);
+      if (
+        this.activeDeviceId &&
+        (facingMode === 'user' || (facingMode === 'environment' && this.activeBackLens === 'wide'))
+      ) {
+        writeStoredDeviceId(facingMode, this.activeDeviceId);
+      }
+
+      // Reset zoom & exposure on new camera stream
+      this.targetZoom = this.baseLensScale;
+      this.hardwareZoom = 1.0;
+      this.softwareZoom = 1.0;
+      this.exposureCompensation = 0;
+    } finally {
+      this._initializingStream = false;
     }
-
-    // Reset zoom & exposure on new camera stream
-    this.targetZoom = this.baseLensScale;
-    this.hardwareZoom = 1.0;
-    this.softwareZoom = 1.0;
-    this.exposureCompensation = 0;
 
     this.startupTimeMs = Math.round(performance.now() - startTs);
 
@@ -327,6 +343,7 @@ export class CameraController {
   _inspectCapabilities() {
     this.capabilities = {};
     this.photoCapabilities = null;
+    this._photoCapabilitiesPromise = null;
     this.imageCapture = null;
 
     const capturedTrack = this.track;
@@ -344,25 +361,163 @@ export class CameraController {
       try {
         this.imageCapture = new window.ImageCapture(capturedTrack);
         if (typeof this.imageCapture.getPhotoCapabilities === 'function') {
-          this.imageCapture
+          this._photoCapabilitiesPromise = this.imageCapture
             .getPhotoCapabilities()
             .then((caps) => {
-              if (this.track !== capturedTrack) return;
-              this.photoCapabilities = caps;
-              if (typeof this.onStreamInfo === 'function') {
+              if (this.track !== capturedTrack) return null;
+              this.photoCapabilities = caps || null;
+              if (!this._initializingStream && typeof this.onStreamInfo === 'function') {
                 this.onStreamInfo(this.getStreamInfo());
               }
+              return this.photoCapabilities;
             })
             .catch(() => {
               if (this.track === capturedTrack) {
                 this.photoCapabilities = null;
               }
+              return null;
             });
         }
       } catch {
         this.imageCapture = null;
+        this._photoCapabilitiesPromise = null;
       }
     }
+  }
+
+  async _awaitPhotoCapabilities(timeoutMs = 80) {
+    if (!this._photoCapabilitiesPromise) return this.photoCapabilities;
+    await Promise.race([
+      this._photoCapabilitiesPromise,
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+    return this.photoCapabilities;
+  }
+
+  async _waitForDimensionSettlement(prevWidth, prevHeight, timeoutMs = 140) {
+    const start = performance.now();
+    do {
+      const vw = this.video.videoWidth || 0;
+      const vh = this.video.videoHeight || 0;
+      if (vw && vh && (vw !== prevWidth || vh !== prevHeight)) {
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 16));
+    } while (performance.now() - start < timeoutMs);
+  }
+
+  async _maybeApplyResolutionOnTrack({ onlyUpgrade = false } = {}) {
+    if (
+      !this.track ||
+      typeof this.track.applyConstraints !== 'function' ||
+      !this.capabilities?.width?.max ||
+      !this.capabilities?.height?.max
+    ) {
+      return false;
+    }
+
+    const currentSettings =
+      typeof this.track.getSettings === 'function' ? this.track.getSettings() : {};
+    const curW = this.video.videoWidth || currentSettings.width || 0;
+    const curH = this.video.videoHeight || currentSettings.height || 0;
+
+    const decision = shouldApplyResolutionUpgrade(
+      { width: curW, height: curH },
+      this.capabilities,
+      {
+        resolutionPreset: this.resolutionPreset,
+        aspectRatio: this.aspectRatio,
+      }
+    );
+
+    if (onlyUpgrade && this.resolutionPreset !== 'max') {
+      return false;
+    }
+    if (!decision.shouldApply) {
+      return false;
+    }
+
+    try {
+      await this.track.applyConstraints({
+        width: { ideal: decision.target.width },
+        height: { ideal: decision.target.height },
+      });
+      await this._waitForDimensionSettlement(curW, curH, 100);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async setResolutionPreset(
+    presetId,
+    { aspectRatio = this.aspectRatio, allowReacquire = true } = {}
+  ) {
+    this.resolutionPreset = normalizeResolutionPreset(presetId);
+    this.aspectRatio = aspectRatio === '16:9' ? '16:9' : '4:3';
+
+    if (!this.track || this.track.readyState !== 'live') {
+      return this.getStreamInfo();
+    }
+
+    const sBefore = this.track.getSettings?.() || {};
+    const beforeW = this.video.videoWidth || sBefore.width || 0;
+    const beforeH = this.video.videoHeight || sBefore.height || 0;
+
+    const target = computeTargetForCapabilities(this.capabilities, {
+      resolutionPreset: this.resolutionPreset,
+      aspectRatio: this.aspectRatio,
+      fallbackWidth: beforeW,
+      fallbackHeight: beforeH,
+    });
+
+    if (typeof this.track.applyConstraints === 'function') {
+      try {
+        await this.track.applyConstraints({
+          width: { ideal: target.width },
+          height: { ideal: target.height },
+        });
+        await this._waitForDimensionSettlement(beforeW, beforeH, 220);
+      } catch {
+        // Ignore if live track rejects width/height applyConstraints
+      }
+    }
+
+    const sAfter = this.track.getSettings?.() || {};
+    const afterW = this.video.videoWidth || sAfter.width || 0;
+    const afterH = this.video.videoHeight || sAfter.height || 0;
+
+    const targetLong = Math.max(target.width, target.height);
+    const afterLong = Math.max(afterW, afterH);
+
+    // If driver left resolution far from explicitly chosen target, restart stream with ideal constraints
+    if (allowReacquire && targetLong > 0 && Math.abs(afterLong - targetLong) > targetLong * 0.14) {
+      try {
+        const perm = await this.checkPermissionState();
+        if (!this.platform.isIOS || perm.state === 'granted') {
+          if (this.facingMode === 'environment' && this.activeDeviceId && this.activeBackLens !== 'wide') {
+            return await this.selectBackLens(this.activeDeviceId, {
+              targetZoom: this.targetZoom,
+              forceReacquire: true,
+            });
+          }
+          return await this.start({
+            facingMode: this.facingMode,
+            resolutionPreset: this.resolutionPreset,
+            aspectRatio: this.aspectRatio,
+            keepOldStreamDuringAcquire: this.platform.isIOS,
+          });
+        }
+      } catch {
+        // Keep active working stream on reacquire failure
+      }
+    }
+
+    const info = this.getStreamInfo();
+    if (typeof this.onStreamInfo === 'function') {
+      this.onStreamInfo(info);
+    }
+    return info;
   }
 
   async _refreshLensCapabilities({ preserveStandardId = false } = {}) {
@@ -461,6 +616,10 @@ export class CameraController {
       videoHeight,
       frameRate: settings.frameRate ? Math.round(settings.frameRate) : null,
       facingMode: actualFacing,
+      resolutionPreset: this.resolutionPreset,
+      trackCapabilities: this.capabilities,
+      capWidth: this.capabilities?.width?.max || videoWidth || null,
+      capHeight: this.capabilities?.height?.max || videoHeight || null,
       startupTimeMs: this.startupTimeMs,
       supportsHardwareZoom: Boolean(
         (maxHardwareZoom && maxHardwareZoom > 1) ||
@@ -494,15 +653,18 @@ export class CameraController {
     this._resetLensState(nextFacing === 'user' ? 'front' : 'wide');
     return this.start({
       facingMode: nextFacing,
+      resolutionPreset: this.resolutionPreset,
+      aspectRatio: this.aspectRatio,
       keepOldStreamDuringAcquire: this.platform.isIOS,
     });
   }
 
-  async selectBackLens(targetDeviceId, { targetZoom = null } = {}) {
+  async selectBackLens(targetDeviceId, { targetZoom = null, forceReacquire = false } = {}) {
     if (!targetDeviceId || this.facingMode !== 'environment') {
       return this.getStreamInfo();
     }
-    const runSwitch = () => this._performSelectBackLens(targetDeviceId, { targetZoom });
+    const runSwitch = () =>
+      this._performSelectBackLens(targetDeviceId, { targetZoom, forceReacquire });
     const queued = this._lensSwitchPromise
       ? this._lensSwitchPromise.then(runSwitch, runSwitch)
       : runSwitch();
@@ -514,8 +676,9 @@ export class CameraController {
     return queued;
   }
 
-  async _performSelectBackLens(targetDeviceId, { targetZoom = null } = {}) {
+  async _performSelectBackLens(targetDeviceId, { targetZoom = null, forceReacquire = false } = {}) {
     if (
+      !forceReacquire &&
       this.activeDeviceId === targetDeviceId &&
       this.track &&
       this.track.readyState === 'live'
@@ -537,30 +700,11 @@ export class CameraController {
     }
 
     // Request exact deviceId WITHOUT pairing facingMode to avoid HAL OverconstrainedError on auxiliary lenses
-    const exactAttempts = [
-      {
-        audio: false,
-        video: {
-          deviceId: { exact: targetDeviceId },
-          width: { ideal: 3840 },
-          height: { ideal: 2160 },
-        },
-      },
-      {
-        audio: false,
-        video: {
-          deviceId: { exact: targetDeviceId },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-        },
-      },
-      {
-        audio: false,
-        video: {
-          deviceId: { exact: targetDeviceId },
-        },
-      },
-    ];
+    const exactAttempts = buildInitialConstraintAttempts({
+      resolutionPreset: this.resolutionPreset,
+      aspectRatio: this.aspectRatio,
+      baseVideo: { deviceId: { exact: targetDeviceId } },
+    });
 
     let stream = null;
     try {
@@ -599,38 +743,40 @@ export class CameraController {
             : null;
         try {
           if (recoverId) {
-            const recoverStream = await this._acquireConstraintsList([
-              {
-                audio: false,
-                video: {
-                  deviceId: { exact: recoverId },
-                  width: { ideal: 3840 },
-                  height: { ideal: 2160 },
-                },
-              },
-              {
-                audio: false,
-                video: { deviceId: { exact: recoverId } },
-              },
-            ]);
-            this.facingMode = 'environment';
-            this.stream = recoverStream;
-            this.track = recoverStream.getVideoTracks()[0] || null;
-            const rSettings = this.track?.getSettings?.() || {};
-            this.activeDeviceId = rSettings.deviceId || recoverId;
-            this.activeDeviceLabel = this.track?.label || '';
-            this.video.srcObject = recoverStream;
-            this.video.muted = true;
-            this.video.playsInline = true;
-            await this._waitForVideoReady();
-            this._inspectCapabilities();
-            await this._refreshLensCapabilities({ preserveStandardId: true });
-            if (
-              !this.standardBackDeviceId &&
-              savedStandardId &&
-              !this.blockedDeviceIds.has(savedStandardId)
-            ) {
-              this.standardBackDeviceId = savedStandardId;
+            const recoverStream = await this._acquireConstraintsList(
+              buildInitialConstraintAttempts({
+                resolutionPreset: this.resolutionPreset,
+                aspectRatio: this.aspectRatio,
+                baseVideo: { deviceId: { exact: recoverId } },
+              })
+            );
+            this._initializingStream = true;
+            try {
+              this.facingMode = 'environment';
+              this.stream = recoverStream;
+              this.track = recoverStream.getVideoTracks()[0] || null;
+              const rSettings = this.track?.getSettings?.() || {};
+              this.activeDeviceId = rSettings.deviceId || recoverId;
+              this.activeDeviceLabel = this.track?.label || '';
+              this.video.srcObject = recoverStream;
+              this.video.muted = true;
+              this.video.playsInline = true;
+              await this._waitForVideoReady();
+              this._inspectCapabilities();
+              await this._maybeApplyResolutionOnTrack({ onlyUpgrade: this.resolutionPreset === 'max' });
+              await Promise.all([
+                this._awaitPhotoCapabilities(80),
+                this._refreshLensCapabilities({ preserveStandardId: true }),
+              ]);
+              if (
+                !this.standardBackDeviceId &&
+                savedStandardId &&
+                !this.blockedDeviceIds.has(savedStandardId)
+              ) {
+                this.standardBackDeviceId = savedStandardId;
+              }
+            } finally {
+              this._initializingStream = false;
             }
           } else {
             await this.start({ facingMode: 'environment' });
@@ -645,42 +791,51 @@ export class CameraController {
       throw err;
     }
 
-    this.facingMode = 'environment';
-    this.stream = stream;
-    this.track = stream.getVideoTracks()[0] || null;
-    const settings =
-      this.track && typeof this.track.getSettings === 'function'
-        ? this.track.getSettings()
-        : {};
-    this.activeDeviceId = settings.deviceId || targetDeviceId;
-    this.activeDeviceLabel = this.track?.label || '';
+    this._initializingStream = true;
+    try {
+      this.facingMode = 'environment';
+      this.stream = stream;
+      this.track = stream.getVideoTracks()[0] || null;
+      const settings =
+        this.track && typeof this.track.getSettings === 'function'
+          ? this.track.getSettings()
+          : {};
+      this.activeDeviceId = settings.deviceId || targetDeviceId;
+      this.activeDeviceLabel = this.track?.label || '';
 
-    this.video.srcObject = stream;
-    this.video.muted = true;
-    this.video.playsInline = true;
+      this.video.srcObject = stream;
+      this.video.muted = true;
+      this.video.playsInline = true;
 
-    await this._waitForVideoReady();
+      await this._waitForVideoReady();
 
-    this._inspectCapabilities();
-    await this._refreshLensCapabilities({ preserveStandardId: true });
-    if (
-      !this.standardBackDeviceId &&
-      savedStandardId &&
-      !this.blockedDeviceIds.has(savedStandardId)
-    ) {
-      this.standardBackDeviceId = savedStandardId;
+      this._inspectCapabilities();
+      await this._maybeApplyResolutionOnTrack({ onlyUpgrade: this.resolutionPreset === 'max' });
+      await Promise.all([
+        this._awaitPhotoCapabilities(80),
+        this._refreshLensCapabilities({ preserveStandardId: true }),
+      ]);
+      if (
+        !this.standardBackDeviceId &&
+        savedStandardId &&
+        !this.blockedDeviceIds.has(savedStandardId)
+      ) {
+        this.standardBackDeviceId = savedStandardId;
+      }
+
+      if (this.activeDeviceId && this.activeBackLens === 'wide') {
+        writeStoredDeviceId('environment', this.activeDeviceId);
+      }
+
+      this.exposureCompensation = 0;
+      const desiredZoom =
+        typeof targetZoom === 'number' && Number.isFinite(targetZoom)
+          ? targetZoom
+          : this.baseLensScale;
+      await this._applySplitZoom(desiredZoom);
+    } finally {
+      this._initializingStream = false;
     }
-
-    if (this.activeDeviceId && this.activeBackLens === 'wide') {
-      writeStoredDeviceId('environment', this.activeDeviceId);
-    }
-
-    this.exposureCompensation = 0;
-    const desiredZoom =
-      typeof targetZoom === 'number' && Number.isFinite(targetZoom)
-        ? targetZoom
-        : this.baseLensScale;
-    await this._applySplitZoom(desiredZoom);
 
     const info = this.getStreamInfo();
     if (typeof this.onStreamInfo === 'function') {
@@ -844,38 +999,70 @@ export class CameraController {
     return { hardwareApplied: false, softwareEv: clamped, value: clamped };
   }
 
+  async tryCaptureTakePhoto() {
+    if (
+      !this.platform.preferTakePhoto ||
+      !this.imageCapture ||
+      typeof this.imageCapture.takePhoto !== 'function'
+    ) {
+      return null;
+    }
+
+    const photoSettings = {};
+    if (this.photoCapabilities?.imageWidth?.max) {
+      photoSettings.imageWidth = this.photoCapabilities.imageWidth.max;
+    }
+    if (this.photoCapabilities?.imageHeight?.max) {
+      photoSettings.imageHeight = this.photoCapabilities.imageHeight.max;
+    }
+
+    let blob = null;
+    try {
+      blob =
+        Object.keys(photoSettings).length > 0
+          ? await this.imageCapture.takePhoto(photoSettings)
+          : await this.imageCapture.takePhoto();
+    } catch {
+      if (Object.keys(photoSettings).length > 0) {
+        try {
+          blob = await this.imageCapture.takePhoto();
+        } catch {
+          blob = null;
+        }
+      }
+    }
+
+    if (!blob) return null;
+
+    try {
+      const bitmap = await createImageBitmap(blob);
+      const streamW = this.video.videoWidth || 0;
+      const streamH = this.video.videoHeight || 0;
+      // Only prefer takePhoto if it achieves >= stream resolution (avoids budget drivers returning VGA stills)
+      if (streamW > 0 && streamH > 0 && bitmap.width * bitmap.height < streamW * streamH * 0.95) {
+        bitmap.close();
+        return null;
+      }
+      return {
+        sourceType: 'takePhoto',
+        bitmap,
+        width: bitmap.width,
+        height: bitmap.height,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Capture a single high-resolution frame.
    * On Android Chrome: prioritize ImageCapture.takePhoto() for sensor max resolution.
    * On iOS Safari (and fallback): extract directly from the active <video> stream.
    */
   async captureSingleFrame({ preferTakePhoto = this.platform.preferTakePhoto } = {}) {
-    if (
-      preferTakePhoto &&
-      this.imageCapture &&
-      typeof this.imageCapture.takePhoto === 'function'
-    ) {
-      try {
-        const photoSettings = {};
-        if (this.photoCapabilities?.imageWidth?.max) {
-          photoSettings.imageWidth = this.photoCapabilities.imageWidth.max;
-        }
-        if (this.photoCapabilities?.imageHeight?.max) {
-          photoSettings.imageHeight = this.photoCapabilities.imageHeight.max;
-        }
-        const blob = await this.imageCapture.takePhoto(
-          Object.keys(photoSettings).length > 0 ? photoSettings : undefined
-        );
-        const bitmap = await createImageBitmap(blob);
-        return {
-          sourceType: 'takePhoto',
-          bitmap,
-          width: bitmap.width,
-          height: bitmap.height,
-        };
-      } catch {
-        // Fall back to grabFrame / video stream cleanly
-      }
+    if (preferTakePhoto) {
+      const still = await this.tryCaptureTakePhoto();
+      if (still) return still;
     }
 
     const bitmap = await this._grabStreamBitmap();
@@ -986,6 +1173,7 @@ export class CameraController {
     this.imageCapture = null;
     this.capabilities = {};
     this.photoCapabilities = null;
+    this._photoCapabilitiesPromise = null;
     this.activeDeviceId = null;
     this.activeDeviceLabel = '';
     this.baseLensScale = 1.0;

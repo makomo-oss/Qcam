@@ -3,6 +3,14 @@ import { CameraController } from './camera/camera-controller.js';
 import { ImagePipeline } from './processing/image-pipeline.js';
 import { buildPhotoFilename, shareOrSavePhoto, triggerAnchorDownload } from './storage/media-saver.js';
 import { CameraUI } from './ui/camera-ui.js';
+import {
+  formatMegapixelsLabel,
+  getAvailableMegapixelOptions,
+  getAvailableResolutionOptions,
+  normalizeMegapixelsSetting,
+  normalizeResolutionPreset,
+  selectHqCapturePlan,
+} from './utils/resolution.js';
 
 const MAX_SESSION_PHOTOS = 30;
 const TIMER_CYCLE = [0, 3, 10];
@@ -57,7 +65,9 @@ class QcamApp {
       aspectRatio: saved.aspectRatio === '16:9' ? '16:9' : '4:3',
       gridVisible: Boolean(saved.gridVisible),
       timerSeconds: 0,
-      mode: saved.mode === 'hq' ? 'hq' : 'standard',
+      mode: 'hq',
+      cameraResolution: normalizeResolutionPreset(saved.cameraResolution),
+      outputMegapixels: normalizeMegapixelsSetting(saved.outputMegapixels),
       outputFormat: saved.outputFormat === 'jpeg' ? 'jpeg' : 'avif',
       autoSave,
       autoSaveExplicit: Boolean(saved.autoSaveExplicit),
@@ -73,6 +83,7 @@ class QcamApp {
     this.countdownRemaining = 0;
     this.streamInfo = null;
     this.lastProcessEngine = '--';
+    this.lastCaptureSource = null;
     this.lastCaptureTimeMs = null;
     this.lastSavedInfo = null;
     this.lastPermissionState = 'unknown';
@@ -85,7 +96,6 @@ class QcamApp {
       onRetryCamera: () => this.startCamera(),
       onShutterClick: () => this.handleShutter(),
       onSwitchCamera: () => this.switchCamera(),
-      onSelectMode: (mode) => this.selectMode(mode),
       onZoomChange: (zoom) => this.applyZoom(zoom),
       onTapFocus: (normPoint) => this.applyFocus(normPoint),
       onExposureChange: (ev) => this.applyExposure(ev),
@@ -94,6 +104,8 @@ class QcamApp {
       onDeleteCurrentPhoto: () => this.deleteCurrentPhoto(),
       onSaveCurrentPhoto: (preferShare) => this.saveCurrentPhoto(preferShare),
       onSettingChange: (key, val) => this.updateSetting(key, val),
+      onSelectResolution: (presetId) => this.selectResolutionPreset(presetId),
+      onSelectMegapixels: (mpValue) => this.selectMegapixels(mpValue),
       onSelectBackLens: (deviceId) => this.selectBackLens(deviceId),
       onRefreshDiagnostics: () => this.refreshDiagnostics(),
       onOpenPermissionGuide: () => this.ui.openInfoModal({ scrollToPermissionGuide: true }),
@@ -102,27 +114,65 @@ class QcamApp {
 
     this.camera = new CameraController(this.ui.els.video, this.platform);
     this.camera.facingMode = this.settings.facingMode;
+    this.camera.resolutionPreset = this.settings.cameraResolution;
+    this.camera.aspectRatio = this.settings.aspectRatio;
     this.camera.onStreamInfo = (info) => {
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
       this.ui.updateLensControls(info);
+      this._refreshQualityControls();
       this._syncPreviewTransform();
     };
 
     this.pipeline = new ImagePipeline(this.platform);
+    this.pipeline.onCapabilitiesChange = () => this._refreshQualityControls();
   }
 
   _persistSettings() {
     writeJsonStorage(SETTINGS_STORAGE_KEY, {
       aspectRatio: this.settings.aspectRatio,
       gridVisible: this.settings.gridVisible,
-      mode: this.settings.mode,
+      mode: 'hq',
+      cameraResolution: this.settings.cameraResolution,
+      outputMegapixels: this.settings.outputMegapixels,
       outputFormat: this.settings.outputFormat,
       autoSave: this.settings.autoSave,
       autoSaveExplicit: Boolean(this.settings.autoSaveExplicit),
       mirrorFrontSave: this.settings.mirrorFrontSave,
       facingMode: this.settings.facingMode,
     });
+  }
+
+  _computeQualityData() {
+    const info = this.streamInfo || {};
+    const caps = this.pipeline.getCapabilities();
+    const resolutionData = getAvailableResolutionOptions({
+      trackCapabilities: info.trackCapabilities || {},
+      streamWidth: info.videoWidth || 0,
+      streamHeight: info.videoHeight || 0,
+      aspectRatio: this.settings.aspectRatio,
+      currentPreset: this.settings.cameraResolution,
+    });
+    const megapixelData = getAvailableMegapixelOptions({
+      trackCapabilities: info.trackCapabilities || {},
+      photoMaxWidth: info.photoMaxWidth || null,
+      photoMaxHeight: info.photoMaxHeight || null,
+      streamWidth: info.videoWidth || 0,
+      streamHeight: info.videoHeight || 0,
+      preferTakePhoto: Boolean(this.platform.preferTakePhoto && info.supportsTakePhoto),
+      aspectRatio: this.settings.aspectRatio,
+      outputFormat: this.settings.outputFormat,
+      maxTextureSize: caps.maxTextureSize,
+      supportsNativeAvif: caps.supportsNativeAvif,
+      currentSelection: this.settings.outputMegapixels,
+    });
+    return { resolutionData, megapixelData };
+  }
+
+  _refreshQualityControls() {
+    const data = this._computeQualityData();
+    this.ui.renderQualityControls(data);
+    return data;
   }
 
   async init() {
@@ -136,11 +186,11 @@ class QcamApp {
     this.ui.setAspectRatio(this.settings.aspectRatio);
     this.ui.setGridVisible(this.settings.gridVisible);
     this.ui.setTimerSeconds(this.settings.timerSeconds);
-    this.ui.setCaptureMode(this.settings.mode);
     this.ui.setOutputFormat(this.settings.outputFormat);
     this.ui.els.toggleAutoSave.checked = this.settings.autoSave;
     this.ui.els.toggleMirrorFront.checked = this.settings.mirrorFrontSave;
     this.ui.renderPermissionGuide(this.platform);
+    this._refreshQualityControls();
 
     await this.startCamera({ fromInit: true });
     this._registerServiceWorker();
@@ -168,10 +218,15 @@ class QcamApp {
       const hadGrantedOnce = readStringStorage(PERM_GRANTED_KEY) === '1';
       const hintDismissed = readStringStorage(PERM_HINT_DISMISSED_KEY) === '1';
 
-      const info = await this.camera.start({ facingMode: this.settings.facingMode });
+      const info = await this.camera.start({
+        facingMode: this.settings.facingMode,
+        resolutionPreset: this.settings.cameraResolution,
+        aspectRatio: this.settings.aspectRatio,
+      });
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
       this.ui.updateLensControls(info);
+      this._refreshQualityControls();
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
 
@@ -223,6 +278,7 @@ class QcamApp {
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
       this.ui.updateLensControls(info);
+      this._refreshQualityControls();
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
     } catch (err) {
@@ -240,6 +296,7 @@ class QcamApp {
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
       this.ui.updateLensControls(info);
+      this._refreshQualityControls();
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
     } catch {
@@ -247,10 +304,51 @@ class QcamApp {
       this.streamInfo = refreshed;
       this.ui.updateStreamBadges(refreshed);
       this.ui.updateLensControls(refreshed);
+      this._refreshQualityControls();
       this._syncPreviewTransform();
       this.ui.showToast('このレンズはブラウザから開けませんでした');
     } finally {
       this.isSwitchingCamera = false;
+    }
+  }
+
+  async selectResolutionPreset(presetId) {
+    if (this.isCapturing || this.countdownRemaining > 0 || this.isSwitchingCamera) return;
+    const next = normalizeResolutionPreset(presetId);
+    this.settings.cameraResolution = next;
+    this._persistSettings();
+    this._refreshQualityControls();
+
+    this.isSwitchingCamera = true;
+    try {
+      const info = await this.camera.setResolutionPreset(next, {
+        aspectRatio: this.settings.aspectRatio,
+        allowReacquire: true,
+      });
+      this.streamInfo = info;
+      this.ui.updateStreamBadges(info);
+      this.ui.updateLensControls(info);
+      this._syncPreviewTransform();
+      this._refreshQualityControls();
+      if (info?.videoWidth && info?.videoHeight) {
+        this.ui.showToast(`解像度を設定しました (${info.videoWidth}×${info.videoHeight})`);
+      }
+    } catch {
+      this.ui.showToast('解像度の変更に失敗しました');
+    } finally {
+      this.isSwitchingCamera = false;
+    }
+  }
+
+  selectMegapixels(mpValue) {
+    const next = normalizeMegapixelsSetting(mpValue);
+    this.settings.outputMegapixels = next;
+    this._persistSettings();
+    const { megapixelData } = this._refreshQualityControls();
+    if (megapixelData.plannedOutWidth && megapixelData.plannedOutHeight) {
+      this.ui.showToast(
+        `保存画素数: ${formatMegapixelsLabel(megapixelData.plannedOutMp)} (${megapixelData.plannedOutWidth}×${megapixelData.plannedOutHeight})`
+      );
     }
   }
 
@@ -259,6 +357,21 @@ class QcamApp {
     this.settings.aspectRatio = next;
     this._persistSettings();
     this.ui.setAspectRatio(next);
+    if (this.camera.track && this.camera.track.readyState === 'live') {
+      this.camera
+        .setResolutionPreset(this.settings.cameraResolution, {
+          aspectRatio: next,
+          allowReacquire: false,
+        })
+        .then((info) => {
+          this.streamInfo = info;
+          this.ui.updateStreamBadges(info);
+          this._refreshQualityControls();
+        })
+        .catch(() => {});
+    } else {
+      this._refreshQualityControls();
+    }
   }
 
   toggleGrid() {
@@ -272,13 +385,6 @@ class QcamApp {
     const next = TIMER_CYCLE[(idx + 1) % TIMER_CYCLE.length];
     this.settings.timerSeconds = next;
     this.ui.setTimerSeconds(next);
-  }
-
-  selectMode(mode) {
-    if (mode !== 'standard' && mode !== 'hq') return;
-    this.settings.mode = mode;
-    this._persistSettings();
-    this.ui.setCaptureMode(mode);
   }
 
   async applyZoom(zoom) {
@@ -378,7 +484,7 @@ class QcamApp {
     this.ui.triggerSilentBlackout();
 
     const totalStart = performance.now();
-    const mode = this.settings.mode;
+    const mode = 'hq';
     const format = this.settings.outputFormat === 'jpeg' ? 'jpeg' : 'avif';
     const isFront = this.camera.facingMode === 'user';
     const mirrorOutput = isFront && this.settings.mirrorFrontSave;
@@ -387,14 +493,40 @@ class QcamApp {
       : this.camera.exposureCompensation;
 
     try {
+      const caps = this.pipeline.getCapabilities();
+      const info = this.streamInfo || this.camera.getStreamInfo();
+      const plan = selectHqCapturePlan({
+        preferTakePhoto: this.platform.preferTakePhoto,
+        hasImageCapture: Boolean(
+          this.camera.imageCapture && typeof this.camera.imageCapture.takePhoto === 'function'
+        ),
+        streamWidth: info?.videoWidth || this.camera.video.videoWidth || 0,
+        streamHeight: info?.videoHeight || this.camera.video.videoHeight || 0,
+        photoMaxWidth: info?.photoMaxWidth || null,
+        photoMaxHeight: info?.photoMaxHeight || null,
+        aspectRatio: this.settings.aspectRatio,
+        softwareZoom: this.camera.softwareZoom,
+        outputMegapixels: this.settings.outputMegapixels,
+        outputFormat: format,
+        maxTextureSize: caps.maxTextureSize,
+        supportsNativeAvif: caps.supportsNativeAvif,
+      });
+
       let frames = [];
-      if (mode === 'hq') {
+      let captureSource = 'burstStream';
+      if (plan.captureMethod === 'takePhoto') {
+        const still = await this.camera.tryCaptureTakePhoto();
+        if (still?.bitmap) {
+          frames = [still.bitmap];
+          captureSource = 'takePhoto';
+        }
+      }
+      if (!frames.length) {
         const burst = await this.camera.captureBurstFrames(4, 200);
         frames = burst.frames;
-      } else {
-        const single = await this.camera.captureSingleFrame();
-        frames = [single.bitmap];
+        captureSource = burst.sourceType;
       }
+      this.lastCaptureSource = captureSource;
 
       const processed = await this.pipeline.process({
         mode,
@@ -404,6 +536,8 @@ class QcamApp {
         mirrorX: mirrorOutput,
         exposureEv: softwareEv,
         outputFormat: format,
+        outputMegapixels: this.settings.outputMegapixels,
+        maxDimension: plan.maxDimension,
       });
 
       const totalTimeMs = Math.round(performance.now() - totalStart);
@@ -636,6 +770,7 @@ class QcamApp {
       const normalized = val === 'jpeg' ? 'jpeg' : 'avif';
       this.settings.outputFormat = normalized;
       this.ui.setOutputFormat(normalized);
+      this._refreshQualityControls();
     } else {
       this.settings[key] = val;
     }
@@ -647,6 +782,8 @@ class QcamApp {
 
   refreshDiagnostics() {
     const info = this.streamInfo || {};
+    const { resolutionData, megapixelData } = this._refreshQualityControls();
+
     const permLabelMap = {
       granted: '許可済み（持続）',
       prompt: '都度確認（ブラウザ設定依存）',
@@ -672,11 +809,35 @@ class QcamApp {
       ? `${this.lastSavedInfo.filename} (${this.lastSavedInfo.mimeType} · ${Math.max(1, Math.round(this.lastSavedInfo.sizeBytes / 1024))}KB)`
       : '未撮影';
 
+    const selectedResOpt = resolutionData.options.find(
+      (o) => o.id === resolutionData.effectiveSelected
+    );
+    const resPresetLabel = selectedResOpt
+      ? selectedResOpt.label
+      : resolutionData.effectiveSelected;
+    const capLabel =
+      resolutionData.capWidth && resolutionData.capHeight
+        ? `${resolutionData.capWidth}×${resolutionData.capHeight}`
+        : '未取得';
+    const mpLabel =
+      megapixelData.plannedOutWidth && megapixelData.plannedOutHeight
+        ? `${megapixelData.plannedOutWidth}×${megapixelData.plannedOutHeight} (${formatMegapixelsLabel(megapixelData.plannedOutMp)})`
+        : '未取得';
+    const captureMethodLabel =
+      this.lastCaptureSource === 'takePhoto'
+        ? 'ImageCapture.takePhoto() + 高画質 HDR'
+        : info.supportsTakePhoto
+        ? 'ImageCapture.takePhoto() / 4連写 + 高画質 HDR'
+        : '4連写マルチフレーム + 高画質 HDR';
+
     const entries = [
       ['アプリバージョン', `v${APP_VERSION}`],
       ['プラットフォーム', `${this.platform.osLabel} (${this.platform.browserLabel})`],
       ['PWA モード', this.platform.isStandalonePWA ? 'スタンドアロン (全画面)' : 'ブラウザ表示'],
       ['カメラ権限状態', permLabelMap[this.lastPermissionState] || this.lastPermissionState],
+      ['撮影画質モード', '高画質 HDR (常時有効)'],
+      ['解像度設定 / 上限', `${resPresetLabel} / 上限 ${capLabel}`],
+      ['保存画素数設定', mpLabel],
       ['超広角 (0.5×) カメラ', ultraWideLabel],
       [
         'プレビュー解像度',
@@ -689,10 +850,7 @@ class QcamApp {
           : 'ストリーム解像度',
       ],
       ['カメラ起動時間', info.startupTimeMs ? `${info.startupTimeMs} ms` : '--'],
-      [
-        '基本撮影方式',
-        info.supportsTakePhoto ? 'ImageCapture.takePhoto()' : '<video> 高解像度フレーム抽出',
-      ],
+      ['基本撮影方式', captureMethodLabel],
       [
         '保存フォーマット',
         this.settings.outputFormat === 'jpeg'

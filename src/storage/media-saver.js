@@ -5,7 +5,7 @@
  *   plus graceful fallback to preview long-press save or <a download>.
  */
 
-export function buildPhotoFilename(date = new Date(), mode = 'standard', format = 'avif') {
+export function buildPhotoFilename(date = new Date(), mode = 'hq', format = 'avif') {
   const pad = (n) => String(n).padStart(2, '0');
   const y = date.getFullYear();
   const m = pad(date.getMonth() + 1);

@@ -1,4 +1,8 @@
 import { computeAspectCrop } from '../utils/geometry.js';
+import {
+  computeMaxDimensionForMegapixels,
+  getEncoderMaxDimension,
+} from '../utils/resolution.js';
 import { WebGLImageProcessor } from '../processing/webgl-processor.js';
 import {
   AVIF_DEFAULT_OPTIONS,
@@ -203,8 +207,18 @@ self.addEventListener('message', async (event) => {
   if (!msg) return;
 
   if (msg.type === 'warmup') {
-    getWebGLProcessor();
+    const webgl = getWebGLProcessor();
     warmupAvifEncoder().catch(() => {});
+    supportsNativeCanvasAvif()
+      .catch(() => false)
+      .then((nativeAvif) => {
+        self.postMessage({
+          type: 'capabilities',
+          maxTextureSize: webgl ? webgl.maxTextureSize : 4096,
+          supportsWebGL: Boolean(webgl),
+          supportsNativeAvif: Boolean(nativeAvif),
+        });
+      });
     return;
   }
 
@@ -243,18 +257,22 @@ self.addEventListener('message', async (event) => {
 
   const {
     id,
-    mode = 'standard',
+    mode = 'hq',
     frames = [],
     aspectRatio = '4:3',
     softwareZoom = 1,
     mirrorX = false,
     exposureEv = 0,
+    outputMegapixels = 'max',
+    maxDimension = null,
     jpegQuality = 0.95,
     avifQuality = AVIF_DEFAULT_OPTIONS.quality,
   } = msg;
   const outputFormat = resolveOutputFormat(msg.outputFormat);
 
   const intermediates = [];
+
+  let fallbackMaxDim = 4096;
 
   try {
     if (!frames.length) {
@@ -264,12 +282,29 @@ self.addEventListener('message', async (event) => {
     const srcW = frames[0].width;
     const srcH = frames[0].height;
     const webgl = getWebGLProcessor();
+    const nativeAvif =
+      outputFormat === 'avif' ? await supportsNativeCanvasAvif().catch(() => false) : false;
+    const texLimit = webgl ? webgl.maxTextureSize : 4096;
+    const encoderMax = getEncoderMaxDimension({
+      outputFormat,
+      maxTextureSize: texLimit,
+      supportsNativeAvif: nativeAvif,
+      aspectRatio,
+    });
+    const mpDim = computeMaxDimensionForMegapixels({
+      outputMegapixels,
+      aspectRatio,
+      outputFormat,
+      maxTextureSize: texLimit,
+      supportsNativeAvif: nativeAvif,
+    });
+    const maxDim =
+      typeof maxDimension === 'number' && Number.isFinite(maxDimension) && maxDimension >= 320
+        ? Math.max(320, Math.min(encoderMax, Math.round(maxDimension)))
+        : mpDim;
+    fallbackMaxDim = maxDim;
 
     if (webgl) {
-      const maxDim =
-        outputFormat === 'avif'
-          ? Math.min(webgl.maxTextureSize, 4096)
-          : webgl.maxTextureSize;
       const crop = computeAspectCrop(
         srcW,
         srcH,
@@ -341,7 +376,7 @@ self.addEventListener('message', async (event) => {
     // Fallback when Worker OffscreenCanvas lacks WebGL (e.g. iOS 16.4-16.6 Safari):
     // Still offload heavy multi-frame pixel averaging to the Worker!
     if (typeof OffscreenCanvas === 'function' && mode === 'hq' && frames.length > 1) {
-      const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, 4096);
+      const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
       const averagedCanvas = averageFramesCPU(frames, crop, mirrorX);
       const averagedBitmap = averagedCanvas.transferToImageBitmap();
       self.postMessage(
@@ -361,7 +396,7 @@ self.addEventListener('message', async (event) => {
 
     // Ultimate Canvas2D fallback inside Worker so transferred bitmaps are never lost
     if (typeof OffscreenCanvas === 'function') {
-      const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, 4096);
+      const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
       const { canvas, ctx } = cropFrameToCanvas(frames[0], crop, mirrorX);
       const encoded = await encodeWorkerOutput({
         format: outputFormat,
@@ -399,7 +434,7 @@ self.addEventListener('message', async (event) => {
           frames[0].height,
           aspectRatio,
           softwareZoom,
-          4096
+          fallbackMaxDim
         );
         const { canvas, ctx } = cropFrameToCanvas(frames[0], crop, mirrorX);
         const encoded = await encodeWorkerOutput({

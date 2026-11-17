@@ -155,16 +155,6 @@
         <span id="zoom-readout" class="zoom-readout">1.0×</span>
       </div>
 
-      <!-- Capture Mode Selector -->
-      <div class="mode-switcher" role="tablist" aria-label="撮影モード">
-        <button id="mode-standard" type="button" role="tab" aria-selected="true" class="mode-tab is-active" data-mode="standard">
-          標準
-        </button>
-        <button id="mode-hq" type="button" role="tab" aria-selected="false" class="mode-tab" data-mode="hq">
-          高画質 HDR
-        </button>
-      </div>
-
       <!-- Main Shutter Row -->
       <div class="shutter-row">
         <button id="btn-gallery" type="button" class="gallery-btn" aria-label="撮影写真プレビュー" disabled>
@@ -173,7 +163,7 @@
           <span id="thumb-count" class="thumb-count" hidden>0</span>
         </button>
 
-        <button id="btn-shutter" type="button" class="shutter-btn" aria-label="無音シャッターを切る">
+        <button id="btn-shutter" type="button" class="shutter-btn is-hq" aria-label="無音シャッターを切る">
           <span class="shutter-outer">
             <span class="shutter-inner"></span>
           </span>
@@ -244,6 +234,27 @@
 
       <div class="sheet-section">
         <h3 class="sheet-subtitle">撮影設定</h3>
+        <div class="setting-row">
+          <div class="setting-label">
+            <strong>撮影画質エンジン</strong>
+            <small>高画質 HDR（マルチフレーム合成＋WebGL トーンマッピング）で常時撮影します</small>
+          </div>
+          <span class="setting-badge">高画質 HDR</span>
+        </div>
+        <div class="setting-row setting-row--stacked">
+          <div class="setting-label">
+            <strong>カメラ解像度</strong>
+            <small id="resolution-setting-note">端末・レンズが対応する最大解像度を自動選択中</small>
+          </div>
+          <div id="resolution-options" class="lens-chip-list" role="radiogroup" aria-label="カメラ解像度"></div>
+        </div>
+        <div class="setting-row setting-row--stacked">
+          <div class="setting-label">
+            <strong>保存画素数</strong>
+            <small id="megapixels-setting-note">端末で保存できる最高画素数を自動選択中</small>
+          </div>
+          <div id="megapixels-options" class="lens-chip-list" role="radiogroup" aria-label="保存画素数"></div>
+        </div>
         <div class="setting-row">
           <div class="setting-label">
             <strong>保存フォーマット</strong>

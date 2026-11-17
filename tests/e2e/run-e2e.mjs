@@ -108,7 +108,7 @@ async function main() {
     // 1. Wait for live camera stream and verify <1.5s startup & silent (no audio tracks)
     await page.waitForFunction(() => {
       const v = document.getElementById('camera-video');
-      return v && v.videoWidth > 0 && v.videoHeight > 0;
+      return Boolean(window.__QCAM__?.streamInfo && v && v.videoWidth > 0 && v.videoHeight > 0);
     }, { timeout: 6000 });
 
     const startupMetrics = await page.evaluate(() => {
@@ -318,16 +318,25 @@ async function main() {
     assert.ok(orientationCheck.mainCorners.tl[0] > 180 && orientationCheck.mainCorners.tl[1] < 80);
     assert.ok(orientationCheck.mainCorners.bl[2] > 180 && orientationCheck.mainCorners.bl[0] < 80);
 
-    console.log('[e2e] capturing Standard mode AVIF photo');
-    // 8. Capture Standard mode photo via shutter click (AVIF default)
+    console.log('[e2e] verifying Standard mode removal and always-on HQ HDR AVIF capture');
+    // 8. Verify mode-switcher is removed and shutter is always in HDR mode even if legacy localStorage had mode: 'standard'
+    assert.equal(await page.locator('.mode-switcher').count(), 0, 'Mode switcher UI must be removed');
+    assert.equal(await page.locator('#mode-standard').count(), 0, 'Standard mode tab must not exist');
+    assert.equal(await page.locator('#mode-hq').count(), 0, 'HQ mode tab must not exist');
+    assert.equal(
+      await page.evaluate(() => document.getElementById('btn-shutter').classList.contains('is-hq')),
+      true,
+      'Shutter must display active HDR ring by default'
+    );
+
     const downloadPromise = page.waitForEvent('download', { timeout: 10000 });
     await page.click('#btn-shutter');
     const download = await downloadPromise;
     assert.ok(download.suggestedFilename().startsWith('Qcam_'));
-    assert.ok(download.suggestedFilename().endsWith('.avif'));
+    assert.ok(download.suggestedFilename().includes('_HDR.avif'));
 
     await page.waitForFunction(() => window.__QCAM__.photos.length === 1);
-    const stdPhoto = await page.evaluate(async () => {
+    const firstHdrPhoto = await page.evaluate(async () => {
       const p = window.__QCAM__.photos[0];
       const hdr = new Uint8Array(await p.blob.slice(0, 16).arrayBuffer());
       return {
@@ -342,17 +351,15 @@ async function main() {
         ftyp: String.fromCharCode(...hdr.slice(4, 12)),
       };
     });
-    assert.equal(stdPhoto.mode, 'standard');
-    assert.equal(stdPhoto.format, 'avif');
-    assert.equal(stdPhoto.type, 'image/avif');
-    assert.equal(stdPhoto.ftyp, 'ftypavif');
-    assert.ok(stdPhoto.size > 200);
-    assert.ok(Math.abs(stdPhoto.width / stdPhoto.height - 4 / 3) < 0.02);
+    assert.equal(firstHdrPhoto.mode, 'hq');
+    assert.equal(firstHdrPhoto.format, 'avif');
+    assert.equal(firstHdrPhoto.type, 'image/avif');
+    assert.equal(firstHdrPhoto.ftyp, 'ftypavif');
+    assert.ok(firstHdrPhoto.size > 200);
+    assert.ok(Math.abs(firstHdrPhoto.width / firstHdrPhoto.height - 4 / 3) < 0.02);
 
-    console.log('[e2e] capturing High Quality HDR burst AVIF photo');
-    // 9. Switch to High Quality HDR mode & capture 4-frame burst as AVIF
-    await page.click('#mode-hq');
-    assert.equal(await page.getAttribute('#mode-hq', 'aria-selected'), 'true');
+    console.log('[e2e] capturing second HQ HDR burst AVIF photo for gallery strip check');
+    // 9. Capture a second HDR AVIF photo cleanly for gallery strip verification
     const hqDownloadPromise = page.waitForEvent('download', { timeout: 10000 });
     await page.click('#btn-shutter');
     const hqDownload = await hqDownloadPromise;
@@ -394,7 +401,7 @@ async function main() {
         clientW: el.clientWidth,
       };
     });
-    assert.ok(previewMetaMetrics.text.includes('AVIF'));
+    assert.ok(previewMetaMetrics.text.includes('AVIF') && previewMetaMetrics.text.includes('HDR'));
     assert.ok(previewMetaMetrics.scrollW <= previewMetaMetrics.clientW + 1, `Preview meta truncated: ${JSON.stringify(previewMetaMetrics)}`);
     assert.ok((await page.textContent('#btn-modal-save')).includes('AVIF'));
 
@@ -462,12 +469,17 @@ async function main() {
     await page.click('#btn-timer');
     await page.click('#btn-timer');
 
-    // 13. Open Settings / Info Sheet, verify AVIF diagnostics & version, test JPEG format switch, then switch back to AVIF
+    // 13. Open Settings / Info Sheet, verify AVIF/HDR diagnostics, quality controls & version, test JPEG format switch, then switch back to AVIF
     await page.click('#btn-info');
     await page.waitForSelector('#info-modal:not([hidden])');
     assert.equal(await page.getAttribute('#btn-format-avif', 'aria-checked'), 'true');
+    assert.ok((await page.locator('#resolution-options .lens-chip').count()) >= 1);
+    assert.ok((await page.locator('#megapixels-options .lens-chip').count()) >= 1);
     const diagText = await page.textContent('#diagnostics-list');
-    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.4.1'));
+    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.5.0'));
+    assert.ok(diagText.includes('撮影画質モード') && diagText.includes('高画質 HDR (常時有効)'));
+    assert.ok(diagText.includes('解像度設定 / 上限'));
+    assert.ok(diagText.includes('保存画素数設定'));
     assert.ok(diagText.includes('WebGL') || diagText.includes('worker') || diagText.includes('canvas'));
     assert.ok(diagText.includes('保存フォーマット') && diagText.includes('AVIF'));
     assert.ok(diagText.includes('直近の生成ファイル') && diagText.includes('.avif') && diagText.includes('image/avif'));
@@ -487,7 +499,7 @@ async function main() {
     const jpgDlPromise = page.waitForEvent('download', { timeout: 6000 });
     await page.click('#btn-shutter');
     const jpgDl = await jpgDlPromise;
-    assert.ok(jpgDl.suggestedFilename().endsWith('.jpg'));
+    assert.ok(jpgDl.suggestedFilename().endsWith('_HDR.jpg'));
     await page.waitForFunction(() => window.__QCAM__.photos.length === 2);
     assert.equal(await page.evaluate(() => window.__QCAM__.photos[0].blob.type), 'image/jpeg');
 
@@ -527,15 +539,15 @@ async function main() {
       'Transient visibilitychange must keep active camera stream alive without re-prompting'
     );
 
-    // 16. Verify persisted settings (16:9, grid ON, hq mode, user facing) survive page reload cleanly
+    // 16. Verify persisted settings (16:9, grid ON, HDR always on, user facing) survive page reload cleanly
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 10000 });
     await page.waitForFunction(() => {
       const v = document.getElementById('camera-video');
-      return v && v.videoWidth > 0 && v.videoHeight > 0;
+      return Boolean(window.__QCAM__?.streamInfo && v && v.videoWidth > 0 && v.videoHeight > 0);
     }, { timeout: 6000 });
     assert.equal(await page.textContent('#aspect-label'), '16:9');
     assert.equal(await page.getAttribute('#btn-grid', 'aria-pressed'), 'true');
-    assert.equal(await page.getAttribute('#mode-hq', 'aria-selected'), 'true');
+    assert.equal(await page.evaluate(() => window.__QCAM__.settings.mode), 'hq');
     assert.equal(await page.evaluate(() => window.__QCAM__.camera.facingMode), 'user');
     assert.equal(await page.locator('#perm-hint-banner').isVisible(), false);
 
@@ -589,14 +601,14 @@ async function main() {
       const zoomBar = document.querySelector('.zoom-bar').getBoundingClientRect();
       const topHud = document.getElementById('top-hud').getBoundingClientRect();
       const shutter = document.getElementById('btn-shutter').getBoundingClientRect();
-      const modeSwitcher = document.querySelector('.mode-switcher').getBoundingClientRect();
+      const shutterRow = document.querySelector('.shutter-row').getBoundingClientRect();
       const vf = document.getElementById('viewfinder-frame').getBoundingClientRect();
       return {
         dock,
         zoomBar,
         topHud,
         shutter,
-        modeSwitcher,
+        shutterRow,
         vf,
         dockScrollH: document.querySelector('.bottom-dock').scrollHeight,
       };
@@ -604,7 +616,11 @@ async function main() {
     assert.ok(landStats.dock.height <= 391 && landStats.dockScrollH <= 391, `Landscape dock overflowed vertically: ${JSON.stringify(landStats)}`);
     assert.ok(landStats.zoomBar.right <= landStats.dock.left + 1, `Zoom bar overlaps landscape right dock: ${JSON.stringify(landStats)}`);
     assert.ok(landStats.topHud.right <= landStats.dock.left + 1, `Top HUD overlaps landscape right dock: ${JSON.stringify(landStats)}`);
-    assert.ok(landStats.shutter.bottom <= 390 && landStats.modeSwitcher.top >= 0);
+    assert.ok(landStats.shutter.bottom <= 390 && landStats.shutterRow.top >= 0);
+    assert.ok(
+      Math.abs((landStats.shutterRow.top + landStats.shutterRow.bottom) / 2 - 195) < 40,
+      `Landscape shutter row should sit balanced near vertical center, got ${JSON.stringify(landStats.shutterRow)}`
+    );
     assert.ok(landStats.vf.left + landStats.vf.width <= landStats.dock.left + 2, `Landscape viewfinder hidden under dock: ${JSON.stringify(landStats.vf)}`);
 
     // Tap near right edge of landscape viewfinder and verify EV slider flips left cleanly
@@ -706,18 +722,19 @@ async function main() {
     await iosPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
     await iosPage.waitForFunction(() => {
       const v = document.getElementById('camera-video');
-      return v && v.videoWidth > 0 && v.videoHeight > 0;
+      return Boolean(window.__QCAM__?.streamInfo && v && v.videoWidth > 0 && v.videoHeight > 0);
     }, { timeout: 6000 });
 
-    // Confirm legacy iOS setting migrated autoSave to true automatically
+    // Confirm legacy iOS setting migrated autoSave to true and mode to 'hq' HDR automatically
     assert.equal(await iosPage.evaluate(() => window.__QCAM__.settings.autoSave), true);
+    assert.equal(await iosPage.evaluate(() => window.__QCAM__.settings.mode), 'hq');
 
-    // Direct capture triggers Web Share immediately with strictly { files: [...] } and .avif / image/avif
+    // Direct capture triggers Web Share immediately with strictly { files: [...] } and _HDR.avif / image/avif
     await iosPage.click('#btn-shutter');
     await iosPage.waitForFunction(() => window.__SHARE_CALLS__.length === 1, { timeout: 10000 });
     const firstShareCall = await iosPage.evaluate(() => window.__SHARE_CALLS__[0]);
     assert.deepEqual(firstShareCall.keys, ['files']);
-    assert.ok(firstShareCall.fileName.endsWith('.avif'), `Expected .avif filename, got ${firstShareCall.fileName}`);
+    assert.ok(firstShareCall.fileName.includes('_HDR.avif'), `Expected _HDR.avif filename, got ${firstShareCall.fileName}`);
     assert.equal(firstShareCall.fileType, 'image/avif');
     assert.equal(await iosPage.locator('#preview-modal').isVisible(), false);
 
@@ -822,7 +839,7 @@ async function main() {
     await iosPwaPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
     await iosPwaPage.waitForFunction(() => {
       const v = document.getElementById('camera-video');
-      return v && v.videoWidth > 0 && v.videoHeight > 0;
+      return Boolean(window.__QCAM__?.streamInfo && v && v.videoWidth > 0 && v.videoHeight > 0);
     }, { timeout: 6000 });
     await iosPwaPage.click('#btn-shutter');
     await iosPwaPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 10000 });
@@ -936,7 +953,7 @@ async function main() {
     await androidUwPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
     await androidUwPage.waitForFunction(() => {
       const v = document.getElementById('camera-video');
-      return v && v.videoWidth > 0 && v.videoHeight > 0;
+      return Boolean(window.__QCAM__?.streamInfo && v && v.videoWidth > 0 && v.videoHeight > 0);
     }, { timeout: 6000 });
 
     assert.equal(await androidUwPage.locator('#btn-zoom-05').isVisible(), true);
@@ -1168,12 +1185,257 @@ async function main() {
     assert.equal(await iosUwPage.textContent('#zoom-readout'), '1.0×');
     await iosUwContext.close();
 
+    // 22. Per-device max resolution auto-upgrade, camera resolution/megapixels UI, and Android high-res takePhoto() + HDR pipeline
+    console.log('[e2e] checking per-device max resolution upgrade, resolution/MP settings UI & takePhoto+HDR');
+    const hiResContext = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+      acceptDownloads: true,
+      userAgent:
+        'Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36',
+      permissions: ['camera'],
+    });
+    const hiResPage = await hiResContext.newPage();
+    hiResPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(`[android-hires] ${msg.text()}`);
+    });
+    hiResPage.on('pageerror', (err) => {
+      pageErrors.push(`[android-hires] ${err.message}`);
+    });
+    await hiResPage.addInitScript(() => {
+      window.__HIRES_APPLIED__ = [];
+      window.__HIRES_TAKEPHOTO__ = [];
+
+      window.ImageCapture = class MockImageCapture {
+        constructor(track) {
+          this.track = track;
+        }
+        async getPhotoCapabilities() {
+          await new Promise((r) => setTimeout(r, 25));
+          return {
+            imageWidth: { min: 640, max: 4800, step: 2 },
+            imageHeight: { min: 480, max: 3600, step: 2 },
+          };
+        }
+        async grabFrame() {
+          const canvas = this.track?.__qcamCanvas;
+          return createImageBitmap(canvas);
+        }
+        async takePhoto(settings = {}) {
+          const w = Math.min(4800, Math.max(640, Number(settings.imageWidth) || 4800));
+          const h = Math.min(3600, Math.max(480, Number(settings.imageHeight) || 3600));
+          window.__HIRES_TAKEPHOTO__.push({ width: w, height: h });
+          const c = document.createElement('canvas');
+          c.width = w;
+          c.height = h;
+          const ctx = c.getContext('2d');
+          ctx.fillStyle = '#1e293b';
+          ctx.fillRect(0, 0, w, h);
+          ctx.fillStyle = '#ef4444';
+          ctx.fillRect(0, 0, Math.round(w * 0.2), Math.round(h * 0.2));
+          ctx.fillStyle = '#22c55e';
+          ctx.fillRect(Math.round(w * 0.8), 0, Math.round(w * 0.2), Math.round(h * 0.2));
+          ctx.fillStyle = '#38bdf8';
+          ctx.fillRect(Math.round(w * 0.35), Math.round(h * 0.35), Math.round(w * 0.3), Math.round(h * 0.3));
+          return await new Promise((resolve) => c.toBlob(resolve, 'image/jpeg', 0.9));
+        }
+      };
+
+      const capW = 2560;
+      const capH = 1920;
+      navigator.mediaDevices.enumerateDevices = async () => [
+        {
+          kind: 'videoinput',
+          deviceId: 'hires-back-0',
+          groupId: 'g-hi',
+          label: 'camera2 0, facing back',
+          toJSON() { return this; },
+          getCapabilities: () => ({
+            facingMode: ['environment'],
+            width: { min: 320, max: capW },
+            height: { min: 240, max: capH },
+          }),
+        },
+      ];
+
+      navigator.mediaDevices.getUserMedia = async () => {
+        // Simulate driver that initially opens at 1280x720 before applyConstraints upgrades it to sensor max (2560x1920)
+        let curW = 1280;
+        let curH = 720;
+        const canvas = document.createElement('canvas');
+        canvas.width = curW;
+        canvas.height = curH;
+        const ctx = canvas.getContext('2d');
+        const paint = () => {
+          ctx.fillStyle = '#162230';
+          ctx.fillRect(0, 0, curW, curH);
+          ctx.fillStyle = '#fbbf24';
+          ctx.fillRect(40, 40, Math.round(curW * 0.18), Math.round(curH * 0.18));
+        };
+        paint();
+        const iv = setInterval(paint, 120);
+        const stream = canvas.captureStream(15);
+        const track = stream.getVideoTracks()[0];
+        track.__qcamCanvas = canvas;
+        const origStop = track.stop.bind(track);
+        track.stop = () => {
+          clearInterval(iv);
+          return origStop();
+        };
+        track.getSettings = () => ({
+          deviceId: 'hires-back-0',
+          facingMode: 'environment',
+          width: curW,
+          height: curH,
+          frameRate: 30,
+        });
+        track.getCapabilities = () => ({
+          facingMode: ['environment'],
+          width: { min: 320, max: capW },
+          height: { min: 240, max: capH },
+        });
+        track.applyConstraints = async (c) => {
+          window.__HIRES_APPLIED__.push(JSON.parse(JSON.stringify(c || {})));
+          const reqW = Number(c?.width?.ideal);
+          const reqH = Number(c?.height?.ideal);
+          if (reqW > 0 && reqH > 0) {
+            curW = Math.min(capW, Math.max(320, Math.round(reqW)));
+            curH = Math.min(capH, Math.max(240, Math.round(reqH)));
+            canvas.width = curW;
+            canvas.height = curH;
+            paint();
+          }
+        };
+        return stream;
+      };
+    });
+
+    await hiResPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    // Verify initial 1280x720 stream automatically upgraded via applyConstraints to 2560x1920 max
+    await hiResPage.waitForFunction(
+      () =>
+        window.__QCAM__.streamInfo?.videoWidth === 2560 &&
+        window.__QCAM__.streamInfo?.videoHeight === 1920 &&
+        window.__QCAM__.streamInfo?.photoMaxWidth === 4800,
+      { timeout: 10000 }
+    );
+    assert.equal(await hiResPage.textContent('#resolution-badge'), '2560×1920');
+    assert.ok(
+      await hiResPage.evaluate(() =>
+        window.__HIRES_APPLIED__.some((c) => c?.width?.ideal === 2560 && c?.height?.ideal === 1920)
+      ),
+      'Expected automatic applyConstraints upgrade to 2560x1920 sensor max'
+    );
+
+    // Open settings and inspect per-device tailored resolution & megapixel chips
+    await hiResPage.click('#btn-info');
+    await hiResPage.waitForSelector('#info-modal:not([hidden])');
+    const resChipTexts = await hiResPage.locator('#resolution-options .lens-chip').allTextContents();
+    assert.ok(resChipTexts.some((t) => t.includes('最高 (2560×1920)')), `Missing max 2560x1920 option: ${resChipTexts}`);
+    assert.ok(resChipTexts.some((t) => t.includes('FHD')), `Missing FHD option: ${resChipTexts}`);
+    assert.ok(!resChipTexts.some((t) => t.includes('4K')), `4K option should not appear when sensor max is 2560x1920: ${resChipTexts}`);
+    assert.equal(await hiResPage.getAttribute('#resolution-options [data-resolution-preset="max"]', 'aria-checked'), 'true');
+
+    // AVIF caps >16MP sensor cleanly with clear note and allows full 17.3 MP in JPEG
+    const avifMpTopText = await hiResPage.textContent('#megapixels-options [data-megapixels="max"]');
+    const avifMpNote = await hiResPage.textContent('#megapixels-setting-note');
+    assert.ok(avifMpTopText.includes('AVIF上限'), `Expected AVIF cap label on 17.3MP sensor, got ${avifMpTopText}`);
+    assert.ok(avifMpNote.includes('JPEG時はさらに高画素可'), `Expected JPEG upgrade hint, got ${avifMpNote}`);
+
+    // Switch resolution preset to FHD and verify live stream updates & persists across reload
+    await hiResPage.click('#resolution-options [data-resolution-preset="fhd"]');
+    await hiResPage.waitForFunction(
+      () =>
+        window.__QCAM__.streamInfo?.videoWidth === 1920 &&
+        window.__QCAM__.streamInfo?.videoHeight === 1440 &&
+        document.getElementById('resolution-badge').textContent === '1920×1440',
+      { timeout: 6000 }
+    );
+    await hiResPage.click('#btn-info-close');
+
+    await hiResPage.reload({ waitUntil: 'domcontentloaded', timeout: 10000 });
+    await hiResPage.waitForFunction(
+      () =>
+        window.__QCAM__.settings.cameraResolution === 'fhd' &&
+        window.__QCAM__.streamInfo?.videoWidth === 1920 &&
+        window.__QCAM__.streamInfo?.videoHeight === 1440,
+      { timeout: 10000 }
+    );
+    assert.equal(await hiResPage.textContent('#resolution-badge'), '1920×1440');
+
+    // Capture in AVIF with '8 MP' selected -> uses Android takePhoto() + HDR and outputs 8MP AVIF
+    await hiResPage.click('#btn-info');
+    await hiResPage.waitForSelector('#info-modal:not([hidden])');
+    await hiResPage.click('#megapixels-options [data-megapixels="8"]');
+    assert.equal(await hiResPage.evaluate(() => window.__QCAM__.settings.outputMegapixels), 8);
+    await hiResPage.click('#btn-info-close');
+
+    const avif8MpDlPromise = hiResPage.waitForEvent('download', { timeout: 20000 });
+    await hiResPage.click('#btn-shutter');
+    const avif8MpDl = await avif8MpDlPromise;
+    assert.ok(avif8MpDl.suggestedFilename().includes('_HDR.avif'));
+    await hiResPage.waitForFunction(() => window.__QCAM__.photos.length === 1 && !window.__QCAM__.isCapturing, { timeout: 20000 });
+    const avif8MpPhoto = await hiResPage.evaluate(() => {
+      const p = window.__QCAM__.photos[0];
+      return {
+        width: p.width,
+        height: p.height,
+        mode: p.mode,
+        format: p.format,
+        source: window.__QCAM__.lastCaptureSource,
+      };
+    });
+    assert.equal(avif8MpPhoto.mode, 'hq');
+    assert.equal(avif8MpPhoto.format, 'avif');
+    assert.equal(avif8MpPhoto.source, 'takePhoto');
+    assert.ok(avif8MpPhoto.width >= 3200 && avif8MpPhoto.width <= 3320, `Expected ~3266px width for 8MP, got ${avif8MpPhoto.width}`);
+    assert.ok(avif8MpPhoto.height >= 2400 && avif8MpPhoto.height <= 2500, `Expected ~2450px height for 8MP, got ${avif8MpPhoto.height}`);
+
+    // Switch back to 'max' MP + JPEG format -> unlocks full 4800x3600 (17.3 MP) takePhoto() + HDR output
+    await hiResPage.click('#btn-info');
+    await hiResPage.waitForSelector('#info-modal:not([hidden])');
+    await hiResPage.click('#btn-format-jpeg');
+    await hiResPage.click('#megapixels-options [data-megapixels="max"]');
+    const jpegMpTopText = await hiResPage.textContent('#megapixels-options [data-megapixels="max"]');
+    assert.ok(jpegMpTopText.includes('17.3 MP') && !jpegMpTopText.includes('AVIF上限'), `Expected unlocked 17.3 MP in JPEG, got ${jpegMpTopText}`);
+    await hiResPage.click('#btn-info-close');
+
+    const jpegMaxDlPromise = hiResPage.waitForEvent('download', { timeout: 20000 });
+    await hiResPage.click('#btn-shutter');
+    const jpegMaxDl = await jpegMaxDlPromise;
+    assert.ok(jpegMaxDl.suggestedFilename().includes('_HDR.jpg'));
+    await hiResPage.waitForFunction(() => window.__QCAM__.photos.length === 2 && !window.__QCAM__.isCapturing, { timeout: 20000 });
+    const jpegMaxPhoto = await hiResPage.evaluate(() => {
+      const p = window.__QCAM__.photos[0];
+      return {
+        width: p.width,
+        height: p.height,
+        mode: p.mode,
+        format: p.format,
+        source: window.__QCAM__.lastCaptureSource,
+      };
+    });
+    assert.equal(jpegMaxPhoto.width, 4800);
+    assert.equal(jpegMaxPhoto.height, 3600);
+    assert.equal(jpegMaxPhoto.mode, 'hq');
+    assert.equal(jpegMaxPhoto.format, 'jpeg');
+    assert.equal(jpegMaxPhoto.source, 'takePhoto');
+
+    if (screenshotDir) {
+      await hiResPage.click('#btn-info');
+      await hiResPage.waitForSelector('#info-modal:not([hidden])');
+      await hiResPage.screenshot({ path: path.join(screenshotDir, 'e2e_hires_settings.png') });
+      await hiResPage.click('#btn-info-close');
+    }
+    await hiResContext.close();
+
     assert.deepEqual(consoleErrors, [], `Console errors encountered: ${consoleErrors.join('; ')}`);
     assert.deepEqual(pageErrors, [], `Page errors encountered: ${pageErrors.join('; ')}`);
 
     console.log('E2E PASS:', JSON.stringify({
       startupTimeMs: startupMetrics.startupTimeMs,
-      stdPhoto,
+      firstHdrPhoto,
       hqPhoto,
       orientationEngine: orientationCheck.engine,
       mainOffloadEngine: orientationCheck.mainEngine,
@@ -1188,6 +1450,10 @@ async function main() {
       iosShareCalls: 3,
       ultraWideHardware05x: true,
       ultraWideDeviceSwitch05x: true,
+      hdrResolutionCheck: {
+        avif8MpPhoto,
+        jpegMaxPhoto,
+      },
     }, null, 2));
   } finally {
     await browser.close();

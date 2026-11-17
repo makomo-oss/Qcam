@@ -2,6 +2,7 @@ import {
   computeViewfinderLayout,
   mapTapToNormalizedPoint,
 } from '../utils/geometry.js';
+import { formatMegapixelsLabel } from '../utils/resolution.js';
 
 export class CameraUI {
   constructor(handlers) {
@@ -50,7 +51,6 @@ export class CameraUI {
       zoomSlider: document.getElementById('zoom-slider'),
       zoomReadout: document.getElementById('zoom-readout'),
 
-      modeTabs: Array.from(document.querySelectorAll('.mode-tab')),
       btnGallery: document.getElementById('btn-gallery'),
       thumbImg: document.getElementById('thumb-img'),
       thumbPlaceholder: document.getElementById('thumb-placeholder'),
@@ -74,6 +74,10 @@ export class CameraUI {
 
       infoModal: document.getElementById('info-modal'),
       btnInfoClose: document.getElementById('btn-info-close'),
+      resolutionSettingNote: document.getElementById('resolution-setting-note'),
+      resolutionOptions: document.getElementById('resolution-options'),
+      megapixelsSettingNote: document.getElementById('megapixels-setting-note'),
+      megapixelsOptions: document.getElementById('megapixels-options'),
       formatButtons: Array.from(document.querySelectorAll('[data-format]')),
       toggleAutoSave: document.getElementById('toggle-auto-save'),
       toggleMirrorFront: document.getElementById('toggle-mirror-front'),
@@ -87,7 +91,6 @@ export class CameraUI {
       aspectRatio: '4:3',
       gridVisible: false,
       timerSeconds: 0,
-      mode: 'standard',
       outputFormat: 'avif',
       mirroredPreview: false,
       softwareZoom: 1,
@@ -138,12 +141,6 @@ export class CameraUI {
     this.els.btnShutter.addEventListener('click', () => this.handlers.onShutterClick());
     this.els.btnSwitchCamera.addEventListener('click', () => this.handlers.onSwitchCamera());
     this.els.btnGallery.addEventListener('click', () => this.handlers.onOpenGallery());
-
-    for (const tab of this.els.modeTabs) {
-      tab.addEventListener('click', () => {
-        this.handlers.onSelectMode(tab.dataset.mode);
-      });
-    }
 
     for (const preset of this.els.zoomPresets) {
       preset.addEventListener('click', () => {
@@ -407,16 +404,6 @@ export class CameraUI {
     this.els.btnTimer.classList.toggle('is-active', seconds > 0);
   }
 
-  setCaptureMode(mode) {
-    this.state.mode = mode;
-    for (const tab of this.els.modeTabs) {
-      const active = tab.dataset.mode === mode;
-      tab.classList.toggle('is-active', active);
-      tab.setAttribute('aria-selected', String(active));
-    }
-    this.els.btnShutter.classList.toggle('is-hq', mode === 'hq');
-  }
-
   setOutputFormat(format) {
     const safeFormat = format === 'jpeg' ? 'jpeg' : 'avif';
     this.state.outputFormat = safeFormat;
@@ -549,6 +536,74 @@ export class CameraUI {
     }
   }
 
+  renderQualityControls({ resolutionData, megapixelData }) {
+    if (this.els.resolutionOptions && resolutionData) {
+      const { options = [], effectiveSelected = 'max', capWidth, capHeight } = resolutionData;
+      if (this.els.resolutionSettingNote) {
+        this.els.resolutionSettingNote.textContent =
+          capWidth && capHeight
+            ? `センサー上限 ${capWidth}×${capHeight}（変更でカメラ解像度を切替）`
+            : 'カメラから対応解像度を取得中';
+      }
+      this.els.resolutionOptions.innerHTML = '';
+      for (const opt of options) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        const isActive = opt.id === effectiveSelected;
+        btn.className = `lens-chip${isActive ? ' is-active' : ''}`;
+        btn.textContent = opt.label;
+        btn.dataset.resolutionPreset = opt.id;
+        btn.setAttribute('role', 'radio');
+        btn.setAttribute('aria-checked', String(isActive));
+        btn.addEventListener('click', () => {
+          this.handlers.onSelectResolution?.(opt.id);
+        });
+        this.els.resolutionOptions.appendChild(btn);
+      }
+    }
+
+    if (this.els.megapixelsOptions && megapixelData) {
+      const {
+        options = [],
+        effectiveSelected = 'max',
+        plannedOutWidth,
+        plannedOutHeight,
+        plannedOutMp,
+        sensorMaxMp,
+        isWasmCapped,
+      } = megapixelData;
+      if (this.els.megapixelsSettingNote) {
+        const plannedLabel =
+          plannedOutWidth && plannedOutHeight
+            ? `保存サイズ: ${plannedOutWidth}×${plannedOutHeight} (${formatMegapixelsLabel(plannedOutMp)})`
+            : '保存時の出力画素数を設定します';
+        const capHint = isWasmCapped
+          ? ` · センサー上限 ${formatMegapixelsLabel(sensorMaxMp)}（JPEG時はさらに高画素可）`
+          : '';
+        this.els.megapixelsSettingNote.textContent = `${plannedLabel}${capHint}`;
+      }
+      this.els.megapixelsOptions.innerHTML = '';
+      for (const opt of options) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        const isActive =
+          opt.value === effectiveSelected ||
+          (opt.value !== 'max' &&
+            effectiveSelected !== 'max' &&
+            Math.abs(Number(opt.value) - Number(effectiveSelected)) < 0.01);
+        btn.className = `lens-chip${isActive ? ' is-active' : ''}`;
+        btn.textContent = opt.label;
+        btn.dataset.megapixels = String(opt.value);
+        btn.setAttribute('role', 'radio');
+        btn.setAttribute('aria-checked', String(isActive));
+        btn.addEventListener('click', () => {
+          this.handlers.onSelectMegapixels?.(opt.value);
+        });
+        this.els.megapixelsOptions.appendChild(btn);
+      }
+    }
+  }
+
   showCameraOverlay(title, message, options = true) {
     const { showRetry = true, showHelp = false } =
       typeof options === 'boolean' ? { showRetry: options } : options || {};
@@ -630,7 +685,7 @@ export class CameraUI {
 
     const kb = Math.round(photo.blob.size / 1024);
     const sizeText = kb >= 1024 ? `${(kb / 1024).toFixed(2)}MB` : `${kb}KB`;
-    const modeLabel = photo.mode === 'hq' ? 'HDR' : '標準';
+    const modeLabel = 'HDR';
     const timeText =
       photo.totalTimeMs >= 1000
         ? `${(photo.totalTimeMs / 1000).toFixed(1)}s`

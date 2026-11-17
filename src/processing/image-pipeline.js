@@ -1,4 +1,8 @@
 import { computeAspectCrop } from '../utils/geometry.js';
+import {
+  computeMaxDimensionForMegapixels,
+  getEncoderMaxDimension,
+} from '../utils/resolution.js';
 import { WebGLImageProcessor } from './webgl-processor.js';
 import {
   AVIF_DEFAULT_OPTIONS,
@@ -24,6 +28,9 @@ export class ImagePipeline {
     this.mainWebGL = null;
     this.pending = new Map();
     this.nextJobId = 1;
+    this.maxTextureSize = 4096;
+    this.supportsNativeAvif = false;
+    this.onCapabilitiesChange = null;
     this._initWorker();
   }
 
@@ -36,6 +43,16 @@ export class ImagePipeline {
       );
       this.worker.addEventListener('message', (event) => {
         const data = event.data;
+        if (data?.type === 'capabilities') {
+          if (typeof data.maxTextureSize === 'number' && data.maxTextureSize > 0) {
+            this.maxTextureSize = data.maxTextureSize;
+          }
+          this.supportsNativeAvif = Boolean(data.supportsNativeAvif);
+          if (typeof this.onCapabilitiesChange === 'function') {
+            this.onCapabilitiesChange(this.getCapabilities());
+          }
+          return;
+        }
         if (!data || !this.pending.has(data.id)) return;
         const { resolve } = this.pending.get(data.id);
         this.pending.delete(data.id);
@@ -65,14 +82,32 @@ export class ImagePipeline {
     }
   }
 
+  getCapabilities() {
+    return {
+      maxTextureSize: this.maxTextureSize,
+      supportsNativeAvif: this.supportsNativeAvif,
+    };
+  }
+
   warmup() {
     if (this.worker) {
       this.worker.postMessage({ type: 'warmup' });
     } else {
       warmupAvifEncoder().catch(() => {});
     }
-    if (!this.platform.supportsOffscreenWebGL) {
-      this._getMainWebGL();
+    if (!this.worker || !this.platform.supportsOffscreenWebGL) {
+      const webgl = this._getMainWebGL();
+      if (webgl && webgl.maxTextureSize) {
+        this.maxTextureSize = webgl.maxTextureSize;
+      }
+      supportsNativeCanvasAvif()
+        .catch(() => false)
+        .then((native) => {
+          this.supportsNativeAvif = Boolean(native);
+          if (typeof this.onCapabilitiesChange === 'function') {
+            this.onCapabilitiesChange(this.getCapabilities());
+          }
+        });
     }
   }
 
@@ -187,13 +222,15 @@ export class ImagePipeline {
    * Process captured frame(s) and return encoded AVIF (default) or JPEG Blob + metadata.
    */
   async process({
-    mode = 'standard',
+    mode = 'hq',
     frames = [],
     aspectRatio = '4:3',
     softwareZoom = 1,
     mirrorX = false,
     exposureEv = 0,
     outputFormat = 'avif',
+    outputMegapixels = 'max',
+    maxDimension = null,
     jpegQuality = JPEG_QUALITY,
     avifQuality = AVIF_DEFAULT_OPTIONS.quality,
   }) {
@@ -207,7 +244,7 @@ export class ImagePipeline {
     // Try Web Worker first when OffscreenCanvas is available
     if (this.worker && this.platform.supportsOffscreenCanvas) {
       const id = this.nextJobId++;
-      // Keep bitmaps on main thread when Worker lacks OffscreenCanvas WebGL on single-frame standard shots;
+      // Keep bitmaps on main thread when Worker lacks OffscreenCanvas WebGL on single-frame shots;
       // Worker still offloads multi-frame HQ averaging and AVIF WASM encoding.
       if (this.platform.supportsOffscreenWebGL || mode === 'hq') {
         const result = await new Promise((resolve) => {
@@ -223,6 +260,8 @@ export class ImagePipeline {
               mirrorX,
               exposureEv,
               outputFormat: format,
+              outputMegapixels,
+              maxDimension,
               jpegQuality,
               avifQuality,
             },
@@ -252,6 +291,8 @@ export class ImagePipeline {
               mirrorX: false,
               exposureEv,
               outputFormat: format,
+              outputMegapixels,
+              maxDimension,
               jpegQuality,
               avifQuality,
               preCropped: true,
@@ -282,6 +323,8 @@ export class ImagePipeline {
         mirrorX,
         exposureEv,
         outputFormat: format,
+        outputMegapixels,
+        maxDimension,
         jpegQuality,
         avifQuality,
         preCropped: false,
@@ -302,13 +345,15 @@ export class ImagePipeline {
   }
 
   async _processOnMainThread({
-    mode,
+    mode = 'hq',
     frames,
     aspectRatio,
     softwareZoom,
     mirrorX,
     exposureEv,
     outputFormat = 'avif',
+    outputMegapixels = 'max',
+    maxDimension = null,
     jpegQuality = JPEG_QUALITY,
     avifQuality = AVIF_DEFAULT_OPTIONS.quality,
     preCropped,
@@ -318,12 +363,28 @@ export class ImagePipeline {
     const srcH = frames[0].height;
     const format = resolveOutputFormat(outputFormat);
     const webgl = this._getMainWebGL();
+    const nativeAvif =
+      format === 'avif' ? await supportsNativeCanvasAvif().catch(() => false) : false;
+    const texLimit = webgl ? webgl.maxTextureSize : 4096;
+    const encoderMax = getEncoderMaxDimension({
+      outputFormat: format,
+      maxTextureSize: texLimit,
+      supportsNativeAvif: nativeAvif,
+      aspectRatio,
+    });
+    const mpDim = computeMaxDimensionForMegapixels({
+      outputMegapixels,
+      aspectRatio,
+      outputFormat: format,
+      maxTextureSize: texLimit,
+      supportsNativeAvif: nativeAvif,
+    });
+    const maxDim =
+      typeof maxDimension === 'number' && Number.isFinite(maxDimension) && maxDimension >= 320
+        ? Math.max(320, Math.min(encoderMax, Math.round(maxDimension)))
+        : mpDim;
 
     if (webgl) {
-      const maxDim =
-        format === 'avif'
-          ? Math.min(webgl.maxTextureSize, 4096)
-          : webgl.maxTextureSize;
       const crop = preCropped
         ? {
             sx: 0,
@@ -416,7 +477,7 @@ export class ImagePipeline {
     }
 
     // Ultimate Canvas2D fallback if WebGL is completely unavailable
-    const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, 4096);
+    const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
     const canvas = document.createElement('canvas');
     canvas.width = crop.outWidth;
     canvas.height = crop.outHeight;
