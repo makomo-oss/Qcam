@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#14171f"/>
+      <stop offset="100%" stop-color="#06070a"/>
+    </linearGradient>
+    <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3f4656"/>
+      <stop offset="50%" stop-color="#1b1f29"/>
+      <stop offset="100%" stop-color="#2c3240"/>
+    </linearGradient>
+    <radialGradient id="glassGrad" cx="42%" cy="38%" r="60%">
+      <stop offset="0%" stop-color="#223047"/>
+      <stop offset="55%" stop-color="#0d131d"/>
+      <stop offset="100%" stop-color="#05070b"/>
+    </radialGradient>
+    <linearGradient id="amberGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#d97706"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)"/>
+  <circle cx="256" cy="256" r="184" fill="url(#ringGrad)" stroke="#4c5568" stroke-width="4"/>
+  <circle cx="256" cy="256" r="154" fill="#090b10" stroke="#222733" stroke-width="3"/>
+  <circle cx="256" cy="256" r="134" fill="url(#glassGrad)"/>
+  <!-- Optical precision aperture rings -->
+  <circle cx="256" cy="256" r="96" fill="none" stroke="rgba(255,255,255,0.14)" stroke-width="2"/>
+  <circle cx="256" cy="256" r="64" fill="none" stroke="rgba(255,255,255,0.22)" stroke-width="2.5"/>
+  <!-- Lens reflections -->
+  <ellipse cx="212" cy="204" rx="34" ry="18" transform="rotate(-32 212 204)" fill="rgba(147, 197, 253, 0.22)"/>
+  <circle cx="294" cy="296" r="12" fill="rgba(251, 191, 36, 0.35)"/>
+  <!-- Q tail / optical precision accent -->
+  <path d="M 314 314 L 386 386" stroke="url(#amberGrad)" stroke-width="24" stroke-linecap="round"/>
+  <!-- Silent status indicator dot -->
+  <circle cx="384" cy="128" r="16" fill="url(#amberGrad)"/>
+</svg>
