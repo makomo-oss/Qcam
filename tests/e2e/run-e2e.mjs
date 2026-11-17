@@ -1,5 +1,6 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
@@ -52,14 +53,16 @@ function startStaticServer() {
 
 async function main() {
   const { server, url } = await startStaticServer();
-  const executablePath = process.env.CHROME_PATH || '/usr/bin/chromium';
+  const executablePath =
+    process.env.CHROME_PATH ||
+    (existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined);
   const screenshotDir = process.env.QCAM_SCREENSHOT_DIR || null;
 
-  console.log('[e2e] launching chromium:', executablePath);
+  console.log('[e2e] launching chromium:', executablePath || 'playwright-bundled');
   const browser = await chromium.launch({
-    executablePath,
+    ...(executablePath ? { executablePath } : {}),
     headless: true,
-    timeout: 15000,
+    timeout: 30000,
     args: [
       '--no-sandbox',
       '--disable-dev-shm-usage',

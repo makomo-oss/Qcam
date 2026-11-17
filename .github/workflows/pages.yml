@@ -29,14 +29,13 @@ jobs:
       - name: Run unit tests
         run: npm run test:unit
 
-      - name: Run headless Chromium E2E tests
+      - name: Install Playwright Chromium for E2E
         run: |
-          if [ -x /usr/bin/google-chrome ]; then
-            PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci
-            CHROME_PATH=/usr/bin/google-chrome npm run test:e2e
-          else
-            echo "google-chrome not available on runner, skipping E2E"
-          fi
+          npm ci
+          npx playwright-core install chromium --only-shell
+
+      - name: Run headless Chromium E2E tests
+        run: npm run test:e2e
 
       - name: Prepare GitHub Pages static bundle
         run: |
