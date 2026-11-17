@@ -58,6 +58,7 @@ class QcamApp {
       gridVisible: Boolean(saved.gridVisible),
       timerSeconds: 0,
       mode: saved.mode === 'hq' ? 'hq' : 'standard',
+      outputFormat: saved.outputFormat === 'jpeg' ? 'jpeg' : 'avif',
       autoSave,
       autoSaveExplicit: Boolean(saved.autoSaveExplicit),
       mirrorFrontSave: Boolean(saved.mirrorFrontSave),
@@ -114,6 +115,7 @@ class QcamApp {
       aspectRatio: this.settings.aspectRatio,
       gridVisible: this.settings.gridVisible,
       mode: this.settings.mode,
+      outputFormat: this.settings.outputFormat,
       autoSave: this.settings.autoSave,
       autoSaveExplicit: Boolean(this.settings.autoSaveExplicit),
       mirrorFrontSave: this.settings.mirrorFrontSave,
@@ -133,6 +135,7 @@ class QcamApp {
     this.ui.setGridVisible(this.settings.gridVisible);
     this.ui.setTimerSeconds(this.settings.timerSeconds);
     this.ui.setCaptureMode(this.settings.mode);
+    this.ui.setOutputFormat(this.settings.outputFormat);
     this.ui.els.toggleAutoSave.checked = this.settings.autoSave;
     this.ui.els.toggleMirrorFront.checked = this.settings.mirrorFrontSave;
     this.ui.renderPermissionGuide(this.platform);
@@ -374,6 +377,7 @@ class QcamApp {
 
     const totalStart = performance.now();
     const mode = this.settings.mode;
+    const format = this.settings.outputFormat === 'jpeg' ? 'jpeg' : 'avif';
     const isFront = this.camera.facingMode === 'user';
     const mirrorOutput = isFront && this.settings.mirrorFrontSave;
     const softwareEv = this.streamInfo?.supportsHardwareExposure
@@ -397,19 +401,26 @@ class QcamApp {
         softwareZoom: this.camera.softwareZoom,
         mirrorX: mirrorOutput,
         exposureEv: softwareEv,
+        outputFormat: format,
       });
 
       const totalTimeMs = Math.round(performance.now() - totalStart);
       this.lastProcessEngine = processed.engine;
       this.lastCaptureTimeMs = totalTimeMs;
 
-      const filename = buildPhotoFilename(new Date(), mode);
+      const actualFormat = processed.format || format;
+      const mimeType =
+        processed.mimeType || (actualFormat === 'jpeg' ? 'image/jpeg' : 'image/avif');
+      const formatLabel = actualFormat.toUpperCase();
+      const filename = buildPhotoFilename(new Date(), mode, actualFormat);
       const url = URL.createObjectURL(processed.blob);
       const photo = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         blob: processed.blob,
         url,
         filename,
+        format: actualFormat,
+        mimeType,
         width: processed.width,
         height: processed.height,
         mode,
@@ -425,11 +436,11 @@ class QcamApp {
           // Attempt direct Web Share Sheet while shutter tap's transient user activation is still active.
           const shareRes = await shareOrSavePhoto(photo, this.platform, { preferShare: true });
           if (shareRes.method === 'web-share' && shareRes.completed) {
-            this.ui.showToast(`共有 /「写真」へ保存しました (${totalTimeMs}ms)`, {
+            this.ui.showToast(`共有 /「写真」へ保存しました (${formatLabel} · ${totalTimeMs}ms)`, {
               durationMs: 2800,
             });
           } else if (shareRes.cancelled) {
-            this.ui.showToast(`撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`, {
+            this.ui.showToast(`${formatLabel} 撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`, {
               durationMs: 5500,
               onClick: () => this._invokeIOSShareOrModal(photo),
             });
@@ -453,16 +464,16 @@ class QcamApp {
             durationMs: 4500,
           });
         } else {
-          this.ui.showToast(`撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`, {
+          this.ui.showToast(`${formatLabel} 撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`, {
             durationMs: 5500,
             onClick: () => this._invokeIOSShareOrModal(photo),
           });
         }
       } else if (this.settings.autoSave) {
         triggerAnchorDownload(photo.url, photo.filename);
-        this.ui.showToast(`保存しました (${totalTimeMs}ms)`, { durationMs: 2400 });
+        this.ui.showToast(`${formatLabel} で保存しました (${totalTimeMs}ms)`, { durationMs: 2400 });
       } else {
-        this.ui.showToast(`撮影完了 (${totalTimeMs}ms)`, { durationMs: 2400 });
+        this.ui.showToast(`${formatLabel} 撮影完了 (${totalTimeMs}ms)`, { durationMs: 2400 });
       }
     } catch (err) {
       this.ui.showToast(`撮影エラー: ${err?.message || '再試行してください'}`);
@@ -536,7 +547,13 @@ class QcamApp {
   }
 
   updateSetting(key, val) {
-    this.settings[key] = val;
+    if (key === 'outputFormat') {
+      const normalized = val === 'jpeg' ? 'jpeg' : 'avif';
+      this.settings.outputFormat = normalized;
+      this.ui.setOutputFormat(normalized);
+    } else {
+      this.settings[key] = val;
+    }
     if (key === 'autoSave') {
       this.settings.autoSaveExplicit = true;
     }
@@ -579,6 +596,12 @@ class QcamApp {
       [
         '基本撮影方式',
         info.supportsTakePhoto ? 'ImageCapture.takePhoto()' : '<video> 高解像度フレーム抽出',
+      ],
+      [
+        '保存フォーマット',
+        this.settings.outputFormat === 'jpeg'
+          ? 'JPEG (.jpg · 品質 0.95)'
+          : 'AVIF (.avif · クライアント圧縮)',
       ],
       ['画像処理エンジン', this.lastProcessEngine],
       ['直近の処理合計', this.lastCaptureTimeMs !== null ? `${this.lastCaptureTimeMs} ms` : '--'],

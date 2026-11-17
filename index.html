@@ -224,7 +224,7 @@
       </div>
 
       <p id="preview-save-hint" class="preview-save-hint" hidden>
-        iPhone では OS の制限上、共有シートの「画像を保存」を選ぶか、上の写真を長押しして「“写真”に保存」を選んでカメラロールへ保存します。
+        iPhone では OS の制限上、共有シートの「画像を保存」を選ぶか、上の写真を長押しして「“写真”に保存」を選んでカメラロールへ保存します。（一部の環境で AVIF の共有ができない場合は設定から JPEG 形式へ変更できます）
       </p>
 
       <div class="modal-actions">
@@ -244,6 +244,16 @@
 
       <div class="sheet-section">
         <h3 class="sheet-subtitle">撮影設定</h3>
+        <div class="setting-row">
+          <div class="setting-label">
+            <strong>保存フォーマット</strong>
+            <small>高圧縮・高画質な AVIF (.avif) を標準使用（互換用途に JPEG も選択可）</small>
+          </div>
+          <div class="segment-group" role="radiogroup" aria-label="保存フォーマット">
+            <button id="btn-format-avif" type="button" role="radio" aria-checked="true" class="lens-chip is-active" data-format="avif">AVIF</button>
+            <button id="btn-format-jpeg" type="button" role="radio" aria-checked="false" class="lens-chip" data-format="jpeg">JPEG</button>
+          </div>
+        </div>
         <label class="toggle-row" for="toggle-auto-save">
           <span>
             <strong>撮影直後に自動保存 / 保存シート表示</strong>

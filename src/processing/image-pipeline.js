@@ -1,23 +1,18 @@
 import { computeAspectCrop } from '../utils/geometry.js';
 import { WebGLImageProcessor } from './webgl-processor.js';
+import {
+  AVIF_DEFAULT_OPTIONS,
+  AVIF_MIME_TYPE,
+  JPEG_MIME_TYPE,
+  canvasToEncodedBlob,
+  encodeAvifFromRgba,
+  isValidAvifBytes,
+  resolveOutputFormat,
+  supportsNativeCanvasAvif,
+  warmupAvifEncoder,
+} from './avif-encoder.js';
 
 const JPEG_QUALITY = 0.95;
-
-function canvasToJpegBlob(canvas, quality = JPEG_QUALITY) {
-  if (typeof canvas.convertToBlob === 'function') {
-    return canvas.convertToBlob({ type: 'image/jpeg', quality });
-  }
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => {
-        if (blob) resolve(blob);
-        else reject(new Error('JPEG エンコードに失敗しました。'));
-      },
-      'image/jpeg',
-      quality
-    );
-  });
-}
 
 /**
  * Coordinates image processing across Web Worker (preferred) and main-thread WebGL / Canvas2D fallback.
@@ -71,15 +66,125 @@ export class ImagePipeline {
   }
 
   warmup() {
-    if (this.worker && this.platform.supportsOffscreenWebGL) {
+    if (this.worker) {
       this.worker.postMessage({ type: 'warmup' });
-    } else if (!this.platform.supportsOffscreenWebGL) {
+    } else {
+      warmupAvifEncoder().catch(() => {});
+    }
+    if (!this.platform.supportsOffscreenWebGL) {
       this._getMainWebGL();
     }
   }
 
+  async _encodeRgbaToAvif({ rgbaPixels, width, height, avifQuality, engineBase }) {
+    if (this.worker) {
+      const buf =
+        rgbaPixels.byteOffset === 0 && rgbaPixels.byteLength === rgbaPixels.buffer.byteLength
+          ? rgbaPixels.buffer
+          : new Uint8Array(rgbaPixels).buffer;
+      const id = this.nextJobId++;
+      const res = await new Promise((resolve) => {
+        this.pending.set(id, { resolve });
+        this.worker.postMessage(
+          {
+            id,
+            type: 'encode-avif',
+            rgbaBuffer: buf,
+            width,
+            height,
+            avifQuality,
+            engine: `${engineBase}+worker-avif`,
+          },
+          [buf]
+        );
+      });
+      if (res.ok && res.blob) {
+        return {
+          blob: res.blob,
+          width: res.width,
+          height: res.height,
+          format: 'avif',
+          mimeType: AVIF_MIME_TYPE,
+          engine: res.engine,
+        };
+      }
+      throw new Error(res.error || 'AVIF エンコードに失敗しました。');
+    }
+
+    const blob = await encodeAvifFromRgba(rgbaPixels, width, height, { quality: avifQuality });
+    return {
+      blob,
+      width,
+      height,
+      format: 'avif',
+      mimeType: AVIF_MIME_TYPE,
+      engine: `${engineBase}+wasm-avif`,
+    };
+  }
+
+  async _encodeMainCanvas({
+    format,
+    webgl,
+    canvas,
+    ctx2d,
+    width,
+    height,
+    avifQuality,
+    jpegQuality,
+    engineBase,
+  }) {
+    if (format === 'jpeg') {
+      const blob = await canvasToEncodedBlob(canvas, JPEG_MIME_TYPE, jpegQuality);
+      return {
+        blob,
+        width,
+        height,
+        format: 'jpeg',
+        mimeType: JPEG_MIME_TYPE,
+        engine: engineBase,
+      };
+    }
+
+    if (await supportsNativeCanvasAvif()) {
+      const blob = await canvasToEncodedBlob(canvas, AVIF_MIME_TYPE, avifQuality / 100);
+      if (blob && blob.type === AVIF_MIME_TYPE && blob.size >= 16) {
+        const header = await blob.slice(0, 64).arrayBuffer();
+        if (isValidAvifBytes(header)) {
+          return {
+            blob,
+            width,
+            height,
+            format: 'avif',
+            mimeType: AVIF_MIME_TYPE,
+            engine: `${engineBase}+native-avif`,
+          };
+        }
+      }
+    }
+
+    let rgbaPixels;
+    if (webgl) {
+      rgbaPixels = webgl.readRgbaTopDown().data;
+    } else {
+      const imageData = ctx2d.getImageData(0, 0, width, height);
+      rgbaPixels = new Uint8Array(
+        imageData.data.buffer,
+        imageData.data.byteOffset,
+        imageData.data.byteLength
+      );
+    }
+
+    return this._encodeRgbaToAvif({
+      rgbaPixels,
+      width,
+      height,
+      avifQuality,
+      engineBase,
+    });
+  }
+
   /**
-   * Process captured frame(s) and return JPEG (quality 0.95) Blob + metadata.
+   * Process captured frame(s) and return encoded AVIF (default) or JPEG Blob + metadata.
    */
   async process({
     mode = 'standard',
@@ -88,8 +193,12 @@ export class ImagePipeline {
     softwareZoom = 1,
     mirrorX = false,
     exposureEv = 0,
+    outputFormat = 'avif',
+    jpegQuality = JPEG_QUALITY,
+    avifQuality = AVIF_DEFAULT_OPTIONS.quality,
   }) {
     const startTs = performance.now();
+    const format = resolveOutputFormat(outputFormat);
 
     if (!frames.length) {
       throw new Error('処理するフレームがありません。');
@@ -98,9 +207,8 @@ export class ImagePipeline {
     // Try Web Worker first when OffscreenCanvas is available
     if (this.worker && this.platform.supportsOffscreenCanvas) {
       const id = this.nextJobId++;
-      // Keep duplicate bitmaps ONLY if worker may decline and ask main thread to fall back?
-      // Wait: if Worker supports OffscreenCanvas WebGL, transferring is zero-copy.
-      // If Worker declines (e.g. iOS 16.4 lacking WebGL in Worker), clone or only transfer if supportsOffscreenWebGL!
+      // Keep bitmaps on main thread when Worker lacks OffscreenCanvas WebGL on single-frame standard shots;
+      // Worker still offloads multi-frame HQ averaging and AVIF WASM encoding.
       if (this.platform.supportsOffscreenWebGL || mode === 'hq') {
         const result = await new Promise((resolve) => {
           this.pending.set(id, { resolve });
@@ -114,7 +222,9 @@ export class ImagePipeline {
               softwareZoom,
               mirrorX,
               exposureEv,
-              jpegQuality: JPEG_QUALITY,
+              outputFormat: format,
+              jpegQuality,
+              avifQuality,
             },
             frames
           );
@@ -125,6 +235,8 @@ export class ImagePipeline {
             blob: result.blob,
             width: result.width,
             height: result.height,
+            format: result.format || format,
+            mimeType: result.mimeType || (format === 'jpeg' ? JPEG_MIME_TYPE : AVIF_MIME_TYPE),
             engine: result.engine,
             processTimeMs: Math.round(performance.now() - startTs),
           };
@@ -139,6 +251,9 @@ export class ImagePipeline {
               softwareZoom: 1, // Already cropped & mirrored in Worker
               mirrorX: false,
               exposureEv,
+              outputFormat: format,
+              jpegQuality,
+              avifQuality,
               preCropped: true,
               enginePrefix: result.engine,
             });
@@ -166,6 +281,9 @@ export class ImagePipeline {
         softwareZoom,
         mirrorX,
         exposureEv,
+        outputFormat: format,
+        jpegQuality,
+        avifQuality,
         preCropped: false,
       });
       return {
@@ -190,14 +308,22 @@ export class ImagePipeline {
     softwareZoom,
     mirrorX,
     exposureEv,
+    outputFormat = 'avif',
+    jpegQuality = JPEG_QUALITY,
+    avifQuality = AVIF_DEFAULT_OPTIONS.quality,
     preCropped,
     enginePrefix,
   }) {
     const srcW = frames[0].width;
     const srcH = frames[0].height;
+    const format = resolveOutputFormat(outputFormat);
     const webgl = this._getMainWebGL();
 
     if (webgl) {
+      const maxDim =
+        format === 'avif'
+          ? Math.min(webgl.maxTextureSize, 4096)
+          : webgl.maxTextureSize;
       const crop = preCropped
         ? {
             sx: 0,
@@ -212,7 +338,7 @@ export class ImagePipeline {
             srcH,
             aspectRatio,
             softwareZoom,
-            webgl.maxTextureSize
+            maxDim
           );
 
       let gpuSources = frames;
@@ -271,17 +397,22 @@ export class ImagePipeline {
         });
       }
 
-      const blob = await canvasToJpegBlob(webgl.canvas, JPEG_QUALITY);
+      const encoded = await this._encodeMainCanvas({
+        format,
+        webgl,
+        canvas: webgl.canvas,
+        width: crop.outWidth,
+        height: crop.outHeight,
+        avifQuality,
+        jpegQuality,
+        engineBase: enginePrefix || 'main-webgl',
+      });
+
       for (const tc of tempCanvases) {
         tc.width = 1;
         tc.height = 1;
       }
-      return {
-        blob,
-        width: crop.outWidth,
-        height: crop.outHeight,
-        engine: enginePrefix || 'main-webgl',
-      };
+      return encoded;
     }
 
     // Ultimate Canvas2D fallback if WebGL is completely unavailable
@@ -309,13 +440,16 @@ export class ImagePipeline {
       crop.outWidth,
       crop.outHeight
     );
-    const blob = await canvasToJpegBlob(canvas, JPEG_QUALITY);
-    return {
-      blob,
+    return this._encodeMainCanvas({
+      format,
+      canvas,
+      ctx2d: ctx,
       width: crop.outWidth,
       height: crop.outHeight,
-      engine: 'canvas2d-fallback',
-    };
+      avifQuality,
+      jpegQuality,
+      engineBase: 'canvas2d-fallback',
+    });
   }
 
   dispose() {

@@ -40,18 +40,28 @@ class MockFile {
   }
 }
 
-test('buildPhotoFilename formats standard and HDR filenames cleanly', () => {
+test('buildPhotoFilename formats standard and HDR filenames cleanly (AVIF default + JPEG option)', () => {
   const sampleDate = new Date(2026, 10, 17, 6, 5, 9);
-  assert.equal(buildPhotoFilename(sampleDate, 'standard'), 'Qcam_20261117_060509.jpg');
-  assert.equal(buildPhotoFilename(sampleDate, 'hq'), 'Qcam_20261117_060509_HDR.jpg');
+  assert.equal(buildPhotoFilename(sampleDate, 'standard'), 'Qcam_20261117_060509.avif');
+  assert.equal(buildPhotoFilename(sampleDate, 'hq'), 'Qcam_20261117_060509_HDR.avif');
+  assert.equal(buildPhotoFilename(sampleDate, 'standard', 'avif'), 'Qcam_20261117_060509.avif');
+  assert.equal(buildPhotoFilename(sampleDate, 'standard', 'jpeg'), 'Qcam_20261117_060509.jpg');
+  assert.equal(buildPhotoFilename(sampleDate, 'hq', 'jpeg'), 'Qcam_20261117_060509_HDR.jpg');
 });
 
-test('shareOrSavePhoto sends strictly { files } on iOS so Save Image appears reliably', async () => {
+test('shareOrSavePhoto sends strictly { files } with image/avif MIME on iOS so Save Image appears reliably', async () => {
   const shareCalls = [];
-  const samplePhoto = {
-    blob: new Blob(['jpeg-bytes'], { type: 'image/jpeg' }),
+  const sampleAvif = {
+    blob: new Blob(['avif-bytes'], { type: 'image/avif' }),
     url: 'blob:qcam/1',
+    filename: 'Qcam_test.avif',
+    mimeType: 'image/avif',
+  };
+  const sampleJpeg = {
+    blob: new Blob(['jpeg-bytes'], { type: 'image/jpeg' }),
+    url: 'blob:qcam/1b',
     filename: 'Qcam_test.jpg',
+    mimeType: 'image/jpeg',
   };
 
   await withMockedGlobals(
@@ -65,12 +75,17 @@ test('shareOrSavePhoto sends strictly { files } on iOS so Save Image appears rel
       },
     },
     async () => {
-      const res = await shareOrSavePhoto(samplePhoto, { isIOS: true, preferWebShareSave: true });
+      const res = await shareOrSavePhoto(sampleAvif, { isIOS: true, preferWebShareSave: true });
       assert.deepEqual(res, { method: 'web-share', completed: true });
       assert.equal(shareCalls.length, 1);
       assert.deepEqual(Object.keys(shareCalls[0]), ['files']);
-      assert.equal(shareCalls[0].files[0].name, 'Qcam_test.jpg');
-      assert.equal(shareCalls[0].files[0].type, 'image/jpeg');
+      assert.equal(shareCalls[0].files[0].name, 'Qcam_test.avif');
+      assert.equal(shareCalls[0].files[0].type, 'image/avif');
+
+      const resJpg = await shareOrSavePhoto(sampleJpeg, { isIOS: true, preferWebShareSave: true });
+      assert.deepEqual(resJpg, { method: 'web-share', completed: true });
+      assert.equal(shareCalls[1].files[0].name, 'Qcam_test.jpg');
+      assert.equal(shareCalls[1].files[0].type, 'image/jpeg');
     }
   );
 });

@@ -5,7 +5,7 @@
  *   plus graceful fallback to preview long-press save or <a download>.
  */
 
-export function buildPhotoFilename(date = new Date(), mode = 'standard') {
+export function buildPhotoFilename(date = new Date(), mode = 'standard', format = 'avif') {
   const pad = (n) => String(n).padStart(2, '0');
   const y = date.getFullYear();
   const m = pad(date.getMonth() + 1);
@@ -14,7 +14,8 @@ export function buildPhotoFilename(date = new Date(), mode = 'standard') {
   const mm = pad(date.getMinutes());
   const ss = pad(date.getSeconds());
   const suffix = mode === 'hq' ? '_HDR' : '';
-  return `Qcam_${y}${m}${d}_${hh}${mm}${ss}${suffix}.jpg`;
+  const ext = format === 'jpeg' ? 'jpg' : 'avif';
+  return `Qcam_${y}${m}${d}_${hh}${mm}${ss}${suffix}.${ext}`;
 }
 
 export function triggerAnchorDownload(blobUrl, filename) {
@@ -45,8 +46,12 @@ export async function shareOrSavePhoto(photo, platform, { preferShare = false } 
       return { method: 'web-share', completed: false, busy: true };
     }
     try {
+      const mimeType =
+        photo.mimeType ||
+        blob?.type ||
+        (/\.jpe?g$/i.test(filename || '') ? 'image/jpeg' : 'image/avif');
       const file = new File([blob], filename, {
-        type: 'image/jpeg',
+        type: mimeType,
         lastModified: Date.now(),
       });
       // Pass strictly { files } on iOS/mobile: adding title/text can break "Save Image" in iOS Share Sheet

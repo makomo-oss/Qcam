@@ -200,6 +200,34 @@ export class WebGLImageProcessor {
     }
   }
 
+  /**
+   * Read the current WebGL framebuffer as a tightly packed top-down RGBA8 buffer.
+   * Flips bottom-up gl.readPixels rows vertically in place using one row scratch buffer
+   * to avoid doubling full-frame memory allocation on mobile devices.
+   */
+  readRgbaTopDown() {
+    const gl = this.gl;
+    const width = this.canvas.width;
+    const height = this.canvas.height;
+    const rowBytes = width * 4;
+    const pixels = new Uint8Array(rowBytes * height);
+    gl.pixelStorei(gl.PACK_ALIGNMENT, 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+    const rowScratch = new Uint8Array(rowBytes);
+    const halfHeight = Math.floor(height / 2);
+    for (let topRow = 0; topRow < halfHeight; topRow++) {
+      const bottomRow = height - 1 - topRow;
+      const topOffset = topRow * rowBytes;
+      const bottomOffset = bottomRow * rowBytes;
+      rowScratch.set(pixels.subarray(topOffset, topOffset + rowBytes));
+      pixels.copyWithin(topOffset, bottomOffset, bottomOffset + rowBytes);
+      pixels.set(rowScratch, bottomOffset);
+    }
+
+    return { data: pixels, width, height };
+  }
+
   dispose() {
     const gl = this.gl;
     if (!gl) return;

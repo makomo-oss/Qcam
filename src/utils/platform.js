@@ -50,16 +50,22 @@ export function detectPlatform(env = globalThis) {
   }
 
   let supportsWebShareFiles = false;
+  let supportsWebShareAvif = false;
   if (typeof nav.share === 'function' && typeof nav.canShare === 'function') {
     try {
       if (typeof win.File === 'function') {
-        const probeFile = new win.File(['x'], 'probe.jpg', { type: 'image/jpeg' });
-        supportsWebShareFiles = Boolean(nav.canShare({ files: [probeFile] }));
+        const probeAvif = new win.File(['x'], 'probe.avif', { type: 'image/avif' });
+        const probeJpg = new win.File(['x'], 'probe.jpg', { type: 'image/jpeg' });
+        supportsWebShareAvif = Boolean(nav.canShare({ files: [probeAvif] }));
+        const supportsWebShareJpg = Boolean(nav.canShare({ files: [probeJpg] }));
+        supportsWebShareFiles = supportsWebShareAvif || supportsWebShareJpg;
       } else {
         supportsWebShareFiles = true;
+        supportsWebShareAvif = true;
       }
     } catch {
       supportsWebShareFiles = false;
+      supportsWebShareAvif = false;
     }
   }
 
@@ -85,6 +91,7 @@ export function detectPlatform(env = globalThis) {
     supportsOffscreenWebGL,
     supportsWorker,
     supportsWebShareFiles,
+    supportsWebShareAvif,
     preferTakePhoto,
     preferWebShareSave,
     osLabel: isIOS ? 'iOS' : isAndroid ? 'Android' : 'Desktop',

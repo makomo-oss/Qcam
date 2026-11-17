@@ -74,6 +74,7 @@ export class CameraUI {
 
       infoModal: document.getElementById('info-modal'),
       btnInfoClose: document.getElementById('btn-info-close'),
+      formatButtons: Array.from(document.querySelectorAll('[data-format]')),
       toggleAutoSave: document.getElementById('toggle-auto-save'),
       toggleMirrorFront: document.getElementById('toggle-mirror-front'),
       backLensSection: document.getElementById('back-lens-section'),
@@ -87,6 +88,7 @@ export class CameraUI {
       gridVisible: false,
       timerSeconds: 0,
       mode: 'standard',
+      outputFormat: 'avif',
       mirroredPreview: false,
       softwareZoom: 1,
       totalZoom: 1,
@@ -195,6 +197,13 @@ export class CameraUI {
     });
 
     // Settings toggles
+    for (const btn of this.els.formatButtons) {
+      btn.addEventListener('click', () => {
+        const format = btn.dataset.format === 'jpeg' ? 'jpeg' : 'avif';
+        this.setOutputFormat(format);
+        this.handlers.onSettingChange('outputFormat', format);
+      });
+    }
     this.els.toggleAutoSave.addEventListener('change', (e) => {
       this.handlers.onSettingChange('autoSave', Boolean(e.target.checked));
     });
@@ -404,6 +413,16 @@ export class CameraUI {
     this.els.btnShutter.classList.toggle('is-hq', mode === 'hq');
   }
 
+  setOutputFormat(format) {
+    const safeFormat = format === 'jpeg' ? 'jpeg' : 'avif';
+    this.state.outputFormat = safeFormat;
+    for (const btn of this.els.formatButtons) {
+      const active = btn.dataset.format === safeFormat;
+      btn.classList.toggle('is-active', active);
+      btn.setAttribute('aria-checked', String(active));
+    }
+  }
+
   setVideoTransform({ mirroredPreview, softwareZoom, totalZoom, maxZoom, softwareEv = 0 }) {
     this.state.mirroredPreview = mirroredPreview;
     this.state.softwareZoom = softwareZoom;
@@ -606,15 +625,25 @@ export class CameraUI {
     this.setPreviewZoom(1);
 
     const kb = Math.round(photo.blob.size / 1024);
-    const sizeText = kb >= 1024 ? `${(kb / 1024).toFixed(2)} MB` : `${kb} KB`;
-    const modeLabel = photo.mode === 'hq' ? '高画質 HDR' : '標準';
-    this.els.previewMeta.textContent = `${photo.width}×${photo.height} · ${modeLabel} · ${photo.totalTimeMs}ms · ${sizeText}`;
+    const sizeText = kb >= 1024 ? `${(kb / 1024).toFixed(2)}MB` : `${kb}KB`;
+    const modeLabel = photo.mode === 'hq' ? 'HDR' : '標準';
+    const timeText =
+      photo.totalTimeMs >= 1000
+        ? `${(photo.totalTimeMs / 1000).toFixed(1)}s`
+        : `${photo.totalTimeMs}ms`;
+    const formatLabel =
+      photo.format === 'jpeg' ||
+      photo.mimeType === 'image/jpeg' ||
+      /\.jpe?g$/i.test(photo.filename || '')
+        ? 'JPEG'
+        : 'AVIF';
+    this.els.previewMeta.textContent = `${photo.width}×${photo.height} · ${formatLabel} · ${modeLabel} · ${timeText} · ${sizeText}`;
 
     // OS-specific save UI guidance
     this.els.previewSaveHint.hidden = !platform.isIOS;
     this.els.btnModalSave.textContent = platform.isIOS
       ? '「写真」へ保存 (共有シート)'
-      : '端末に保存 (JPEG)';
+      : `端末に保存 (${formatLabel})`;
     this.els.btnModalShare.hidden = platform.isIOS || !platform.supportsWebShareFiles;
 
     // Render filmstrip

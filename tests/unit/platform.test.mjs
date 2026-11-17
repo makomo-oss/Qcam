@@ -71,4 +71,32 @@ test('detectPlatform identifies Android Chrome and selects ImageCapture + downlo
   assert.equal(info.isIOS, false);
   assert.equal(info.preferTakePhoto, true);
   assert.equal(info.preferWebShareSave, false);
+  assert.equal(info.supportsWebShareFiles, true);
+  assert.equal(info.supportsWebShareAvif, true);
+});
+
+test('detectPlatform differentiates image/avif vs image/jpeg support in navigator.canShare', () => {
+  class FakeFile {
+    constructor(parts, name, opts = {}) {
+      this.name = name;
+      this.type = opts.type || '';
+    }
+  }
+  const selectiveEnv = {
+    navigator: {
+      userAgent:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Version/17.4 Mobile/15E148 Safari/604.1',
+      maxTouchPoints: 5,
+      mediaDevices: { getUserMedia: async () => {} },
+      share: async () => {},
+      canShare: (data) => data?.files?.[0]?.type === 'image/jpeg',
+    },
+    window: {
+      File: FakeFile,
+    },
+  };
+
+  const info = detectPlatform(selectiveEnv);
+  assert.equal(info.supportsWebShareFiles, true);
+  assert.equal(info.supportsWebShareAvif, false);
 });

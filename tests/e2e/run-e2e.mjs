@@ -17,6 +17,8 @@ const MIME_TYPES = {
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
+  '.avif': 'image/avif',
+  '.wasm': 'application/wasm',
 };
 
 function startStaticServer() {
@@ -127,11 +129,19 @@ async function main() {
     assert.ok(startupMetrics.startupTimeMs < 1500, `Startup too slow: ${startupMetrics.startupTimeMs}ms`);
     assert.equal(startupMetrics.overlayHidden, true);
 
-    console.log('[e2e] verifying PWA manifest and SW');
-    // 2. Verify PWA manifest & Service Worker registration
+    console.log('[e2e] verifying PWA manifest, SW, and precache asset URLs');
+    // 2. Verify PWA manifest, Service Worker registration & precache URLs
     const pwaStatus = await page.evaluate(async () => {
       const manifestResp = await fetch('./manifest.webmanifest');
       const manifest = await manifestResp.json();
+      const swText = await (await fetch('./sw.js')).text();
+      const assetBlock = swText.match(/APP_SHELL_ASSETS\s*=\s*\[([\s\S]*?)\]/)?.[1] || '';
+      const assetPaths = Array.from(assetBlock.matchAll(/'([^']+)'/g), (m) => m[1]);
+      const assetStatuses = [];
+      for (const p of assetPaths) {
+        const r = await fetch(p);
+        assetStatuses.push({ path: p, status: r.status, ok: r.ok });
+      }
       let swRegistered = false;
       if ('serviceWorker' in navigator) {
         const deadline = Date.now() + 3000;
@@ -149,12 +159,17 @@ async function main() {
         display: manifest.display,
         iconsCount: manifest.icons.length,
         swRegistered,
+        assetStatuses,
       };
     });
     assert.equal(pwaStatus.manifestOk, true);
     assert.equal(pwaStatus.display, 'standalone');
     assert.ok(pwaStatus.iconsCount >= 3);
     assert.equal(pwaStatus.swRegistered, true);
+    assert.ok(pwaStatus.assetStatuses.length >= 20);
+    for (const entry of pwaStatus.assetStatuses) {
+      assert.equal(entry.ok, true, `SW precache asset failed: ${entry.path} (${entry.status})`);
+    }
 
     console.log('[e2e] checking 4:3 and 16:9 aspect ratios');
     // 3. Verify 4:3 vs 16:9 viewfinder aspect ratio switch
@@ -203,108 +218,185 @@ async function main() {
     await page.click('.zoom-preset[data-zoom="1"]');
     assert.equal(await page.textContent('#zoom-readout'), '1.0×');
 
-    // 7. Verify WebGL pixel orientation & mirroring directly inside page context
+    // 7. Verify WebGL pixel orientation, AVIF ISOBMFF signature, & main-thread offload path
     const orientationCheck = await page.evaluate(async () => {
-      const c = document.createElement('canvas');
-      c.width = 120;
-      c.height = 90;
-      const ctx = c.getContext('2d');
-      // Top-left red, top-right green, bottom-left blue, bottom-right yellow
-      ctx.fillStyle = '#ff0000';
-      ctx.fillRect(0, 0, 60, 45);
-      ctx.fillStyle = '#00ff00';
-      ctx.fillRect(60, 0, 60, 45);
-      ctx.fillStyle = '#0000ff';
-      ctx.fillRect(0, 45, 60, 45);
-      ctx.fillStyle = '#ffff00';
-      ctx.fillRect(60, 45, 60, 45);
+      const readAvifSignature = async (blob) => {
+        const bytes = new Uint8Array(await blob.slice(0, 32).arrayBuffer());
+        const ascii = (start, len) =>
+          String.fromCharCode(...bytes.slice(start, start + len));
+        return {
+          boxType: ascii(4, 4),
+          majorBrand: ascii(8, 4),
+          compat: ascii(16, Math.min(16, Math.max(0, bytes.length - 16))),
+        };
+      };
 
-      const bmp = await createImageBitmap(c);
+      const makeTestCanvas = () => {
+        const c = document.createElement('canvas');
+        c.width = 120;
+        c.height = 90;
+        const ctx = c.getContext('2d');
+        // Top-left red, top-right green, bottom-left blue, bottom-right yellow
+        ctx.fillStyle = '#ff0000';
+        ctx.fillRect(0, 0, 60, 45);
+        ctx.fillStyle = '#00ff00';
+        ctx.fillRect(60, 0, 60, 45);
+        ctx.fillStyle = '#0000ff';
+        ctx.fillRect(0, 45, 60, 45);
+        ctx.fillStyle = '#ffff00';
+        ctx.fillRect(60, 45, 60, 45);
+        return c;
+      };
+
+      const sampleCorners = async (blob) => {
+        const outBmp = await createImageBitmap(blob);
+        const checkCanvas = document.createElement('canvas');
+        checkCanvas.width = outBmp.width;
+        checkCanvas.height = outBmp.height;
+        const checkCtx = checkCanvas.getContext('2d');
+        checkCtx.drawImage(outBmp, 0, 0);
+        const sample = (x, y) => Array.from(checkCtx.getImageData(x, y, 1, 1).data);
+        const corners = {
+          tl: sample(15, 15),
+          tr: sample(105, 15),
+          bl: sample(15, 75),
+        };
+        outBmp.close();
+        return corners;
+      };
+
+      const c = makeTestCanvas();
+      const bmp1 = await createImageBitmap(c);
       const res = await window.__QCAM__.pipeline.process({
         mode: 'standard',
-        frames: [bmp],
+        frames: [bmp1],
         aspectRatio: '4:3',
         softwareZoom: 1,
         mirrorX: false,
+        outputFormat: 'avif',
       });
+      const sig = await readAvifSignature(res.blob);
+      const corners = await sampleCorners(res.blob);
 
-      const outBmp = await createImageBitmap(res.blob);
-      const checkCanvas = document.createElement('canvas');
-      checkCanvas.width = outBmp.width;
-      checkCanvas.height = outBmp.height;
-      const checkCtx = checkCanvas.getContext('2d');
-      checkCtx.drawImage(outBmp, 0, 0);
-      const sample = (x, y) => Array.from(checkCtx.getImageData(x, y, 1, 1).data);
-      const tl = sample(15, 15);
-      const tr = sample(105, 15);
-      const bl = sample(15, 75);
-      outBmp.close();
-      return { tl, tr, bl, engine: res.engine, type: res.blob.type };
+      // Also verify iOS 16.4-style main-thread WebGL + Worker AVIF encode offload path
+      const bmp2 = await createImageBitmap(c);
+      const mainRes = await window.__QCAM__.pipeline._processOnMainThread({
+        mode: 'standard',
+        frames: [bmp2],
+        aspectRatio: '4:3',
+        softwareZoom: 1,
+        mirrorX: false,
+        exposureEv: 0,
+        outputFormat: 'avif',
+        preCropped: false,
+      });
+      bmp2.close();
+      const mainSig = await readAvifSignature(mainRes.blob);
+      const mainCorners = await sampleCorners(mainRes.blob);
+
+      return {
+        ...corners,
+        engine: res.engine,
+        type: res.blob.type,
+        sig,
+        mainEngine: mainRes.engine,
+        mainType: mainRes.blob.type,
+        mainSig,
+        mainCorners,
+      };
     });
 
-    assert.equal(orientationCheck.type, 'image/jpeg');
+    assert.equal(orientationCheck.type, 'image/avif');
+    assert.equal(orientationCheck.sig.boxType, 'ftyp');
+    assert.ok(orientationCheck.sig.majorBrand === 'avif' || orientationCheck.sig.compat.includes('avif'));
     assert.ok(orientationCheck.tl[0] > 180 && orientationCheck.tl[1] < 80, `Top-left should be red, got ${orientationCheck.tl}`);
     assert.ok(orientationCheck.tr[1] > 180 && orientationCheck.tr[0] < 80, `Top-right should be green, got ${orientationCheck.tr}`);
     assert.ok(orientationCheck.bl[2] > 180 && orientationCheck.bl[0] < 80, `Bottom-left should be blue, got ${orientationCheck.bl}`);
 
-    console.log('[e2e] capturing Standard mode photo');
-    // 8. Capture Standard mode photo via shutter click
-    const downloadPromise = page.waitForEvent('download', { timeout: 6000 });
+    assert.equal(orientationCheck.mainType, 'image/avif');
+    assert.equal(orientationCheck.mainSig.boxType, 'ftyp');
+    assert.ok(orientationCheck.mainCorners.tl[0] > 180 && orientationCheck.mainCorners.tl[1] < 80);
+    assert.ok(orientationCheck.mainCorners.bl[2] > 180 && orientationCheck.mainCorners.bl[0] < 80);
+
+    console.log('[e2e] capturing Standard mode AVIF photo');
+    // 8. Capture Standard mode photo via shutter click (AVIF default)
+    const downloadPromise = page.waitForEvent('download', { timeout: 10000 });
     await page.click('#btn-shutter');
     const download = await downloadPromise;
     assert.ok(download.suggestedFilename().startsWith('Qcam_'));
-    assert.ok(download.suggestedFilename().endsWith('.jpg'));
+    assert.ok(download.suggestedFilename().endsWith('.avif'));
 
     await page.waitForFunction(() => window.__QCAM__.photos.length === 1);
-    const stdPhoto = await page.evaluate(() => {
+    const stdPhoto = await page.evaluate(async () => {
       const p = window.__QCAM__.photos[0];
+      const hdr = new Uint8Array(await p.blob.slice(0, 16).arrayBuffer());
       return {
         width: p.width,
         height: p.height,
         mode: p.mode,
+        format: p.format,
         size: p.blob.size,
         type: p.blob.type,
         totalTimeMs: p.totalTimeMs,
         engine: p.engine,
+        ftyp: String.fromCharCode(...hdr.slice(4, 12)),
       };
     });
     assert.equal(stdPhoto.mode, 'standard');
-    assert.equal(stdPhoto.type, 'image/jpeg');
-    assert.ok(stdPhoto.size > 3000);
+    assert.equal(stdPhoto.format, 'avif');
+    assert.equal(stdPhoto.type, 'image/avif');
+    assert.equal(stdPhoto.ftyp, 'ftypavif');
+    assert.ok(stdPhoto.size > 200);
     assert.ok(Math.abs(stdPhoto.width / stdPhoto.height - 4 / 3) < 0.02);
 
-    console.log('[e2e] capturing High Quality HDR burst photo');
-    // 9. Switch to High Quality HDR mode & capture 4-frame burst
+    console.log('[e2e] capturing High Quality HDR burst AVIF photo');
+    // 9. Switch to High Quality HDR mode & capture 4-frame burst as AVIF
     await page.click('#mode-hq');
     assert.equal(await page.getAttribute('#mode-hq', 'aria-selected'), 'true');
-    const hqDownloadPromise = page.waitForEvent('download', { timeout: 6000 });
+    const hqDownloadPromise = page.waitForEvent('download', { timeout: 10000 });
     await page.click('#btn-shutter');
     const hqDownload = await hqDownloadPromise;
-    assert.ok(hqDownload.suggestedFilename().includes('_HDR.jpg'));
+    assert.ok(hqDownload.suggestedFilename().includes('_HDR.avif'));
 
     await page.waitForFunction(() => window.__QCAM__.photos.length === 2);
-    const hqPhoto = await page.evaluate(() => {
+    const hqPhoto = await page.evaluate(async () => {
       const p = window.__QCAM__.photos[0];
+      const hdr = new Uint8Array(await p.blob.slice(0, 16).arrayBuffer());
       return {
         width: p.width,
         height: p.height,
         mode: p.mode,
+        format: p.format,
         size: p.blob.size,
         type: p.blob.type,
         totalTimeMs: p.totalTimeMs,
         engine: p.engine,
+        ftyp: String.fromCharCode(...hdr.slice(4, 12)),
       };
     });
     assert.equal(hqPhoto.mode, 'hq');
-    assert.equal(hqPhoto.type, 'image/jpeg');
-    assert.ok(hqPhoto.size > 3000);
+    assert.equal(hqPhoto.format, 'avif');
+    assert.equal(hqPhoto.type, 'image/avif');
+    assert.equal(hqPhoto.ftyp, 'ftypavif');
+    assert.ok(hqPhoto.size > 200);
 
-    console.log('[e2e] checking preview modal, info sheet, photo deletion, and camera switch');
-    // 10. Open Photo Preview Modal, test zoom & inspect image, delete one photo, then close
+    console.log('[e2e] checking preview modal, info sheet, format switcher, photo deletion, and camera switch');
+    // 10. Open Photo Preview Modal, verify AVIF render & labels, zoom & inspect image, delete one photo, then close
     await page.click('#btn-gallery');
     await page.waitForSelector('#preview-modal:not([hidden])');
     const imgNaturalW = await page.evaluate(() => document.getElementById('preview-image').naturalWidth);
-    assert.ok(imgNaturalW > 0, 'Preview modal image must load cleanly');
+    assert.ok(imgNaturalW > 0, 'Preview modal AVIF image must decode & load cleanly');
+    const previewMetaMetrics = await page.evaluate(() => {
+      const el = document.getElementById('preview-meta');
+      return {
+        text: el.textContent || '',
+        scrollW: el.scrollWidth,
+        clientW: el.clientWidth,
+      };
+    });
+    assert.ok(previewMetaMetrics.text.includes('AVIF'));
+    assert.ok(previewMetaMetrics.scrollW <= previewMetaMetrics.clientW + 1, `Preview meta truncated: ${JSON.stringify(previewMetaMetrics)}`);
+    assert.ok((await page.textContent('#btn-modal-save')).includes('AVIF'));
 
     await page.click('#btn-preview-zoom-2x');
     const zoomedWidth = await page.evaluate(() => document.getElementById('preview-image').getBoundingClientRect().width);
@@ -321,7 +413,7 @@ async function main() {
     await page.click('#btn-modal-close');
     assert.equal(await page.locator('#preview-modal').isVisible(), false);
 
-    // 11. Verify HQ tone mapping lifts shadows on synthetic dark input
+    // 11. Verify HQ tone mapping lifts shadows on synthetic dark input (encoded to AVIF)
     const hdrCheck = await page.evaluate(async () => {
       const makeDarkFrame = async (val) => {
         const c = document.createElement('canvas');
@@ -343,6 +435,7 @@ async function main() {
         frames,
         aspectRatio: '4:3',
         softwareZoom: 1,
+        outputFormat: 'avif',
       });
       const bmp = await createImageBitmap(res.blob);
       const outC = document.createElement('canvas');
@@ -352,8 +445,9 @@ async function main() {
       octx.drawImage(bmp, 0, 0);
       const px = octx.getImageData(32, 32, 1, 1).data;
       bmp.close();
-      return { r: px[0], g: px[1], b: px[2] };
+      return { r: px[0], g: px[1], b: px[2], type: res.blob.type };
     });
+    assert.equal(hdrCheck.type, 'image/avif');
     assert.ok(hdrCheck.r > 34, `HQ tone mapping should lift shadows (>34), got ${hdrCheck.r}`);
 
     // 12. Verify 3s timer countdown starts and cancels on second shutter press
@@ -368,11 +462,13 @@ async function main() {
     await page.click('#btn-timer');
     await page.click('#btn-timer');
 
-    // 13. Open Settings / Info Sheet and verify diagnostics + OS permission guide
+    // 13. Open Settings / Info Sheet, verify AVIF diagnostics, test JPEG format switch, then switch back to AVIF
     await page.click('#btn-info');
     await page.waitForSelector('#info-modal:not([hidden])');
+    assert.equal(await page.getAttribute('#btn-format-avif', 'aria-checked'), 'true');
     const diagText = await page.textContent('#diagnostics-list');
     assert.ok(diagText.includes('WebGL') || diagText.includes('worker') || diagText.includes('canvas'));
+    assert.ok(diagText.includes('保存フォーマット') && diagText.includes('AVIF'));
     assert.ok(diagText.includes('カメラ権限状態'));
     assert.ok(diagText.includes('超広角 (0.5×) カメラ') && diagText.includes('非対応'));
     const guideText = await page.textContent('#permission-guide');
@@ -380,6 +476,24 @@ async function main() {
     if (screenshotDir) {
       await page.screenshot({ path: path.join(screenshotDir, 'e2e_info_sheet.png') });
     }
+
+    // Switch output format to JPEG and verify capture saves .jpg
+    await page.click('#btn-format-jpeg');
+    assert.equal(await page.getAttribute('#btn-format-jpeg', 'aria-checked'), 'true');
+    await page.click('#btn-info-close');
+
+    const jpgDlPromise = page.waitForEvent('download', { timeout: 6000 });
+    await page.click('#btn-shutter');
+    const jpgDl = await jpgDlPromise;
+    assert.ok(jpgDl.suggestedFilename().endsWith('.jpg'));
+    await page.waitForFunction(() => window.__QCAM__.photos.length === 2);
+    assert.equal(await page.evaluate(() => window.__QCAM__.photos[0].blob.type), 'image/jpeg');
+
+    // Switch back to AVIF default
+    await page.click('#btn-info');
+    await page.waitForSelector('#info-modal:not([hidden])');
+    await page.click('#btn-format-avif');
+    assert.equal(await page.getAttribute('#btn-format-avif', 'aria-checked'), 'true');
     await page.click('#btn-info-close');
 
     // 14. Switch Camera (environment -> user) and verify settings persistence across reload
@@ -595,26 +709,31 @@ async function main() {
     // Confirm legacy iOS setting migrated autoSave to true automatically
     assert.equal(await iosPage.evaluate(() => window.__QCAM__.settings.autoSave), true);
 
-    // Direct capture triggers Web Share immediately with strictly { files: [...] }
+    // Direct capture triggers Web Share immediately with strictly { files: [...] } and .avif / image/avif
     await iosPage.click('#btn-shutter');
-    await iosPage.waitForFunction(() => window.__SHARE_CALLS__.length === 1, { timeout: 6000 });
+    await iosPage.waitForFunction(() => window.__SHARE_CALLS__.length === 1, { timeout: 10000 });
     const firstShareCall = await iosPage.evaluate(() => window.__SHARE_CALLS__[0]);
     assert.deepEqual(firstShareCall.keys, ['files']);
-    assert.equal(firstShareCall.fileType, 'image/jpeg');
+    assert.ok(firstShareCall.fileName.endsWith('.avif'), `Expected .avif filename, got ${firstShareCall.fileName}`);
+    assert.equal(firstShareCall.fileType, 'image/avif');
     assert.equal(await iosPage.locator('#preview-modal').isVisible(), false);
 
     // Simulate NotAllowedError on next capture (e.g., slow burst) -> Preview Modal opens automatically with visible toast
-    await iosPage.waitForFunction(() => !window.__QCAM__.isCapturing, { timeout: 4000 });
+    await iosPage.waitForFunction(() => !window.__QCAM__.isCapturing, { timeout: 6000 });
     await iosPage.evaluate(() => {
       window.__SHARE_MODE__ = 'expire';
     });
     await iosPage.click('#btn-shutter');
-    await iosPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 6000 });
+    await iosPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 10000 });
     assert.ok(
       (await iosPage.textContent('#btn-modal-save')).includes('写真'),
       'iOS preview save button should clearly mention 写真'
     );
     assert.equal(await iosPage.locator('#modal-toast').isVisible(), true);
+    assert.ok(
+      (await iosPage.evaluate(() => document.getElementById('preview-image').naturalWidth)) > 0,
+      'iOS preview AVIF image must decode cleanly'
+    );
 
     // Clicking the modal save button retries Share Sheet with fresh click gesture
     await iosPage.evaluate(() => {
@@ -622,6 +741,9 @@ async function main() {
     });
     await iosPage.click('#btn-modal-save');
     await iosPage.waitForFunction(() => window.__SHARE_CALLS__.length === 3, { timeout: 4000 });
+    const modalShareCall = await iosPage.evaluate(() => window.__SHARE_CALLS__[2]);
+    assert.ok(modalShareCall.fileName.endsWith('.avif'));
+    assert.equal(modalShareCall.fileType, 'image/avif');
     assert.ok((await iosPage.textContent('#modal-toast')).includes('写真'));
 
     await iosPage.click('#btn-modal-close');
@@ -781,10 +903,10 @@ async function main() {
       await androidUwPage.screenshot({ path: path.join(screenshotDir, 'e2e_ultrawide_360x640.png') });
     }
 
-    const uwDlPromise = androidUwPage.waitForEvent('download', { timeout: 6000 });
+    const uwDlPromise = androidUwPage.waitForEvent('download', { timeout: 10000 });
     await androidUwPage.click('#btn-shutter');
     const uwDl = await uwDlPromise;
-    assert.ok(uwDl.suggestedFilename().endsWith('.jpg'));
+    assert.ok(uwDl.suggestedFilename().endsWith('.avif'));
 
     // Check 844x390 landscape with 0.5x visible
     await androidUwPage.setViewportSize({ width: 844, height: 390 });
@@ -972,8 +1094,15 @@ async function main() {
       stdPhoto,
       hqPhoto,
       orientationEngine: orientationCheck.engine,
+      mainOffloadEngine: orientationCheck.mainEngine,
       compactStats,
-      pwa: pwaStatus,
+      pwa: {
+        manifestOk: pwaStatus.manifestOk,
+        display: pwaStatus.display,
+        iconsCount: pwaStatus.iconsCount,
+        swRegistered: pwaStatus.swRegistered,
+        precacheAssetCount: pwaStatus.assetStatuses.length,
+      },
       iosShareCalls: 3,
       ultraWideHardware05x: true,
       ultraWideDeviceSwitch05x: true,

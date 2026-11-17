@@ -1,5 +1,16 @@
 import { computeAspectCrop } from '../utils/geometry.js';
 import { WebGLImageProcessor } from '../processing/webgl-processor.js';
+import {
+  AVIF_DEFAULT_OPTIONS,
+  AVIF_MIME_TYPE,
+  JPEG_MIME_TYPE,
+  canvasToEncodedBlob,
+  encodeAvifFromRgba,
+  isValidAvifBytes,
+  resolveOutputFormat,
+  supportsNativeCanvasAvif,
+  warmupAvifEncoder,
+} from '../processing/avif-encoder.js';
 
 let webglProcessor = null;
 let webglUnavailable = false;
@@ -127,12 +138,104 @@ function averageFramesCPU(frames, crop, mirrorX) {
   return workCanvas;
 }
 
+async function encodeWorkerOutput({
+  format,
+  webgl,
+  canvas,
+  ctx2d,
+  avifQuality = AVIF_DEFAULT_OPTIONS.quality,
+  jpegQuality = 0.95,
+  engineBase,
+}) {
+  if (format === 'jpeg') {
+    const blob = await canvasToEncodedBlob(canvas, JPEG_MIME_TYPE, jpegQuality);
+    return {
+      blob,
+      mimeType: JPEG_MIME_TYPE,
+      format: 'jpeg',
+      engine: engineBase,
+    };
+  }
+
+  if (await supportsNativeCanvasAvif()) {
+    const blob = await canvasToEncodedBlob(canvas, AVIF_MIME_TYPE, avifQuality / 100);
+    if (blob && blob.type === AVIF_MIME_TYPE && blob.size >= 16) {
+      const header = await blob.slice(0, 64).arrayBuffer();
+      if (isValidAvifBytes(header)) {
+        return {
+          blob,
+          mimeType: AVIF_MIME_TYPE,
+          format: 'avif',
+          engine: `${engineBase}+native-avif`,
+        };
+      }
+    }
+  }
+
+  let rgbaPixels;
+  let width = canvas.width;
+  let height = canvas.height;
+  if (webgl) {
+    const read = webgl.readRgbaTopDown();
+    rgbaPixels = read.data;
+    width = read.width;
+    height = read.height;
+  } else {
+    const imageData = ctx2d.getImageData(0, 0, canvas.width, canvas.height);
+    rgbaPixels = new Uint8Array(
+      imageData.data.buffer,
+      imageData.data.byteOffset,
+      imageData.data.byteLength
+    );
+  }
+
+  const blob = await encodeAvifFromRgba(rgbaPixels, width, height, { quality: avifQuality });
+  return {
+    blob,
+    mimeType: AVIF_MIME_TYPE,
+    format: 'avif',
+    engine: `${engineBase}+wasm-avif`,
+  };
+}
+
 self.addEventListener('message', async (event) => {
   const msg = event.data;
   if (!msg) return;
 
   if (msg.type === 'warmup') {
     getWebGLProcessor();
+    warmupAvifEncoder().catch(() => {});
+    return;
+  }
+
+  if (msg.type === 'encode-avif') {
+    const {
+      id,
+      rgbaBuffer,
+      width,
+      height,
+      avifQuality = AVIF_DEFAULT_OPTIONS.quality,
+      engine = 'main-webgl+worker-avif',
+    } = msg;
+    try {
+      const blob = await encodeAvifFromRgba(rgbaBuffer, width, height, { quality: avifQuality });
+      self.postMessage({
+        id,
+        ok: true,
+        blob,
+        width,
+        height,
+        format: 'avif',
+        mimeType: AVIF_MIME_TYPE,
+        engine,
+      });
+    } catch (err) {
+      self.postMessage({
+        id,
+        ok: false,
+        error: err?.message || String(err),
+      });
+    }
     return;
   }
 
@@ -147,7 +250,9 @@ self.addEventListener('message', async (event) => {
     mirrorX = false,
     exposureEv = 0,
     jpegQuality = 0.95,
+    avifQuality = AVIF_DEFAULT_OPTIONS.quality,
   } = msg;
+  const outputFormat = resolveOutputFormat(msg.outputFormat);
 
   const intermediates = [];
 
@@ -161,12 +266,16 @@ self.addEventListener('message', async (event) => {
     const webgl = getWebGLProcessor();
 
     if (webgl) {
+      const maxDim =
+        outputFormat === 'avif'
+          ? Math.min(webgl.maxTextureSize, 4096)
+          : webgl.maxTextureSize;
       const crop = computeAspectCrop(
         srcW,
         srcH,
         aspectRatio,
         softwareZoom,
-        webgl.maxTextureSize
+        maxDim
       );
 
       let gpuSources = frames;
@@ -207,18 +316,24 @@ self.addEventListener('message', async (event) => {
         });
       }
 
-      const blob = await webgl.canvas.convertToBlob({
-        type: 'image/jpeg',
-        quality: jpegQuality,
+      const encoded = await encodeWorkerOutput({
+        format: outputFormat,
+        webgl,
+        canvas: webgl.canvas,
+        avifQuality,
+        jpegQuality,
+        engineBase: 'worker-webgl',
       });
 
       self.postMessage({
         id,
         ok: true,
-        blob,
+        blob: encoded.blob,
         width: crop.outWidth,
         height: crop.outHeight,
-        engine: 'worker-webgl',
+        format: encoded.format,
+        mimeType: encoded.mimeType,
+        engine: encoded.engine,
       });
       return;
     }
@@ -247,18 +362,24 @@ self.addEventListener('message', async (event) => {
     // Ultimate Canvas2D fallback inside Worker so transferred bitmaps are never lost
     if (typeof OffscreenCanvas === 'function') {
       const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, 4096);
-      const { canvas } = cropFrameToCanvas(frames[0], crop, mirrorX);
-      const blob = await canvas.convertToBlob({
-        type: 'image/jpeg',
-        quality: jpegQuality,
+      const { canvas, ctx } = cropFrameToCanvas(frames[0], crop, mirrorX);
+      const encoded = await encodeWorkerOutput({
+        format: outputFormat,
+        canvas,
+        ctx2d: ctx,
+        avifQuality,
+        jpegQuality,
+        engineBase: 'worker-canvas2d',
       });
       self.postMessage({
         id,
         ok: true,
-        blob,
+        blob: encoded.blob,
         width: crop.outWidth,
         height: crop.outHeight,
-        engine: 'worker-canvas2d',
+        format: encoded.format,
+        mimeType: encoded.mimeType,
+        engine: encoded.engine,
       });
       return;
     }
@@ -280,18 +401,24 @@ self.addEventListener('message', async (event) => {
           softwareZoom,
           4096
         );
-        const { canvas } = cropFrameToCanvas(frames[0], crop, mirrorX);
-        const blob = await canvas.convertToBlob({
-          type: 'image/jpeg',
-          quality: jpegQuality,
+        const { canvas, ctx } = cropFrameToCanvas(frames[0], crop, mirrorX);
+        const encoded = await encodeWorkerOutput({
+          format: outputFormat,
+          canvas,
+          ctx2d: ctx,
+          avifQuality,
+          jpegQuality,
+          engineBase: 'worker-rescue-2d',
         });
         self.postMessage({
           id,
           ok: true,
-          blob,
+          blob: encoded.blob,
           width: crop.outWidth,
           height: crop.outHeight,
-          engine: 'worker-rescue-2d',
+          format: encoded.format,
+          mimeType: encoded.mimeType,
+          engine: encoded.engine,
         });
         return;
       }
