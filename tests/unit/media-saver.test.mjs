@@ -193,3 +193,64 @@ test('shareOrSavePhoto guards against concurrent navigator.share invocations', a
   );
 });
 
+test('shareOrSavePhoto supports explicit forceDownload (.avif) on iOS Safari and distinguishes share-file-unsupported', async () => {
+  const sampleAvif = {
+    blob: new Blob(['avif-bytes'], { type: 'image/avif' }),
+    url: 'blob:qcam/avif-dl',
+    filename: 'Qcam_force.avif',
+    mimeType: 'image/avif',
+  };
+
+  const clickedAnchors = [];
+  const prevDocDesc = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    writable: true,
+    value: {
+      createElement: () => ({
+        style: {},
+        click() {
+          clickedAnchors.push({ href: this.href, download: this.download });
+        },
+        remove() {},
+      }),
+      body: {
+        appendChild() {},
+      },
+    },
+  });
+
+  try {
+    await withMockedGlobals(
+      {
+        File: MockFile,
+        navigator: {
+          canShare: () => false,
+          share: async () => {
+            throw new Error('should not call share');
+          },
+        },
+      },
+      async () => {
+        const unsupportedRes = await shareOrSavePhoto(sampleAvif, {
+          isIOS: true,
+          preferWebShareSave: true,
+        });
+        assert.deepEqual(unsupportedRes, {
+          method: 'ios-manual-hint',
+          completed: false,
+          gestureExpired: false,
+          reason: 'share-file-unsupported',
+        });
+
+        const dlRes = await shareOrSavePhoto(sampleAvif, { isIOS: true }, { forceDownload: true });
+        assert.deepEqual(dlRes, { method: 'download', completed: true });
+        assert.deepEqual(clickedAnchors, [{ href: 'blob:qcam/avif-dl', download: 'Qcam_force.avif' }]);
+      }
+    );
+  } finally {
+    if (prevDocDesc) Object.defineProperty(globalThis, 'document', prevDocDesc);
+    else delete globalThis.document;
+  }
+});
+

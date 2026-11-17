@@ -224,7 +224,7 @@
       </div>
 
       <p id="preview-save-hint" class="preview-save-hint" hidden>
-        iPhone では OS の制限上、共有シートの「画像を保存」を選ぶか、上の写真を長押しして「“写真”に保存」を選んでカメラロールへ保存します。（一部の環境で AVIF の共有ができない場合は設定から JPEG 形式へ変更できます）
+        iPhone の「写真」アプリ（「画像を保存」／長押し保存）へ取り込むと OS 仕様で JPEG 変換されます。.avif のまま残す場合は共有シートの「“ファイル”に保存」を選んでください。
       </p>
 
       <div class="modal-actions">
@@ -247,7 +247,7 @@
         <div class="setting-row">
           <div class="setting-label">
             <strong>保存フォーマット</strong>
-            <small>高圧縮・高画質な AVIF (.avif) を標準使用（互換用途に JPEG も選択可）</small>
+            <small>高圧縮・高画質な AVIF (.avif) を標準使用（iPhone で .avif のまま残す場合は「“ファイル”に保存」推奨／「写真」へ残すと iOS 仕様で JPEG 変換されます）</small>
           </div>
           <div class="segment-group" role="radiogroup" aria-label="保存フォーマット">
             <button id="btn-format-avif" type="button" role="radio" aria-checked="true" class="lens-chip is-active" data-format="avif">AVIF</button>
@@ -257,7 +257,7 @@
         <label class="toggle-row" for="toggle-auto-save">
           <span>
             <strong>撮影直後に自動保存 / 保存シート表示</strong>
-            <small>Android / PC は即時ダウンロード、iPhone は共有シート（→「画像を保存」で写真アプリ）を自動表示</small>
+            <small>Android / PC は即時ダウンロード、iPhone は共有シートを表示（「“ファイル”に保存」で .avif 維持／「画像を保存」は写真アプリ用に JPEG 変換）</small>
           </span>
           <input id="toggle-auto-save" type="checkbox" checked>
         </label>

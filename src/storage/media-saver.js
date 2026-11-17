@@ -33,13 +33,25 @@ export function triggerAnchorDownload(blobUrl, filename) {
 
 let shareInFlight = false;
 
-export async function shareOrSavePhoto(photo, platform, { preferShare = false } = {}) {
+export async function shareOrSavePhoto(
+  photo,
+  platform,
+  { preferShare = false, forceDownload = false } = {}
+) {
   const { blob, url, filename } = photo;
+
+  if (forceDownload) {
+    triggerAnchorDownload(url, filename);
+    return { method: 'download', completed: true };
+  }
+
   const isIOS = Boolean(platform?.isIOS);
   const shouldUseWebShare =
     (preferShare || Boolean(platform?.preferWebShareSave) || isIOS) &&
     typeof navigator !== 'undefined' &&
     typeof navigator.share === 'function';
+
+  let shareUnavailableReason = 'web-share-unavailable';
 
   if (shouldUseWebShare) {
     if (shareInFlight) {
@@ -54,7 +66,7 @@ export async function shareOrSavePhoto(photo, platform, { preferShare = false } 
         type: mimeType,
         lastModified: Date.now(),
       });
-      // Pass strictly { files } on iOS/mobile: adding title/text can break "Save Image" in iOS Share Sheet
+      // Pass strictly { files } on iOS/mobile: adding title/text can break Share Sheet actions
       const shareData = { files: [file] };
       const canShareFile =
         typeof navigator.canShare !== 'function' || navigator.canShare(shareData);
@@ -64,6 +76,7 @@ export async function shareOrSavePhoto(photo, platform, { preferShare = false } 
         await navigator.share(shareData);
         return { method: 'web-share', completed: true };
       }
+      shareUnavailableReason = 'share-file-unsupported';
     } catch (err) {
       if (err && err.name === 'AbortError') {
         return { method: 'web-share', completed: false, cancelled: true };
@@ -81,14 +94,14 @@ export async function shareOrSavePhoto(photo, platform, { preferShare = false } 
     }
   }
 
-  // On iOS, <a download> saves to the Files app instead of the Photos library.
-  // Surface manual save guidance (Share button / long-press <img>) instead of silently downloading to Files.
+  // On iOS PWA / fallback, <a download> cannot target the Photos library and may fail inside standalone PWAs.
+  // Surface manual save guidance (Share Sheet "Save to Files" for .avif, or Photos save) unless forceDownload was chosen.
   if (isIOS) {
     return {
       method: 'ios-manual-hint',
       completed: false,
       gestureExpired: false,
-      reason: 'web-share-unavailable',
+      reason: shareUnavailableReason,
     };
   }
 

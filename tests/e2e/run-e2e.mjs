@@ -462,13 +462,15 @@ async function main() {
     await page.click('#btn-timer');
     await page.click('#btn-timer');
 
-    // 13. Open Settings / Info Sheet, verify AVIF diagnostics, test JPEG format switch, then switch back to AVIF
+    // 13. Open Settings / Info Sheet, verify AVIF diagnostics & version, test JPEG format switch, then switch back to AVIF
     await page.click('#btn-info');
     await page.waitForSelector('#info-modal:not([hidden])');
     assert.equal(await page.getAttribute('#btn-format-avif', 'aria-checked'), 'true');
     const diagText = await page.textContent('#diagnostics-list');
+    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.4.1'));
     assert.ok(diagText.includes('WebGL') || diagText.includes('worker') || diagText.includes('canvas'));
     assert.ok(diagText.includes('保存フォーマット') && diagText.includes('AVIF'));
+    assert.ok(diagText.includes('直近の生成ファイル') && diagText.includes('.avif') && diagText.includes('image/avif'));
     assert.ok(diagText.includes('カメラ権限状態'));
     assert.ok(diagText.includes('超広角 (0.5×) カメラ') && diagText.includes('非対応'));
     const guideText = await page.textContent('#permission-guide');
@@ -660,12 +662,13 @@ async function main() {
     await deniedPage.waitForSelector('#info-modal:not([hidden])');
     await deniedContext.close();
 
-    // 19. iPhone Safari simulation: auto Share Sheet on shutter, NotAllowedError fallback to Preview Modal & iOS guidance
-    console.log('[e2e] checking iPhone Safari auto Share Sheet & manual save fallback flow');
+    // 19. iPhone Safari simulation: auto Share Sheet on shutter, NotAllowedError fallback to Preview Modal, direct .avif DL, & standalone PWA guard
+    console.log('[e2e] checking iPhone Safari auto Share Sheet, .avif direct DL, & manual save fallback flow');
     const iosContext = await browser.newContext({
       viewport: { width: 390, height: 844 },
       hasTouch: true,
       isMobile: true,
+      acceptDownloads: true,
       userAgent:
         'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1',
       permissions: ['camera'],
@@ -718,7 +721,7 @@ async function main() {
     assert.equal(firstShareCall.fileType, 'image/avif');
     assert.equal(await iosPage.locator('#preview-modal').isVisible(), false);
 
-    // Simulate NotAllowedError on next capture (e.g., slow burst) -> Preview Modal opens automatically with visible toast
+    // Simulate NotAllowedError on next capture (e.g., slow burst) -> Preview Modal opens automatically with visible toast & direct .avif DL
     await iosPage.waitForFunction(() => !window.__QCAM__.isCapturing, { timeout: 6000 });
     await iosPage.evaluate(() => {
       window.__SHARE_MODE__ = 'expire';
@@ -726,13 +729,47 @@ async function main() {
     await iosPage.click('#btn-shutter');
     await iosPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 10000 });
     assert.ok(
-      (await iosPage.textContent('#btn-modal-save')).includes('写真'),
-      'iOS preview save button should clearly mention 写真'
+      (await iosPage.textContent('#btn-modal-save')).includes('AVIF') ||
+        (await iosPage.textContent('#btn-modal-save')).includes('.avif'),
+      'iOS AVIF preview primary save button should reference .avif'
     );
+    assert.equal(
+      await iosPage.locator('#btn-modal-share').isVisible(),
+      true,
+      'Non-standalone iOS Safari should show direct .avif download button'
+    );
+    assert.ok((await iosPage.textContent('#btn-modal-share')).includes('.avif'));
+    const iosHintText = await iosPage.textContent('#preview-save-hint');
+    assert.ok(iosHintText.includes('ファイル') && iosHintText.includes('JPEG'));
     assert.equal(await iosPage.locator('#modal-toast').isVisible(), true);
     assert.ok(
       (await iosPage.evaluate(() => document.getElementById('preview-image').naturalWidth)) > 0,
       'iOS preview AVIF image must decode cleanly'
+    );
+    const iosModalLayout = await iosPage.evaluate(() => {
+      const saveBtn = document.getElementById('btn-modal-save').getBoundingClientRect();
+      const dlBtn = document.getElementById('btn-modal-share').getBoundingClientRect();
+      const hint = document.getElementById('preview-save-hint').getBoundingClientRect();
+      const stage = document.getElementById('preview-stage').getBoundingClientRect();
+      return { saveBtn, dlBtn, hint, stage };
+    });
+    assert.ok(
+      iosModalLayout.dlBtn.right <= iosModalLayout.saveBtn.left + 1 &&
+        iosModalLayout.saveBtn.right <= 390 &&
+        iosModalLayout.stage.height >= 200,
+      `iOS preview modal layout issue: ${JSON.stringify(iosModalLayout)}`
+    );
+    if (screenshotDir) {
+      await iosPage.screenshot({ path: path.join(screenshotDir, 'e2e_ios_preview_avif.png') });
+    }
+
+    // Clicking the secondary direct-DL button on non-standalone iPhone Safari triggers an actual .avif download
+    const iosDirectDlPromise = iosPage.waitForEvent('download', { timeout: 6000 });
+    await iosPage.click('#btn-modal-share');
+    const iosDirectDl = await iosDirectDlPromise;
+    assert.ok(
+      iosDirectDl.suggestedFilename().endsWith('.avif'),
+      `iOS direct DL should save .avif, got ${iosDirectDl.suggestedFilename()}`
     );
 
     // Clicking the modal save button retries Share Sheet with fresh click gesture
@@ -744,14 +781,59 @@ async function main() {
     const modalShareCall = await iosPage.evaluate(() => window.__SHARE_CALLS__[2]);
     assert.ok(modalShareCall.fileName.endsWith('.avif'));
     assert.equal(modalShareCall.fileType, 'image/avif');
-    assert.ok((await iosPage.textContent('#modal-toast')).includes('写真'));
+    assert.ok((await iosPage.textContent('#modal-toast')).includes('ファイル'));
 
     await iosPage.click('#btn-modal-close');
     await iosPage.click('#btn-info');
     await iosPage.waitForSelector('#info-modal:not([hidden])');
+    // Switching iOS setting to JPEG hides direct .avif DL and uses Photos save wording
+    await iosPage.click('#btn-format-jpeg');
     const iosGuideText = await iosPage.textContent('#permission-guide');
     assert.ok(iosGuideText.includes('設定') && iosGuideText.includes('Safari') && iosGuideText.includes('許可'));
+    await iosPage.click('#btn-info-close');
+
+    await iosPage.evaluate(() => {
+      window.__SHARE_MODE__ = 'expire';
+    });
+    await iosPage.click('#btn-shutter');
+    await iosPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 10000 });
+    assert.ok((await iosPage.textContent('#btn-modal-save')).includes('写真'));
+    assert.equal(await iosPage.locator('#btn-modal-share').isVisible(), false);
+    await iosPage.click('#btn-modal-close');
     await iosContext.close();
+
+    // 19b. iPhone Standalone PWA simulation: direct <a download> button stays hidden to prevent PWA navigation trap
+    const iosPwaContext = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+      userAgent:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1',
+      permissions: ['camera'],
+    });
+    const iosPwaPage = await iosPwaContext.newPage();
+    await iosPwaPage.addInitScript(() => {
+      Object.defineProperty(navigator, 'standalone', { configurable: true, get: () => true });
+      navigator.canShare = (data) => Array.isArray(data?.files) && data.files.length === 1;
+      navigator.share = async () => {
+        throw new DOMException('Activation expired', 'NotAllowedError');
+      };
+    });
+    await iosPwaPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await iosPwaPage.waitForFunction(() => {
+      const v = document.getElementById('camera-video');
+      return v && v.videoWidth > 0 && v.videoHeight > 0;
+    }, { timeout: 6000 });
+    await iosPwaPage.click('#btn-shutter');
+    await iosPwaPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 10000 });
+    assert.equal(
+      await iosPwaPage.locator('#btn-modal-share').isVisible(),
+      false,
+      'Standalone iOS PWA must hide direct anchor download button'
+    );
+    assert.ok((await iosPwaPage.textContent('#btn-modal-save')).includes('.avif'));
+    assert.ok(!(await iosPwaPage.textContent('#preview-save-hint')).includes('直接DL'));
+    await iosPwaContext.close();
 
     // 20. Android Chrome 0.5x hardware zoom simulation (capabilities.zoom.min = 0.5) & compact layout check
     console.log('[e2e] checking Android 0.5x hardware zoom & compact 360x640 / landscape layout');

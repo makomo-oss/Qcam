@@ -1,6 +1,8 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { detectPlatform } from '../../src/utils/platform.js';
+import { APP_VERSION, detectPlatform } from '../../src/utils/platform.js';
 
 test('detectPlatform identifies iOS Safari and selects Video Stream + Web Share strategy', () => {
   const iosEnv = {
@@ -99,4 +101,16 @@ test('detectPlatform differentiates image/avif vs image/jpeg support in navigato
   const info = detectPlatform(selectiveEnv);
   assert.equal(info.supportsWebShareFiles, true);
   assert.equal(info.supportsWebShareAvif, false);
+});
+
+test('APP_VERSION stays in sync with sw.js CACHE_VERSION and reload precache', () => {
+  const swPath = path.resolve(import.meta.dirname, '..', '..', 'sw.js');
+  const swContent = fs.readFileSync(swPath, 'utf8');
+  const match = swContent.match(/const CACHE_VERSION = 'qcam-v([^']+)'/);
+  assert.ok(match, 'sw.js must define CACHE_VERSION');
+  assert.equal(match[1], APP_VERSION);
+  assert.ok(
+    swContent.includes("cache: 'reload'"),
+    'sw.js install precache must bypass stale HTTP cache via cache: reload'
+  );
 });

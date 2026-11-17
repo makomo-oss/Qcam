@@ -186,8 +186,12 @@ export class CameraUI {
     // Preview Modal events
     this.els.btnModalClose.addEventListener('click', () => this.closePreviewModal());
     this.els.btnModalDelete.addEventListener('click', () => this.handlers.onDeleteCurrentPhoto());
-    this.els.btnModalSave.addEventListener('click', () => this.handlers.onSaveCurrentPhoto(false));
-    this.els.btnModalShare.addEventListener('click', () => this.handlers.onSaveCurrentPhoto(true));
+    this.els.btnModalSave.addEventListener('click', () =>
+      this.handlers.onSaveCurrentPhoto(this.els.btnModalSave.dataset.saveAction || 'auto')
+    );
+    this.els.btnModalShare.addEventListener('click', () =>
+      this.handlers.onSaveCurrentPhoto(this.els.btnModalShare.dataset.saveAction || 'share')
+    );
 
     this.els.btnPreviewZoom1x.addEventListener('click', () => this.setPreviewZoom(1));
     this.els.btnPreviewZoom2x.addEventListener('click', () => this.setPreviewZoom(2));
@@ -640,11 +644,36 @@ export class CameraUI {
     this.els.previewMeta.textContent = `${photo.width}×${photo.height} · ${formatLabel} · ${modeLabel} · ${timeText} · ${sizeText}`;
 
     // OS-specific save UI guidance
+    const isAvif = formatLabel === 'AVIF';
+    const canDirectDownloadAvifOnIOS = Boolean(
+      platform.isIOS && platform.isSafari && !platform.isStandalonePWA && isAvif
+    );
     this.els.previewSaveHint.hidden = !platform.isIOS;
-    this.els.btnModalSave.textContent = platform.isIOS
-      ? '「写真」へ保存 (共有シート)'
-      : `端末に保存 (${formatLabel})`;
-    this.els.btnModalShare.hidden = platform.isIOS || !platform.supportsWebShareFiles;
+    if (platform.isIOS) {
+      if (isAvif) {
+        this.els.btnModalSave.textContent = '共有で保存 (.avif)';
+        this.els.btnModalSave.dataset.saveAction = 'share';
+        this.els.btnModalShare.textContent = '直接DL (.avif)';
+        this.els.btnModalShare.dataset.saveAction = 'download';
+        this.els.btnModalShare.hidden = !canDirectDownloadAvifOnIOS;
+        this.els.previewSaveHint.textContent =
+          `iPhone の「写真」アプリ（「画像を保存」／長押し保存）へ取り込むと OS 仕様で JPEG 変換されます。.avif のまま残す場合は共有シートの「“ファイル”に保存」${canDirectDownloadAvifOnIOS ? 'または「直接DL (.avif)」' : ''}を選択してください。`;
+      } else {
+        this.els.btnModalSave.textContent = '「写真」へ保存 (共有)';
+        this.els.btnModalSave.dataset.saveAction = 'share';
+        this.els.btnModalShare.textContent = '共有';
+        this.els.btnModalShare.dataset.saveAction = 'share';
+        this.els.btnModalShare.hidden = true;
+        this.els.previewSaveHint.textContent =
+          'iPhone では共有シートの「画像を保存」、または上の写真を長押しして「“写真”に保存」を選ぶと写真アプリに保存されます。';
+      }
+    } else {
+      this.els.btnModalSave.textContent = `端末に保存 (${formatLabel})`;
+      this.els.btnModalSave.dataset.saveAction = 'download';
+      this.els.btnModalShare.textContent = '共有';
+      this.els.btnModalShare.dataset.saveAction = 'share';
+      this.els.btnModalShare.hidden = !platform.supportsWebShareFiles;
+    }
 
     // Render filmstrip
     this.els.previewFilmstrip.innerHTML = '';
