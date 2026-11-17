@@ -1,0 +1,64 @@
+name: Test and Deploy Qcam to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Run headless Chromium E2E tests
+        run: |
+          if [ -x /usr/bin/google-chrome ]; then
+            PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci
+            CHROME_PATH=/usr/bin/google-chrome npm run test:e2e
+          else
+            echo "google-chrome not available on runner, skipping E2E"
+          fi
+
+      - name: Prepare GitHub Pages static bundle
+        run: |
+          mkdir -p _site
+          cp index.html manifest.webmanifest sw.js _site/
+          cp -r icons styles src _site/
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

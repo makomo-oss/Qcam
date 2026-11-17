@@ -129,7 +129,14 @@ function averageFramesCPU(frames, crop, mirrorX) {
 
 self.addEventListener('message', async (event) => {
   const msg = event.data;
-  if (!msg || msg.type !== 'process') return;
+  if (!msg) return;
+
+  if (msg.type === 'warmup') {
+    getWebGLProcessor();
+    return;
+  }
+
+  if (msg.type !== 'process') return;
 
   const {
     id,

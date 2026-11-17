@@ -87,8 +87,8 @@ input:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: calc(10px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-right)) 10px calc(14px + env(safe-area-inset-left));
+  gap: 6px;
+  padding: calc(10px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 10px calc(12px + env(safe-area-inset-left));
   background: linear-gradient(180deg, rgba(5, 6, 8, 0.88) 0%, rgba(5, 6, 8, 0.25) 100%);
 }
 
@@ -96,21 +96,24 @@ input:focus-visible {
 .top-bar-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  min-width: 0;
 }
 
 .status-pill {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
+  flex-shrink: 0;
+  white-space: nowrap;
   height: 30px;
-  padding: 0 10px;
+  padding: 0 8px;
   border-radius: 999px;
   background: var(--surface-glass);
   border: 1px solid var(--border-hairline);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.02em;
   color: var(--text-secondary);
@@ -127,8 +130,10 @@ input:focus-visible {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  height: 36px;
+  gap: 4px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  height: 34px;
   border-radius: 999px;
   background: var(--surface-glass);
   border: 1px solid var(--border-hairline);
@@ -139,14 +144,14 @@ input:focus-visible {
 }
 
 .icon-pill {
-  padding: 0 12px;
+  padding: 0 10px;
   font-size: 12px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
 
 .icon-btn {
-  width: 36px;
+  width: 34px;
 }
 
 .icon-pill:hover,
@@ -772,7 +777,7 @@ input:focus-visible {
   z-index: 60;
   display: flex;
   flex-direction: column;
-  background: rgba(5, 6, 8, 0.98);
+  background: var(--bg-obsidian);
 }
 
 .modal[hidden],

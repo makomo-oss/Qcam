@@ -10,5 +10,7 @@
     "test:e2e": "node tests/e2e/run-e2e.mjs",
     "test": "npm run test:unit && npm run test:e2e"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "playwright-core": "^1.65.1"
+  }
 }

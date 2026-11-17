@@ -68,6 +68,7 @@ class QcamApp {
     await this.startCamera();
     this._registerServiceWorker();
     this._setupLifecycleHandlers();
+    setTimeout(() => this.pipeline.warmup(), 120);
   }
 
   async startCamera() {

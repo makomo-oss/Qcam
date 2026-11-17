@@ -138,7 +138,7 @@ export class WebGLImageProcessor {
       gl.uniform1f(gl.getUniformLocation(this.standardProgram, 'uExposureEv'), exposureEv);
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      gl.finish();
+      gl.flush();
     } finally {
       gl.deleteTexture(tex);
     }
@@ -192,7 +192,7 @@ export class WebGLImageProcessor {
       gl.uniform1f(gl.getUniformLocation(this.hqProgram, 'uExposureEv'), exposureEv);
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      gl.finish();
+      gl.flush();
     } finally {
       for (const tex of textures) {
         gl.deleteTexture(tex);

@@ -70,6 +70,14 @@ export class ImagePipeline {
     }
   }
 
+  warmup() {
+    if (this.worker && this.platform.supportsOffscreenWebGL) {
+      this.worker.postMessage({ type: 'warmup' });
+    } else if (!this.platform.supportsOffscreenWebGL) {
+      this._getMainWebGL();
+    }
+  }
+
   /**
    * Process captured frame(s) and return JPEG (quality 0.95) Blob + metadata.
    */
@@ -99,6 +107,7 @@ export class ImagePipeline {
           this.worker.postMessage(
             {
               id,
+              type: 'process',
               mode,
               frames,
               aspectRatio,

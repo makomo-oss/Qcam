@@ -39,7 +39,7 @@ export const STANDARD_FRAGMENT_SHADER = `
   void main() {
     vec3 center = texture2D(uTexture, vTexCoord).rgb;
 
-    // 9-tap Gaussian-weighted neighborhood for isotropic luminance unsharp mask
+    // 5-tap isotropic cross kernel for fast luminance unsharp mask
     vec2 dx = vec2(uTexelSize.x, 0.0);
     vec2 dy = vec2(0.0, uTexelSize.y);
 
@@ -48,14 +48,8 @@ export const STANDARD_FRAGMENT_SHADER = `
     float lS = getLuma(texture2D(uTexture, vTexCoord + dy).rgb);
     float lW = getLuma(texture2D(uTexture, vTexCoord - dx).rgb);
     float lE = getLuma(texture2D(uTexture, vTexCoord + dx).rgb);
-    float lNW = getLuma(texture2D(uTexture, vTexCoord - dx - dy).rgb);
-    float lNE = getLuma(texture2D(uTexture, vTexCoord + dx - dy).rgb);
-    float lSW = getLuma(texture2D(uTexture, vTexCoord - dx + dy).rgb);
-    float lSE = getLuma(texture2D(uTexture, vTexCoord + dx + dy).rgb);
 
-    float lBlur = 0.25 * lC
-                + 0.125 * (lN + lS + lW + lE)
-                + 0.0625 * (lNW + lNE + lSW + lSE);
+    float lBlur = 0.25 * (lN + lS + lW + lE);
 
     float detail = lC - lBlur;
     // Soft noise coring so subtle grain is not amplified while real edges sharpen crisply
