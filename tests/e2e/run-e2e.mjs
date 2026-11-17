@@ -134,11 +134,15 @@ async function main() {
       const manifest = await manifestResp.json();
       let swRegistered = false;
       if ('serviceWorker' in navigator) {
-        const reg = await Promise.race([
-          navigator.serviceWorker.getRegistration(),
-          new Promise((r) => setTimeout(() => r(null), 2000)),
-        ]);
-        swRegistered = Boolean(reg);
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          const reg = await navigator.serviceWorker.getRegistration();
+          if (reg) {
+            swRegistered = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 60));
+        }
       }
       return {
         manifestOk: manifestResp.ok,
@@ -362,19 +366,182 @@ async function main() {
     await page.click('#btn-timer');
     await page.click('#btn-timer');
 
-    // 13. Open Settings / Info Sheet and verify diagnostics
+    // 13. Open Settings / Info Sheet and verify diagnostics + OS permission guide
     await page.click('#btn-info');
     await page.waitForSelector('#info-modal:not([hidden])');
     const diagText = await page.textContent('#diagnostics-list');
     assert.ok(diagText.includes('WebGL') || diagText.includes('worker') || diagText.includes('canvas'));
+    assert.ok(diagText.includes('カメラ権限状態'));
+    const guideText = await page.textContent('#permission-guide');
+    assert.ok(guideText.includes('iOS Safari') && guideText.includes('Android'));
     if (screenshotDir) {
       await page.screenshot({ path: path.join(screenshotDir, 'e2e_info_sheet.png') });
     }
     await page.click('#btn-info-close');
 
-    // 14. Switch Camera (environment -> user)
+    // 14. Switch Camera (environment -> user) and verify settings persistence across reload
+    await page.click('#btn-aspect'); // 4:3 -> 16:9
     await page.click('#btn-switch-camera');
-    await page.waitForFunction(() => window.__QCAM__.camera.facingMode === 'user');
+    await page.waitForFunction(
+      () =>
+        window.__QCAM__.camera.facingMode === 'user' &&
+        window.__QCAM__.camera.track &&
+        window.__QCAM__.camera.track.readyState === 'live'
+    );
+    const trackIdBeforeVis = await page.evaluate(() => window.__QCAM__.camera.track?.id || '');
+
+    // 15. Simulate transient visibilitychange (Share Sheet / Control Center) and verify track stays alive
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await page.waitForTimeout(80);
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await page.waitForTimeout(80);
+    const trackIdAfterVis = await page.evaluate(() => window.__QCAM__.camera.track?.id || '');
+    assert.equal(
+      trackIdAfterVis,
+      trackIdBeforeVis,
+      'Transient visibilitychange must keep active camera stream alive without re-prompting'
+    );
+
+    // 16. Verify persisted settings (16:9, grid ON, hq mode, user facing) survive page reload cleanly
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 10000 });
+    await page.waitForFunction(() => {
+      const v = document.getElementById('camera-video');
+      return v && v.videoWidth > 0 && v.videoHeight > 0;
+    }, { timeout: 6000 });
+    assert.equal(await page.textContent('#aspect-label'), '16:9');
+    assert.equal(await page.getAttribute('#btn-grid', 'aria-pressed'), 'true');
+    assert.equal(await page.getAttribute('#mode-hq', 'aria-selected'), 'true');
+    assert.equal(await page.evaluate(() => window.__QCAM__.camera.facingMode), 'user');
+    assert.equal(await page.locator('#perm-hint-banner').isVisible(), false);
+
+    if (screenshotDir) {
+      await page.screenshot({ path: path.join(screenshotDir, 'e2e_viewfinder_169.png') });
+    }
+
+    // 17. Responsive layout checks across smartphone viewports (360x640 compact Android, 375x667 SE, 844x390 landscape)
+    console.log('[e2e] checking multi-smartphone viewports (360x640, 375x667, 844x390)');
+    await page.setViewportSize({ width: 360, height: 640 });
+    await page.waitForTimeout(140);
+    const compactStats = await page.evaluate(() => {
+      const topBar = document.querySelector('.top-bar');
+      const silentLabel = document.querySelector('.silent-label');
+      const btnInfoRect = document.getElementById('btn-info').getBoundingClientRect();
+      const shutterRect = document.getElementById('btn-shutter').getBoundingClientRect();
+      const vfRect = document.getElementById('viewfinder-frame').getBoundingClientRect();
+      return {
+        topBarScrollW: topBar.scrollWidth,
+        topBarClientW: topBar.clientWidth,
+        silentLabelDisplay: getComputedStyle(silentLabel).display,
+        btnInfoRight: btnInfoRect.right,
+        shutterBottom: shutterRect.bottom,
+        shutterTop: shutterRect.top,
+        vfWidth: vfRect.width,
+        vfHeight: vfRect.height,
+      };
+    });
+    assert.ok(compactStats.topBarScrollW <= compactStats.topBarClientW + 1, `Top bar overflowed on 360px: ${JSON.stringify(compactStats)}`);
+    assert.equal(compactStats.silentLabelDisplay, 'none', 'Silent label should collapse on <=375px width');
+    assert.ok(compactStats.btnInfoRight <= 360, `btn-info clipped on 360px: ${compactStats.btnInfoRight}`);
+    assert.ok(compactStats.shutterBottom <= 640 && compactStats.shutterTop > 0, `Shutter out of bounds: ${JSON.stringify(compactStats)}`);
+    assert.ok(compactStats.vfWidth >= 358, `16:9 portrait on 360x640 should use full 360px width, got ${compactStats.vfWidth}`);
+    if (screenshotDir) {
+      await page.screenshot({ path: path.join(screenshotDir, 'e2e_compact_360x640.png') });
+    }
+
+    // Check 375x667 (iPhone SE) in 4:3 as well
+    await page.click('#btn-aspect'); // back to 4:3
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.waitForTimeout(140);
+    const seBox = await page.locator('#viewfinder-frame').boundingBox();
+    assert.ok(seBox.width >= 335, `4:3 on 375x667 too narrow: ${seBox.width}`);
+    assert.ok(Math.abs(seBox.width / seBox.height - 3 / 4) < 0.04);
+
+    // Check 844x390 Smartphone Landscape
+    await page.setViewportSize({ width: 844, height: 390 });
+    await page.waitForTimeout(160);
+    const landStats = await page.evaluate(() => {
+      const dock = document.querySelector('.bottom-dock').getBoundingClientRect();
+      const zoomBar = document.querySelector('.zoom-bar').getBoundingClientRect();
+      const topHud = document.getElementById('top-hud').getBoundingClientRect();
+      const shutter = document.getElementById('btn-shutter').getBoundingClientRect();
+      const modeSwitcher = document.querySelector('.mode-switcher').getBoundingClientRect();
+      const vf = document.getElementById('viewfinder-frame').getBoundingClientRect();
+      return {
+        dock,
+        zoomBar,
+        topHud,
+        shutter,
+        modeSwitcher,
+        vf,
+        dockScrollH: document.querySelector('.bottom-dock').scrollHeight,
+      };
+    });
+    assert.ok(landStats.dock.height <= 391 && landStats.dockScrollH <= 391, `Landscape dock overflowed vertically: ${JSON.stringify(landStats)}`);
+    assert.ok(landStats.zoomBar.right <= landStats.dock.left + 1, `Zoom bar overlaps landscape right dock: ${JSON.stringify(landStats)}`);
+    assert.ok(landStats.topHud.right <= landStats.dock.left + 1, `Top HUD overlaps landscape right dock: ${JSON.stringify(landStats)}`);
+    assert.ok(landStats.shutter.bottom <= 390 && landStats.modeSwitcher.top >= 0);
+    assert.ok(landStats.vf.left + landStats.vf.width <= landStats.dock.left + 2, `Landscape viewfinder hidden under dock: ${JSON.stringify(landStats.vf)}`);
+
+    // Tap near right edge of landscape viewfinder and verify EV slider flips left cleanly
+    await page.mouse.click(landStats.vf.left + landStats.vf.width - 14, landStats.vf.top + landStats.vf.height * 0.5);
+    await page.waitForTimeout(50);
+    assert.equal(await page.evaluate(() => document.getElementById('focus-reticle').classList.contains('is-ev-left')), true);
+    if (screenshotDir) {
+      await page.screenshot({ path: path.join(screenshotDir, 'e2e_landscape_844x390.png') });
+    }
+
+    // 18. Permission prompt reload hint & denied recovery flow in isolated contexts
+    console.log('[e2e] checking permission reload hint banner and denied fallback UX');
+    const promptContext = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      permissions: ['camera'],
+    });
+    const promptPage = await promptContext.newPage();
+    await promptPage.addInitScript(() => {
+      localStorage.setItem('qcam_perm_granted_once', '1');
+      if (navigator.permissions) {
+        const origQuery = navigator.permissions.query.bind(navigator.permissions);
+        navigator.permissions.query = (desc) => {
+          if (desc && desc.name === 'camera') {
+            return Promise.resolve({ state: 'prompt' });
+          }
+          return origQuery(desc);
+        };
+      }
+    });
+    await promptPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await promptPage.waitForSelector('#perm-hint-banner:not([hidden])', { timeout: 6000 });
+    await promptPage.click('#btn-perm-hint-dismiss');
+    assert.equal(await promptPage.locator('#perm-hint-banner').isVisible(), false);
+    assert.equal(await promptPage.evaluate(() => localStorage.getItem('qcam_perm_hint_dismissed')), '1');
+    await promptContext.close();
+
+    const deniedContext = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+    });
+    const deniedPage = await deniedContext.newPage();
+    await deniedPage.addInitScript(() => {
+      if (navigator.permissions) {
+        navigator.permissions.query = (desc) => {
+          if (desc && desc.name === 'camera') {
+            return Promise.resolve({ state: 'denied' });
+          }
+          return Promise.resolve({ state: 'prompt' });
+        };
+      }
+    });
+    await deniedPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await deniedPage.waitForSelector('#camera-overlay:not([hidden])', { timeout: 6000 });
+    assert.equal(await deniedPage.locator('#btn-overlay-help').isVisible(), true);
+    await deniedPage.click('#btn-overlay-help');
+    await deniedPage.waitForSelector('#info-modal:not([hidden])');
+    await deniedContext.close();
 
     assert.deepEqual(consoleErrors, [], `Console errors encountered: ${consoleErrors.join('; ')}`);
     assert.deepEqual(pageErrors, [], `Page errors encountered: ${pageErrors.join('; ')}`);
@@ -384,6 +551,7 @@ async function main() {
       stdPhoto,
       hqPhoto,
       orientationEngine: orientationCheck.engine,
+      compactStats,
       pwa: pwaStatus,
     }, null, 2));
   } finally {

@@ -170,3 +170,136 @@ export function mapTapToNormalizedPoint(
     y: Number(Math.max(0, Math.min(1, normY)).toFixed(4)),
   };
 }
+
+/**
+ * Compute optimal viewfinder frame placement across smartphone portrait,
+ * short browser viewports (address bars visible), compact smartphone landscape,
+ * and tablet/desktop viewports.
+ */
+export function computeViewfinderLayout({
+  stageWidth,
+  stageHeight,
+  topBarBottom = 0,
+  dockTop = stageHeight,
+  dockLeft = stageWidth,
+  dockWidth = 0,
+  dockHeight = 0,
+  aspectRatio = '4:3',
+}) {
+  const safeW = Math.max(120, stageWidth || 360);
+  const safeH = Math.max(120, stageHeight || 640);
+  const baseRatio = ASPECT_RATIOS[aspectRatio] || ASPECT_RATIOS['4:3'];
+  const isPortrait = safeH >= safeW;
+  const targetRatio = isPortrait ? 1 / baseRatio : baseRatio;
+
+  const isSideDock =
+    dockWidth > 0 &&
+    dockHeight > safeH * 0.65 &&
+    dockWidth < safeW * 0.45 &&
+    dockLeft > safeW * 0.5;
+
+  const fitInto = (maxW, maxH) => {
+    let w = maxW;
+    let h = w / targetRatio;
+    if (h > maxH) {
+      h = maxH;
+      w = h * targetRatio;
+    }
+    return { width: w, height: h };
+  };
+
+  let frameW;
+  let frameH;
+  let left;
+  let top;
+
+  if (isSideDock) {
+    const clearW = Math.max(120, dockLeft);
+    if (aspectRatio === '16:9') {
+      const fitted = fitInto(safeW, safeH);
+      frameW = fitted.width;
+      frameH = fitted.height;
+      // If 16:9 still clears the side dock comfortably, center inside clear area; otherwise full-bleed
+      left = frameW <= clearW ? (clearW - frameW) / 2 : (safeW - frameW) / 2;
+      top = (safeH - frameH) / 2;
+    } else {
+      const fitted = fitInto(Math.max(120, clearW - 8), Math.max(120, safeH - 4));
+      frameW = fitted.width;
+      frameH = fitted.height;
+      left = (clearW - frameW) / 2;
+      top = (safeH - frameH) / 2;
+    }
+  } else if (isPortrait) {
+    const clearTop = Math.max(0, topBarBottom);
+    const clearBottom = Math.min(safeH, dockTop > 0 ? dockTop : safeH - dockHeight);
+    const clearH = Math.max(120, clearBottom - clearTop);
+
+    if (aspectRatio === '16:9') {
+      const fitted = fitInto(safeW, safeH);
+      frameW = fitted.width;
+      frameH = fitted.height;
+      left = (safeW - frameW) / 2;
+      top = (safeH - frameH) / 2;
+    } else {
+      const fullWHeight = safeW / targetRatio;
+      const clearFitW = Math.max(0, clearH - 4) * targetRatio;
+
+      if (fullWHeight <= clearH - 4) {
+        frameW = safeW;
+        frameH = fullWHeight;
+        left = 0;
+        top = clearTop + (clearH - frameH) / 2;
+      } else if (clearFitW >= safeW * 0.88) {
+        frameW = clearFitW;
+        frameH = clearH - 4;
+        left = (safeW - frameW) / 2;
+        top = clearTop + 2;
+      } else {
+        // Short phone screens (e.g. mobile Safari/Chrome with bottom toolbar open):
+        // allow translucent top bar / zoom pill over the frame while keeping shutter button unobstructed
+        const measuredDockH = Math.max(0, dockHeight || safeH - clearBottom);
+        const shutterGuard = Math.min(92, measuredDockH * 0.56);
+        const topGuard = Math.min(24, clearTop * 0.5);
+        const availH = Math.min(safeH, Math.max(clearH, safeH - topGuard - shutterGuard));
+        const fitted = fitInto(safeW, availH);
+        frameW = fitted.width;
+        frameH = fitted.height;
+        left = (safeW - frameW) / 2;
+        top = topGuard + Math.max(0, (availH - frameH) / 2);
+      }
+    }
+  } else {
+    // Tablet / Desktop landscape (dock at bottom)
+    const clearTop = Math.max(0, topBarBottom);
+    const clearBottom = Math.min(safeH, dockTop > 0 ? dockTop : safeH - dockHeight);
+    const clearH = Math.max(120, clearBottom - clearTop - 12);
+    const availW = Math.max(120, safeW - 24);
+    const fitted = fitInto(availW, clearH);
+    frameW = fitted.width;
+    frameH = fitted.height;
+    left = (safeW - frameW) / 2;
+    top = clearTop + 6 + (clearH - frameH) / 2;
+  }
+
+  const width = Math.round(frameW);
+  const height = Math.round(frameH);
+  const roundedLeft = Math.round(left);
+  const roundedTop = Math.round(top);
+  const edgeToEdge = width >= safeW - 2 || height >= safeH - 2;
+  const topInset = isSideDock ? Math.max(0, Math.round(topBarBottom - roundedTop)) : Math.max(0, Math.round(topBarBottom - roundedTop));
+  const bottomInset = isSideDock
+    ? 0
+    : Math.max(0, Math.round(roundedTop + height - Math.min(safeH, dockTop > 0 ? dockTop : safeH - dockHeight)));
+
+  return {
+    left: roundedLeft,
+    top: roundedTop,
+    width,
+    height,
+    edgeToEdge,
+    topInset,
+    bottomInset,
+    isSideDock,
+  };
+}
+

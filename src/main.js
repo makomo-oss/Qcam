@@ -6,27 +6,67 @@ import { CameraUI } from './ui/camera-ui.js';
 
 const MAX_SESSION_PHOTOS = 30;
 const TIMER_CYCLE = [0, 3, 10];
+const SETTINGS_STORAGE_KEY = 'qcam_settings_v1';
+const PERM_GRANTED_KEY = 'qcam_perm_granted_once';
+const PERM_HINT_DISMISSED_KEY = 'qcam_perm_hint_dismissed';
+
+function readJsonStorage(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonStorage(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // ignore storage errors in private mode
+  }
+}
+
+function readStringStorage(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStringStorage(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // ignore
+  }
+}
 
 class QcamApp {
   constructor() {
     this.platform = detectPlatform(window);
+    const saved = readJsonStorage(SETTINGS_STORAGE_KEY) || {};
     this.settings = {
-      aspectRatio: '4:3',
-      gridVisible: false,
+      aspectRatio: saved.aspectRatio === '16:9' ? '16:9' : '4:3',
+      gridVisible: Boolean(saved.gridVisible),
       timerSeconds: 0,
-      mode: 'standard',
-      autoSave: !this.platform.isIOS,
-      mirrorFrontSave: false,
+      mode: saved.mode === 'hq' ? 'hq' : 'standard',
+      autoSave: typeof saved.autoSave === 'boolean' ? saved.autoSave : !this.platform.isIOS,
+      mirrorFrontSave: Boolean(saved.mirrorFrontSave),
+      facingMode: saved.facingMode === 'user' ? 'user' : 'environment',
     };
 
     this.photos = [];
     this.currentGalleryIndex = 0;
     this.isCapturing = false;
+    this.isSwitchingCamera = false;
     this.countdownTimerId = null;
     this.countdownRemaining = 0;
     this.streamInfo = null;
     this.lastProcessEngine = '--';
     this.lastCaptureTimeMs = null;
+    this.lastPermissionState = 'unknown';
 
     this.ui = new CameraUI({
       onToggleAspect: () => this.toggleAspectRatio(),
@@ -45,9 +85,12 @@ class QcamApp {
       onSaveCurrentPhoto: (preferShare) => this.saveCurrentPhoto(preferShare),
       onSettingChange: (key, val) => this.updateSetting(key, val),
       onRefreshDiagnostics: () => this.refreshDiagnostics(),
+      onOpenPermissionGuide: () => this.ui.openInfoModal({ scrollToPermissionGuide: true }),
+      onDismissPermissionHint: () => this.dismissPermissionHint(),
     });
 
     this.camera = new CameraController(this.ui.els.video, this.platform);
+    this.camera.facingMode = this.settings.facingMode;
     this.camera.onStreamInfo = (info) => {
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
@@ -57,34 +100,82 @@ class QcamApp {
     this.pipeline = new ImagePipeline(this.platform);
   }
 
+  _persistSettings() {
+    writeJsonStorage(SETTINGS_STORAGE_KEY, {
+      aspectRatio: this.settings.aspectRatio,
+      gridVisible: this.settings.gridVisible,
+      mode: this.settings.mode,
+      autoSave: this.settings.autoSave,
+      mirrorFrontSave: this.settings.mirrorFrontSave,
+      facingMode: this.settings.facingMode,
+    });
+  }
+
   async init() {
+    document.documentElement.dataset.os = this.platform.isIOS
+      ? 'ios'
+      : this.platform.isAndroid
+      ? 'android'
+      : 'desktop';
+    document.documentElement.dataset.pwa = String(this.platform.isStandalonePWA);
+
     this.ui.setAspectRatio(this.settings.aspectRatio);
     this.ui.setGridVisible(this.settings.gridVisible);
     this.ui.setTimerSeconds(this.settings.timerSeconds);
     this.ui.setCaptureMode(this.settings.mode);
     this.ui.els.toggleAutoSave.checked = this.settings.autoSave;
     this.ui.els.toggleMirrorFront.checked = this.settings.mirrorFrontSave;
+    this.ui.renderPermissionGuide(this.platform);
 
-    await this.startCamera();
+    await this.startCamera({ fromInit: true });
     this._registerServiceWorker();
     this._setupLifecycleHandlers();
     setTimeout(() => this.pipeline.warmup(), 120);
   }
 
-  async startCamera() {
+  async startCamera({ fromInit = false } = {}) {
     this.ui.hideCameraOverlay();
+
+    const permBefore = await this.camera.checkPermissionState();
+    this.lastPermissionState = permBefore.state;
+
+    if (permBefore.state === 'denied') {
+      this.ui.hidePermissionHintBanner();
+      this.ui.showCameraOverlay(
+        'カメラの使用が許可されていません',
+        'ブラウザまたは端末のサイト設定からカメラへのアクセスを「許可」に変更し、「カメラを起動」を押してください。',
+        { showRetry: true, showHelp: true }
+      );
+      return;
+    }
+
     try {
-      const info = await this.camera.start();
+      const hadGrantedOnce = readStringStorage(PERM_GRANTED_KEY) === '1';
+      const hintDismissed = readStringStorage(PERM_HINT_DISMISSED_KEY) === '1';
+
+      const info = await this.camera.start({ facingMode: this.settings.facingMode });
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
+
+      writeStringStorage(PERM_GRANTED_KEY, '1');
+      const permAfter = await this.camera.checkPermissionState();
+      this.lastPermissionState = permAfter.state !== 'unknown' ? permAfter.state : 'granted';
+
+      if (fromInit && permBefore.state === 'prompt' && hadGrantedOnce && !hintDismissed) {
+        this.ui.showPermissionHintBanner();
+      } else if (permBefore.state === 'granted') {
+        this.ui.hidePermissionHintBanner();
+      }
     } catch (err) {
       const name = err?.name || '';
       if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        this.lastPermissionState = 'denied';
         this.ui.showCameraOverlay(
           'カメラの使用が許可されていません',
-          'ブラウザまたは端末の設定からこのサイトのカメラアクセスを許可して「カメラを起動」を押してください。'
+          'ブラウザまたは端末の設定からこのサイトのカメラアクセスを許可して「カメラを起動」を押してください。',
+          { showRetry: true, showHelp: true }
         );
       } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
         this.ui.showCameraOverlay(
@@ -100,28 +191,40 @@ class QcamApp {
     }
   }
 
+  dismissPermissionHint() {
+    writeStringStorage(PERM_HINT_DISMISSED_KEY, '1');
+    this.ui.hidePermissionHintBanner();
+  }
+
   async switchCamera() {
-    if (this.isCapturing || this.countdownRemaining > 0) return;
+    if (this.isCapturing || this.countdownRemaining > 0 || this.isSwitchingCamera) return;
+    this.isSwitchingCamera = true;
     this.ui.animateSwitchCamera();
     try {
       const info = await this.camera.switchCamera();
+      this.settings.facingMode = this.camera.facingMode;
+      this._persistSettings();
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
     } catch (err) {
       this.ui.showToast('カメラの切り替えに失敗しました');
+    } finally {
+      this.isSwitchingCamera = false;
     }
   }
 
   toggleAspectRatio() {
     const next = this.settings.aspectRatio === '4:3' ? '16:9' : '4:3';
     this.settings.aspectRatio = next;
+    this._persistSettings();
     this.ui.setAspectRatio(next);
   }
 
   toggleGrid() {
     this.settings.gridVisible = !this.settings.gridVisible;
+    this._persistSettings();
     this.ui.setGridVisible(this.settings.gridVisible);
   }
 
@@ -135,6 +238,7 @@ class QcamApp {
   selectMode(mode) {
     if (mode !== 'standard' && mode !== 'hq') return;
     this.settings.mode = mode;
+    this._persistSettings();
     this.ui.setCaptureMode(mode);
   }
 
@@ -353,13 +457,21 @@ class QcamApp {
 
   updateSetting(key, val) {
     this.settings[key] = val;
+    this._persistSettings();
   }
 
   refreshDiagnostics() {
     const info = this.streamInfo || {};
+    const permLabelMap = {
+      granted: '許可済み（持続）',
+      prompt: '都度確認（ブラウザ設定依存）',
+      denied: '拒否',
+      unknown: '取得中 / ブラウザ非公開',
+    };
     const entries = [
       ['プラットフォーム', `${this.platform.osLabel} (${this.platform.browserLabel})`],
       ['PWA モード', this.platform.isStandalonePWA ? 'スタンドアロン (全画面)' : 'ブラウザ表示'],
+      ['カメラ権限状態', permLabelMap[this.lastPermissionState] || this.lastPermissionState],
       [
         'プレビュー解像度',
         info.videoWidth && info.videoHeight ? `${info.videoWidth}×${info.videoHeight}` : '未取得',
@@ -405,14 +517,27 @@ class QcamApp {
   }
 
   _setupLifecycleHandlers() {
-    // Pause camera cleanly when backgrounded and resume when visible (mobile battery & iOS stream recovery)
+    // Keep camera track alive across brief OS overlays (Share Sheet, Control Center)
+    // so iOS Safari does not re-prompt camera permission unnecessarily.
+    // Only restart on return if OS actually ended the backgrounded track.
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
         this._cancelCountdown();
-        this.camera.stop();
-      } else if (!this.camera.stream && this.ui.els.cameraOverlay.hidden) {
-        this.startCamera();
+      } else if (this.ui.els.cameraOverlay.hidden) {
+        const trackEnded =
+          !this.camera.stream ||
+          !this.camera.track ||
+          this.camera.track.readyState === 'ended';
+        if (trackEnded) {
+          this.startCamera();
+        }
       }
+    });
+
+    // Release hardware cleanly when leaving or reloading so next page load acquires immediately
+    window.addEventListener('pagehide', () => {
+      this._cancelCountdown();
+      this.camera.stop();
     });
   }
 }

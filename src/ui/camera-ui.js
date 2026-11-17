@@ -1,10 +1,17 @@
-import { ASPECT_RATIOS, mapTapToNormalizedPoint } from '../utils/geometry.js';
+import {
+  computeViewfinderLayout,
+  mapTapToNormalizedPoint,
+} from '../utils/geometry.js';
 
 export class CameraUI {
   constructor(handlers) {
     this.handlers = handlers;
 
     this.els = {
+      topHud: document.getElementById('top-hud'),
+      topBar: document.querySelector('.top-bar'),
+      bottomDock: document.querySelector('.bottom-dock'),
+      zoomBar: document.querySelector('.zoom-bar'),
       silentBadge: document.getElementById('silent-badge'),
       resolutionBadge: document.getElementById('resolution-badge'),
       btnAspect: document.getElementById('btn-aspect'),
@@ -13,6 +20,9 @@ export class CameraUI {
       btnTimer: document.getElementById('btn-timer'),
       timerLabel: document.getElementById('timer-label'),
       btnInfo: document.getElementById('btn-info'),
+      permHintBanner: document.getElementById('perm-hint-banner'),
+      btnPermHintOpen: document.getElementById('btn-perm-hint-open'),
+      btnPermHintDismiss: document.getElementById('btn-perm-hint-dismiss'),
 
       stage: document.getElementById('viewfinder-stage'),
       frame: document.getElementById('viewfinder-frame'),
@@ -31,6 +41,7 @@ export class CameraUI {
       overlayTitle: document.getElementById('overlay-title'),
       overlayMessage: document.getElementById('overlay-message'),
       btnRetryCamera: document.getElementById('btn-retry-camera'),
+      btnOverlayHelp: document.getElementById('btn-overlay-help'),
 
       saveToast: document.getElementById('save-toast'),
       zoomPresets: Array.from(document.querySelectorAll('.zoom-bar .zoom-preset')),
@@ -63,6 +74,7 @@ export class CameraUI {
       btnInfoClose: document.getElementById('btn-info-close'),
       toggleAutoSave: document.getElementById('toggle-auto-save'),
       toggleMirrorFront: document.getElementById('toggle-mirror-front'),
+      permissionGuide: document.getElementById('permission-guide'),
       diagnosticsList: document.getElementById('diagnostics-list'),
     };
 
@@ -78,6 +90,8 @@ export class CameraUI {
       previewZoom: 1,
     };
 
+    this._frameTopInset = 0;
+    this._frameBottomInset = 0;
     this._focusHideTimer = null;
     this._focusFadeTimer = null;
     this._toastTimer = null;
@@ -101,6 +115,16 @@ export class CameraUI {
     this.els.btnInfoClose.addEventListener('click', () => this.closeInfoModal());
     this.els.infoModal.addEventListener('click', (e) => {
       if (e.target === this.els.infoModal) this.closeInfoModal();
+    });
+
+    this.els.btnPermHintOpen?.addEventListener('click', () => {
+      this.handlers.onOpenPermissionGuide?.();
+    });
+    this.els.btnPermHintDismiss?.addEventListener('click', () => {
+      this.handlers.onDismissPermissionHint?.();
+    });
+    this.els.btnOverlayHelp?.addEventListener('click', () => {
+      this.handlers.onOpenPermissionGuide?.();
     });
 
     this.els.btnRetryCamera.addEventListener('click', () => this.handlers.onRetryCamera());
@@ -191,29 +215,41 @@ export class CameraUI {
     if (typeof ResizeObserver === 'function') {
       const ro = new ResizeObserver(updateSize);
       ro.observe(this.els.stage);
+      if (this.els.topBar) ro.observe(this.els.topBar);
+      if (this.els.bottomDock) ro.observe(this.els.bottomDock);
     }
     window.addEventListener('resize', updateSize);
     window.addEventListener('orientationchange', updateSize);
+    window.visualViewport?.addEventListener('resize', updateSize);
     requestAnimationFrame(updateSize);
   }
 
   fitViewfinderFrame() {
     const stageRect = this.els.stage.getBoundingClientRect();
-    const availW = Math.max(120, stageRect.width - 8);
-    const availH = Math.max(120, stageRect.height - 8);
-    const baseRatio = ASPECT_RATIOS[this.state.aspectRatio] || ASPECT_RATIOS['4:3'];
-    const isPortrait = availH >= availW;
-    const targetRatio = isPortrait ? 1 / baseRatio : baseRatio;
+    const topRect = this.els.topBar?.getBoundingClientRect();
+    const dockRect = this.els.bottomDock?.getBoundingClientRect();
 
-    let frameW = availW;
-    let frameH = frameW / targetRatio;
-    if (frameH > availH) {
-      frameH = availH;
-      frameW = frameH * targetRatio;
-    }
+    const layout = computeViewfinderLayout({
+      stageWidth: stageRect.width,
+      stageHeight: stageRect.height,
+      topBarBottom: topRect ? topRect.bottom - stageRect.top : 0,
+      dockTop: dockRect ? dockRect.top - stageRect.top : stageRect.height,
+      dockLeft: dockRect ? dockRect.left - stageRect.left : stageRect.width,
+      dockWidth: dockRect ? dockRect.width : 0,
+      dockHeight: dockRect ? dockRect.height : 0,
+      aspectRatio: this.state.aspectRatio,
+    });
 
-    this.els.frame.style.width = `${Math.round(frameW)}px`;
-    this.els.frame.style.height = `${Math.round(frameH)}px`;
+    this._frameTopInset = layout.topInset;
+    this._frameBottomInset = layout.bottomInset;
+
+    this.els.frame.style.left = `${layout.left}px`;
+    this.els.frame.style.top = `${layout.top}px`;
+    this.els.frame.style.width = `${layout.width}px`;
+    this.els.frame.style.height = `${layout.height}px`;
+    this.els.frame.style.setProperty('--frame-top-inset', `${layout.topInset}px`);
+    this.els.frame.style.setProperty('--frame-bottom-inset', `${layout.bottomInset}px`);
+    this.els.frame.classList.toggle('is-edge-to-edge', layout.edgeToEdge);
   }
 
   _onPointerDown(e) {
@@ -283,11 +319,14 @@ export class CameraUI {
 
   _handleTapFocus(clientX, clientY) {
     const rect = this.els.frame.getBoundingClientRect();
+    const minY = Math.max(44, (this._frameTopInset || 0) + 38);
+    const maxY = Math.max(minY, rect.height - Math.max(44, (this._frameBottomInset || 0) + 38));
     const relX = Math.max(44, Math.min(rect.width - 44, clientX - rect.left));
-    const relY = Math.max(44, Math.min(rect.height - 44, clientY - rect.top));
+    const relY = Math.max(minY, Math.min(maxY, clientY - rect.top));
 
     this.els.focusReticle.style.left = `${relX}px`;
     this.els.focusReticle.style.top = `${relY}px`;
+    this.els.focusReticle.classList.toggle('is-ev-left', relX > rect.width - 96);
     this.els.focusReticle.classList.remove('is-fading');
     this.els.focusReticle.hidden = false;
     this._resetFocusTimers();
@@ -423,15 +462,32 @@ export class CameraUI {
     this.els.resolutionBadge.textContent = resText;
   }
 
-  showCameraOverlay(title, message, showRetry = true) {
+  showCameraOverlay(title, message, options = true) {
+    const { showRetry = true, showHelp = false } =
+      typeof options === 'boolean' ? { showRetry: options } : options || {};
     this.els.overlayTitle.textContent = title;
     this.els.overlayMessage.textContent = message;
     this.els.btnRetryCamera.hidden = !showRetry;
+    if (this.els.btnOverlayHelp) {
+      this.els.btnOverlayHelp.hidden = !showHelp;
+    }
     this.els.cameraOverlay.hidden = false;
   }
 
   hideCameraOverlay() {
     this.els.cameraOverlay.hidden = true;
+  }
+
+  showPermissionHintBanner() {
+    if (this.els.permHintBanner) {
+      this.els.permHintBanner.hidden = false;
+    }
+  }
+
+  hidePermissionHintBanner() {
+    if (this.els.permHintBanner) {
+      this.els.permHintBanner.hidden = true;
+    }
   }
 
   updateThumbnail(latestPhoto, totalCount) {
@@ -561,13 +617,81 @@ export class CameraUI {
     });
   }
 
-  openInfoModal() {
+  openInfoModal({ scrollToPermissionGuide = false } = {}) {
     this.handlers.onRefreshDiagnostics();
     this.els.infoModal.hidden = false;
+    if (scrollToPermissionGuide && this.els.permissionGuide) {
+      requestAnimationFrame(() => {
+        this.els.permissionGuide.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    }
   }
 
   closeInfoModal() {
     this.els.infoModal.hidden = true;
+  }
+
+  renderPermissionGuide(platform) {
+    const container = this.els.permissionGuide;
+    if (!container) return;
+
+    const guides = [
+      {
+        id: 'ios',
+        isCurrent: Boolean(platform?.isIOS),
+        title: 'iPhone / iPad (iOS Safari)',
+        steps: [
+          'アドレスバー左側の「ぁあ」（またはサイト設定アイコン）をタップし、「Webサイトの設定」→「カメラ」を「許可」に変更すると次回から確認が省略されます。',
+          '「ホーム画面に追加」した PWA として起動している場合、iOS の仕様上起動ごとに確認が表示されることがあります（省略したい場合は通常の Safari でご利用ください）。',
+        ],
+      },
+      {
+        id: 'android',
+        isCurrent: Boolean(platform?.isAndroid),
+        title: 'Android (Chrome)',
+        steps: [
+          'カメラ許可ダイアログで「今回のみ」ではなく「サイトにアクセスするたびに許可」を選択してください。',
+          'あとから変更する場合はアドレスバー左のアイコン →「権限」→「カメラ」→「許可」に設定し直します。',
+        ],
+      },
+      {
+        id: 'desktop',
+        isCurrent: Boolean(!platform?.isIOS && !platform?.isAndroid),
+        title: 'PC ブラウザ (Chrome / Safari / Edge)',
+        steps: [
+          'アドレスバー左側のサイト情報アイコンから、カメラ権限を「許可（常に許可）」へ設定すると再読み込み時も維持されます。',
+        ],
+      },
+    ];
+
+    guides.sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent));
+    container.innerHTML = '';
+
+    for (const g of guides) {
+      const card = document.createElement('div');
+      card.className = `perm-guide-card${g.isCurrent ? ' is-current' : ''}`;
+
+      const h4 = document.createElement('h4');
+      h4.className = 'perm-guide-title';
+      h4.textContent = g.title;
+      if (g.isCurrent) {
+        const badge = document.createElement('span');
+        badge.className = 'perm-guide-badge';
+        badge.textContent = '現在の端末';
+        h4.appendChild(badge);
+      }
+      card.appendChild(h4);
+
+      const ol = document.createElement('ol');
+      ol.className = 'perm-guide-steps';
+      for (const text of g.steps) {
+        const li = document.createElement('li');
+        li.textContent = text;
+        ol.appendChild(li);
+      }
+      card.appendChild(ol);
+      container.appendChild(card);
+    }
   }
 
   renderDiagnostics(entries) {

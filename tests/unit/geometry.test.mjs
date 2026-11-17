@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   computeAspectCrop,
+  computeViewfinderLayout,
   splitZoom,
   mapTapToNormalizedPoint,
 } from '../../src/utils/geometry.js';
@@ -88,3 +89,63 @@ test('mapTapToNormalizedPoint handles center tap, mirroring, and software zoom',
   });
   assert.equal(zoomedEdge.x, 0.75);
 });
+
+test('computeViewfinderLayout maximizes width cleanly across smartphone profiles', () => {
+  // Modern iPhone portrait (390x844): 4:3 clears top & bottom HUDs completely; 16:9 fills edge-to-edge width
+  const iphone43 = computeViewfinderLayout({
+    stageWidth: 390,
+    stageHeight: 844,
+    topBarBottom: 54,
+    dockTop: 654,
+    dockWidth: 390,
+    dockHeight: 190,
+    aspectRatio: '4:3',
+  });
+  assert.equal(iphone43.width, 390);
+  assert.equal(iphone43.height, 520);
+  assert.equal(iphone43.topInset, 0);
+  assert.equal(iphone43.bottomInset, 0);
+
+  const iphone169 = computeViewfinderLayout({
+    stageWidth: 390,
+    stageHeight: 844,
+    topBarBottom: 54,
+    dockTop: 654,
+    dockWidth: 390,
+    dockHeight: 190,
+    aspectRatio: '16:9',
+  });
+  assert.equal(iphone169.width, 390);
+  assert.equal(iphone169.height, 693);
+  assert.equal(iphone169.edgeToEdge, true);
+  assert.ok(iphone169.bottomInset > 0);
+
+  // Short mobile browser viewport (360x520 with URL bar open): expands past cramped clear band while keeping shutter safe
+  const shortAndroid43 = computeViewfinderLayout({
+    stageWidth: 360,
+    stageHeight: 520,
+    topBarBottom: 46,
+    dockTop: 372,
+    dockWidth: 360,
+    dockHeight: 148,
+    aspectRatio: '4:3',
+  });
+  assert.ok(shortAndroid43.width >= 305, `Expected expanded width >= 305, got ${shortAndroid43.width}`);
+  assert.ok(Math.abs(shortAndroid43.width / shortAndroid43.height - 3 / 4) < 0.02);
+
+  // Compact smartphone landscape (844x390 with side right dock)
+  const phoneLandscape = computeViewfinderLayout({
+    stageWidth: 844,
+    stageHeight: 390,
+    topBarBottom: 48,
+    dockTop: 0,
+    dockLeft: 742,
+    dockWidth: 102,
+    dockHeight: 390,
+    aspectRatio: '16:9',
+  });
+  assert.equal(phoneLandscape.isSideDock, true);
+  assert.equal(phoneLandscape.height, 390);
+  assert.ok(phoneLandscape.left + phoneLandscape.width <= 742);
+});
+

@@ -5,6 +5,27 @@ import { splitZoom } from '../utils/geometry.js';
  * tap-to-focus / exposure, hardware + software zoom, and frame extraction.
  * Never requests or plays audio so shutter remains strictly silent.
  */
+const DEVICE_STORAGE_KEY = 'qcam_device_ids_v1';
+
+function readStoredDeviceIds() {
+  try {
+    return JSON.parse(localStorage.getItem(DEVICE_STORAGE_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function writeStoredDeviceId(facingMode, deviceId) {
+  if (!deviceId) return;
+  try {
+    const map = readStoredDeviceIds();
+    map[facingMode] = deviceId;
+    localStorage.setItem(DEVICE_STORAGE_KEY, JSON.stringify(map));
+  } catch {
+    // ignore storage errors in private browsing
+  }
+}
+
 export class CameraController {
   constructor(videoElement, platform) {
     this.video = videoElement;
@@ -23,20 +44,88 @@ export class CameraController {
     this.onStreamInfo = null;
   }
 
-  async start({ facingMode = this.facingMode } = {}) {
+  async checkPermissionState() {
+    let state = 'unknown';
+    if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+      try {
+        const status = await navigator.permissions.query({ name: 'camera' });
+        if (status && status.state) {
+          state = status.state; // 'granted' | 'denied' | 'prompt'
+        }
+      } catch {
+        // Safari/older browsers may throw on { name: 'camera' }
+      }
+    }
+
+    let hasLabeledVideoDevice = false;
+    if (
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.enumerateDevices === 'function'
+    ) {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        hasLabeledVideoDevice = devices.some(
+          (d) => d.kind === 'videoinput' && Boolean(d.label)
+        );
+        if (hasLabeledVideoDevice && state === 'unknown') {
+          state = 'granted';
+        }
+      } catch {
+        // ignore enumerateDevices failure
+      }
+    }
+
+    return { state, hasLabeledVideoDevice };
+  }
+
+  async _getPreferredDeviceId(facingMode) {
+    const stored = readStoredDeviceIds()[facingMode];
+    if (!stored || !navigator.mediaDevices?.enumerateDevices) return null;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const match = devices.find(
+        (d) => d.kind === 'videoinput' && d.deviceId === stored && Boolean(d.label)
+      );
+      return match ? match.deviceId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  _stopTracks(stream) {
+    if (!stream) return;
+    for (const track of stream.getTracks()) {
+      try {
+        track.stop();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  async start({ facingMode = this.facingMode, keepOldStreamDuringAcquire = false } = {}) {
     const startTs = performance.now();
-    this.facingMode = facingMode;
-    this.stop();
 
     if (!this.platform.supportsMediaDevices) {
       throw new Error('お使いのブラウザはカメラ API（getUserMedia）に対応していません。');
     }
 
+    const oldStream = this.stream;
+    if (!keepOldStreamDuringAcquire) {
+      this.stop();
+    }
+
+    const preferredDeviceId = await this._getPreferredDeviceId(facingMode);
+    const baseVideo = {
+      facingMode: { ideal: facingMode },
+      ...(preferredDeviceId ? { deviceId: { ideal: preferredDeviceId } } : {}),
+    };
+
     const constraintAttempts = [
       {
         audio: false,
         video: {
-          facingMode: { ideal: facingMode },
+          ...baseVideo,
           width: { ideal: 3840 },
           height: { ideal: 2160 },
         },
@@ -44,14 +133,14 @@ export class CameraController {
       {
         audio: false,
         video: {
-          facingMode: { ideal: facingMode },
+          ...baseVideo,
           width: { ideal: 1920 },
           height: { ideal: 1080 },
         },
       },
       {
         audio: false,
-        video: { facingMode },
+        video: { facingMode: { ideal: facingMode } },
       },
       {
         audio: false,
@@ -59,27 +148,61 @@ export class CameraController {
       },
     ];
 
-    let stream = null;
-    let lastError = null;
-    for (const constraints of constraintAttempts) {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia(constraints);
-        break;
-      } catch (err) {
-        lastError = err;
-        // Do not retry if user explicitly denied permission
-        if (err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
-          throw err;
+    const acquire = async () => {
+      let acquired = null;
+      let errOut = null;
+      for (const constraints of constraintAttempts) {
+        try {
+          acquired = await navigator.mediaDevices.getUserMedia(constraints);
+          break;
+        } catch (err) {
+          errOut = err;
+          if (err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
+            throw err;
+          }
         }
+      }
+      if (!acquired) {
+        throw errOut || new Error('カメラの起動に失敗しました。');
+      }
+      return acquired;
+    };
+
+    let stream = null;
+    try {
+      stream = await acquire();
+      if (keepOldStreamDuringAcquire && oldStream) {
+        this._stopTracks(oldStream);
+      }
+    } catch (err) {
+      // Single-ISP hardware cannot open front+back simultaneously -> stop old stream and retry once
+      if (
+        keepOldStreamDuringAcquire &&
+        oldStream &&
+        err?.name !== 'NotAllowedError' &&
+        err?.name !== 'PermissionDeniedError'
+      ) {
+        this.stop();
+        stream = await acquire();
+      } else if (err?.name === 'NotReadableError' || err?.name === 'AbortError') {
+        // Previous tab/reload may still be releasing camera sensor; brief backoff retry once
+        await new Promise((r) => setTimeout(r, 220));
+        stream = await acquire();
+      } else {
+        throw err;
       }
     }
 
-    if (!stream) {
-      throw lastError || new Error('カメラの起動に失敗しました。');
-    }
-
+    this.facingMode = facingMode;
     this.stream = stream;
     this.track = stream.getVideoTracks()[0] || null;
+    if (this.track && typeof this.track.getSettings === 'function') {
+      const settings = this.track.getSettings();
+      if (settings.deviceId) {
+        writeStoredDeviceId(facingMode, settings.deviceId);
+      }
+    }
+
     this.video.srcObject = stream;
     this.video.muted = true;
     this.video.playsInline = true;
@@ -217,7 +340,10 @@ export class CameraController {
 
   async switchCamera() {
     const nextFacing = this.facingMode === 'environment' ? 'user' : 'environment';
-    return this.start({ facingMode: nextFacing });
+    return this.start({
+      facingMode: nextFacing,
+      keepOldStreamDuringAcquire: this.platform.isIOS,
+    });
   }
 
   async setZoom(requestedZoom) {

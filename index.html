@@ -19,52 +19,66 @@
   <h1 class="sr-only">Qcam — 無音・高画質 Web カメラ</h1>
 
   <main id="app-shell" class="app-shell">
-    <!-- Top Utility Bar -->
-    <header class="top-bar" aria-label="撮影設定バー">
-      <div class="top-bar-group">
-        <span id="silent-badge" class="status-pill" title="音声出力なし・完全無音撮影">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M11 5L6 9H2v6h4l5 4V5z"></path>
-            <line x1="23" y1="9" x2="17" y2="15"></line>
-            <line x1="17" y1="9" x2="23" y2="15"></line>
-          </svg>
-          <span>無音</span>
-        </span>
-        <span id="resolution-badge" class="status-pill status-pill--mono" aria-live="polite">--×--</span>
+    <!-- Top Floating HUD (Bar + Permission Hint + Action Toast) -->
+    <div id="top-hud" class="top-hud">
+      <!-- Top Utility Bar -->
+      <header class="top-bar" aria-label="撮影設定バー">
+        <div class="top-bar-group">
+          <span id="silent-badge" class="status-pill" title="音声出力なし・完全無音撮影" aria-label="音声出力なし・完全無音撮影">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M11 5L6 9H2v6h4l5 4V5z"></path>
+              <line x1="23" y1="9" x2="17" y2="15"></line>
+              <line x1="17" y1="9" x2="23" y2="15"></line>
+            </svg>
+            <span class="silent-label">無音</span>
+          </span>
+          <span id="resolution-badge" class="status-pill status-pill--mono" aria-live="polite">--×--</span>
+        </div>
+
+        <div class="top-bar-actions">
+          <button id="btn-aspect" type="button" class="icon-pill" aria-label="アスペクト比切替" title="アスペクト比 (4:3 / 16:9)">
+            <span id="aspect-label">4:3</span>
+          </button>
+
+          <button id="btn-grid" type="button" class="icon-btn" aria-label="3×3 グリッド表示切替" aria-pressed="false" title="3×3 グリッド線">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+              <line x1="9" y1="3" x2="9" y2="21"></line>
+              <line x1="15" y1="3" x2="15" y2="21"></line>
+              <line x1="3" y1="9" x2="21" y2="9"></line>
+              <line x1="3" y1="15" x2="21" y2="15"></line>
+            </svg>
+          </button>
+
+          <button id="btn-timer" type="button" class="icon-pill" aria-label="セルフタイマー設定" title="セルフタイマー (OFF / 3秒 / 10秒)">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="13" r="8"></circle>
+              <path d="M12 9v4l2.5 1.5"></path>
+              <path d="M9 2h6"></path>
+            </svg>
+            <span id="timer-label">OFF</span>
+          </button>
+
+          <button id="btn-info" type="button" class="icon-btn" aria-label="カメラ情報・設定" title="詳細情報・設定">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- Non-blocking Permission Persistence Tip Banner (shown on iOS/Chrome when OS re-prompts on reload) -->
+      <div id="perm-hint-banner" class="perm-hint-banner" hidden role="status">
+        <button id="btn-perm-hint-open" type="button" class="perm-hint-link">
+          再読み込み時のカメラ許可を省略する方法を見る
+        </button>
+        <button id="btn-perm-hint-dismiss" type="button" class="perm-hint-close" aria-label="閉じる">×</button>
       </div>
 
-      <div class="top-bar-actions">
-        <button id="btn-aspect" type="button" class="icon-pill" aria-label="アスペクト比切替" title="アスペクト比 (4:3 / 16:9)">
-          <span id="aspect-label">4:3</span>
-        </button>
-
-        <button id="btn-grid" type="button" class="icon-btn" aria-label="3×3 グリッド表示切替" aria-pressed="false" title="3×3 グリッド線">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
-            <rect x="3" y="3" width="18" height="18" rx="2"></rect>
-            <line x1="9" y1="3" x2="9" y2="21"></line>
-            <line x1="15" y1="3" x2="15" y2="21"></line>
-            <line x1="3" y1="9" x2="21" y2="9"></line>
-            <line x1="3" y1="15" x2="21" y2="15"></line>
-          </svg>
-        </button>
-
-        <button id="btn-timer" type="button" class="icon-pill" aria-label="セルフタイマー設定" title="セルフタイマー (OFF / 3秒 / 10秒)">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="13" r="8"></circle>
-            <path d="M12 9v4l2.5 1.5"></path>
-            <path d="M9 2h6"></path>
-          </svg>
-          <span id="timer-label">OFF</span>
-        </button>
-
-        <button id="btn-info" type="button" class="icon-btn" aria-label="カメラ情報・設定" title="詳細情報・設定">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-          </svg>
-        </button>
-      </div>
-    </header>
+      <!-- Action / Save Feedback Toast -->
+      <button id="save-toast" type="button" class="save-toast" hidden aria-live="polite"></button>
+    </div>
 
     <!-- Viewfinder Stage -->
     <section id="viewfinder-stage" class="viewfinder-stage" aria-label="カメラプレビュー">
@@ -89,7 +103,9 @@
           </div>
           <div id="ev-control" class="ev-control">
             <span class="ev-icon" aria-hidden="true">☀</span>
-            <input id="ev-slider" class="ev-slider" type="range" min="-2" max="2" step="0.2" value="0" aria-label="露出補正 (EV)">
+            <div class="ev-slider-wrap">
+              <input id="ev-slider" class="ev-slider" type="range" min="-2" max="2" step="0.2" value="0" aria-label="露出補正 (EV)">
+            </div>
             <span id="ev-value" class="ev-value">0.0</span>
           </div>
         </div>
@@ -107,16 +123,19 @@
 
         <!-- Live Pinch Zoom HUD -->
         <div id="zoom-hud-pill" class="zoom-hud-pill" hidden>1.0×</div>
+      </div>
 
-        <!-- Camera Permission / Error Overlay -->
-        <div id="camera-overlay" class="camera-overlay" hidden>
-          <div class="camera-overlay-card">
-            <div class="overlay-lens-mark" aria-hidden="true"></div>
-            <h2 id="overlay-title" class="overlay-title">カメラへのアクセスが必要です</h2>
-            <p id="overlay-message" class="overlay-message">
-              無音撮影を開始するにはブラウザのカメラ権限を許可してください。映像や写真は外部サーバーへ送信されず、すべて端末内で処理されます。
-            </p>
+      <!-- Camera Permission / Error Overlay -->
+      <div id="camera-overlay" class="camera-overlay" hidden>
+        <div class="camera-overlay-card">
+          <div class="overlay-lens-mark" aria-hidden="true"></div>
+          <h2 id="overlay-title" class="overlay-title">カメラへのアクセスが必要です</h2>
+          <p id="overlay-message" class="overlay-message">
+            無音撮影を開始するにはブラウザのカメラ権限を許可してください。映像や写真は外部サーバーへ送信されず、すべて端末内で処理されます。
+          </p>
+          <div class="overlay-actions">
             <button id="btn-retry-camera" type="button" class="primary-btn">カメラを起動</button>
+            <button id="btn-overlay-help" type="button" class="secondary-btn" hidden>許可手順を見る</button>
           </div>
         </div>
       </div>
@@ -124,9 +143,6 @@
 
     <!-- Bottom Controls Dock -->
     <footer class="bottom-dock" aria-label="撮影コントロール">
-      <!-- Action / Save Feedback Toast -->
-      <button id="save-toast" type="button" class="save-toast" hidden aria-live="polite"></button>
-
       <!-- Zoom Presets & Slider -->
       <div class="zoom-bar" aria-label="デジタルズーム">
         <div class="zoom-presets">
@@ -239,6 +255,11 @@
           </span>
           <input id="toggle-mirror-front" type="checkbox">
         </label>
+      </div>
+
+      <div class="sheet-section">
+        <h3 class="sheet-subtitle">再読み込み時のカメラ許可を省略するには</h3>
+        <div id="permission-guide" class="permission-guide"></div>
       </div>
 
       <div class="sheet-section">
