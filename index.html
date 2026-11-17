@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Qcam — 無音・高画質 Web カメラ</title>
+  <meta name="description" content="ブラウザだけで動作する無音・高画質 Web カメラ PWA。マルチフレーム合成ノイズ低減と WebGL トーンマッピングを搭載し、すべての画像処理を端末内で完結します。">
+  <meta name="theme-color" content="#050608">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Qcam">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="./icons/icon.svg">
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="./styles/main.css">
+</head>
+<body>
+  <h1 class="sr-only">Qcam — 無音・高画質 Web カメラ</h1>
+
+  <main id="app-shell" class="app-shell">
+    <!-- Top Utility Bar -->
+    <header class="top-bar" aria-label="撮影設定バー">
+      <div class="top-bar-group">
+        <span id="silent-badge" class="status-pill" title="音声出力なし・完全無音撮影">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M11 5L6 9H2v6h4l5 4V5z"></path>
+            <line x1="23" y1="9" x2="17" y2="15"></line>
+            <line x1="17" y1="9" x2="23" y2="15"></line>
+          </svg>
+          <span>無音</span>
+        </span>
+        <span id="resolution-badge" class="status-pill status-pill--mono" aria-live="polite">--×--</span>
+      </div>
+
+      <div class="top-bar-actions">
+        <button id="btn-aspect" type="button" class="icon-pill" aria-label="アスペクト比切替" title="アスペクト比 (4:3 / 16:9)">
+          <span id="aspect-label">4:3</span>
+        </button>
+
+        <button id="btn-grid" type="button" class="icon-btn" aria-label="3×3 グリッド表示切替" aria-pressed="false" title="3×3 グリッド線">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+            <line x1="9" y1="3" x2="9" y2="21"></line>
+            <line x1="15" y1="3" x2="15" y2="21"></line>
+            <line x1="3" y1="9" x2="21" y2="9"></line>
+            <line x1="3" y1="15" x2="21" y2="15"></line>
+          </svg>
+        </button>
+
+        <button id="btn-timer" type="button" class="icon-pill" aria-label="セルフタイマー設定" title="セルフタイマー (OFF / 3秒 / 10秒)">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="13" r="8"></circle>
+            <path d="M12 9v4l2.5 1.5"></path>
+            <path d="M9 2h6"></path>
+          </svg>
+          <span id="timer-label">OFF</span>
+        </button>
+
+        <button id="btn-info" type="button" class="icon-btn" aria-label="カメラ情報・設定" title="詳細情報・設定">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Viewfinder Stage -->
+    <section id="viewfinder-stage" class="viewfinder-stage" aria-label="カメラプレビュー">
+      <div id="viewfinder-frame" class="viewfinder-frame">
+        <video id="camera-video" class="camera-video" autoplay playsinline muted></video>
+
+        <!-- 3x3 Rule-of-thirds Grid Overlay -->
+        <div id="grid-overlay" class="grid-overlay" hidden aria-hidden="true">
+          <span class="grid-line grid-line--v1"></span>
+          <span class="grid-line grid-line--v2"></span>
+          <span class="grid-line grid-line--h1"></span>
+          <span class="grid-line grid-line--h2"></span>
+        </div>
+
+        <!-- Tap-to-Focus & Exposure Reticle -->
+        <div id="focus-reticle" class="focus-reticle" hidden>
+          <div class="focus-box" aria-hidden="true">
+            <span class="focus-corner tl"></span>
+            <span class="focus-corner tr"></span>
+            <span class="focus-corner bl"></span>
+            <span class="focus-corner br"></span>
+          </div>
+          <div id="ev-control" class="ev-control">
+            <span class="ev-icon" aria-hidden="true">☀</span>
+            <input id="ev-slider" class="ev-slider" type="range" min="-2" max="2" step="0.2" value="0" aria-label="露出補正 (EV)">
+            <span id="ev-value" class="ev-value">0.0</span>
+          </div>
+        </div>
+
+        <!-- Silent Shutter Blackout Feedback -->
+        <div id="shutter-blackout" class="shutter-blackout" aria-hidden="true"></div>
+
+        <!-- Timer Countdown Overlay -->
+        <div id="countdown-overlay" class="countdown-overlay" hidden aria-live="assertive">
+          <div class="countdown-ring">
+            <span id="countdown-number" class="countdown-number">3</span>
+          </div>
+          <p class="countdown-hint">シャッターボタンでキャンセル</p>
+        </div>
+
+        <!-- Live Pinch Zoom HUD -->
+        <div id="zoom-hud-pill" class="zoom-hud-pill" hidden>1.0×</div>
+
+        <!-- Camera Permission / Error Overlay -->
+        <div id="camera-overlay" class="camera-overlay" hidden>
+          <div class="camera-overlay-card">
+            <div class="overlay-lens-mark" aria-hidden="true"></div>
+            <h2 id="overlay-title" class="overlay-title">カメラへのアクセスが必要です</h2>
+            <p id="overlay-message" class="overlay-message">
+              無音撮影を開始するにはブラウザのカメラ権限を許可してください。映像や写真は外部サーバーへ送信されず、すべて端末内で処理されます。
+            </p>
+            <button id="btn-retry-camera" type="button" class="primary-btn">カメラを起動</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Bottom Controls Dock -->
+    <footer class="bottom-dock" aria-label="撮影コントロール">
+      <!-- Action / Save Feedback Toast -->
+      <button id="save-toast" type="button" class="save-toast" hidden aria-live="polite"></button>
+
+      <!-- Zoom Presets & Slider -->
+      <div class="zoom-bar" aria-label="デジタルズーム">
+        <div class="zoom-presets">
+          <button type="button" class="zoom-preset is-active" data-zoom="1">1×</button>
+          <button type="button" class="zoom-preset" data-zoom="2">2×</button>
+          <button type="button" class="zoom-preset" data-zoom="3">3×</button>
+        </div>
+        <input id="zoom-slider" class="zoom-slider" type="range" min="1" max="5" step="0.1" value="1" aria-label="ズーム倍率">
+        <span id="zoom-readout" class="zoom-readout">1.0×</span>
+      </div>
+
+      <!-- Capture Mode Selector -->
+      <div class="mode-switcher" role="tablist" aria-label="撮影モード">
+        <button id="mode-standard" type="button" role="tab" aria-selected="true" class="mode-tab is-active" data-mode="standard">
+          標準
+        </button>
+        <button id="mode-hq" type="button" role="tab" aria-selected="false" class="mode-tab" data-mode="hq">
+          高画質 HDR
+        </button>
+      </div>
+
+      <!-- Main Shutter Row -->
+      <div class="shutter-row">
+        <button id="btn-gallery" type="button" class="gallery-btn" aria-label="撮影写真プレビュー" disabled>
+          <img id="thumb-img" class="thumb-img" alt="最新の撮影写真" hidden>
+          <span id="thumb-placeholder" class="thumb-placeholder" aria-hidden="true"></span>
+          <span id="thumb-count" class="thumb-count" hidden>0</span>
+        </button>
+
+        <button id="btn-shutter" type="button" class="shutter-btn" aria-label="無音シャッターを切る">
+          <span class="shutter-outer">
+            <span class="shutter-inner"></span>
+          </span>
+        </button>
+
+        <button id="btn-switch-camera" type="button" class="switch-btn" aria-label="カメラ切替（アウト / イン）" title="カメラ切替">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20 7h-3l-2-3H9L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"></path>
+            <path d="M9.5 13.5a2.5 2.5 0 0 1 4.4-1.6"></path>
+            <polyline points="14.5 10.5 14.5 13 12 13"></polyline>
+            <path d="M14.5 14.5a2.5 2.5 0 0 1-4.4 1.6"></path>
+            <polyline points="9.5 17.5 9.5 15 12 15"></polyline>
+          </svg>
+        </button>
+      </div>
+    </footer>
+  </main>
+
+  <!-- Photo Review / Zoom / Save Modal -->
+  <div id="preview-modal" class="modal" hidden role="dialog" aria-modal="true" aria-label="撮影写真の確認と保存">
+    <div class="modal-header">
+      <button id="btn-modal-close" type="button" class="icon-pill">閉じる</button>
+      <div id="preview-meta" class="preview-meta">--</div>
+      <button id="btn-modal-delete" type="button" class="icon-btn icon-btn--danger" aria-label="この写真を削除" title="削除">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="3 6 5 6 21 6"></polyline>
+          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+          <path d="M10 11v6"></path>
+          <path d="M14 11v6"></path>
+          <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
+        </svg>
+      </button>
+    </div>
+
+    <div id="preview-stage" class="preview-stage">
+      <img id="preview-image" class="preview-image" alt="撮影結果プレビュー">
+    </div>
+
+    <div id="preview-filmstrip" class="preview-filmstrip" aria-label="撮影履歴"></div>
+
+    <div class="modal-footer">
+      <div class="preview-zoom-controls" aria-label="プレビュー拡大操作">
+        <button id="btn-preview-zoom-1x" type="button" class="zoom-preset is-active">全体</button>
+        <button id="btn-preview-zoom-2x" type="button" class="zoom-preset">2× 拡大</button>
+        <button id="btn-preview-zoom-4x" type="button" class="zoom-preset">4× 拡大</button>
+      </div>
+
+      <p id="preview-save-hint" class="preview-save-hint" hidden>
+        iOS Safari では共有メニューの「画像を保存」または画像長押しでカメラロールに保存できます。
+      </p>
+
+      <div class="modal-actions">
+        <button id="btn-modal-share" type="button" class="secondary-btn" hidden>共有</button>
+        <button id="btn-modal-save" type="button" class="primary-btn">端末に保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Info & Settings Sheet -->
+  <div id="info-modal" class="modal modal--sheet" hidden role="dialog" aria-modal="true" aria-label="カメラ仕様・設定">
+    <div class="sheet-card">
+      <div class="sheet-header">
+        <h2 class="sheet-title">Qcam 設定・ステータス</h2>
+        <button id="btn-info-close" type="button" class="icon-pill">閉じる</button>
+      </div>
+
+      <div class="sheet-section">
+        <h3 class="sheet-subtitle">撮影設定</h3>
+        <label class="toggle-row" for="toggle-auto-save">
+          <span>
+            <strong>撮影直後に自動保存</strong>
+            <small>Android / PC で標準の即時ダウンロードを行います</small>
+          </span>
+          <input id="toggle-auto-save" type="checkbox" checked>
+        </label>
+        <label class="toggle-row" for="toggle-mirror-front">
+          <span>
+            <strong>インカメラを左右反転して保存</strong>
+            <small>オフ時は自然な正像（文字反転なし）で保存します</small>
+          </span>
+          <input id="toggle-mirror-front" type="checkbox">
+        </label>
+      </div>
+
+      <div class="sheet-section">
+        <h3 class="sheet-subtitle">ハードウェア / パイプライン診断</h3>
+        <dl id="diagnostics-list" class="diagnostics-list"></dl>
+      </div>
+
+      <div class="sheet-section sheet-privacy">
+        <p>
+          <strong>完全ローカル処理・完全無音:</strong> 撮影した写真データおよびカメラ映像は端末内のブラウザメモリ（Web Worker / WebGL）上のみで処理され、外部サーバーへ一切送信されません。
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
