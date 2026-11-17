@@ -78,6 +78,7 @@ export class CameraUI {
       resolutionOptions: document.getElementById('resolution-options'),
       megapixelsSettingNote: document.getElementById('megapixels-setting-note'),
       megapixelsOptions: document.getElementById('megapixels-options'),
+      iosSensorNote: document.getElementById('ios-sensor-note'),
       formatButtons: Array.from(document.querySelectorAll('[data-format]')),
       toggleAutoSave: document.getElementById('toggle-auto-save'),
       toggleMirrorFront: document.getElementById('toggle-mirror-front'),
@@ -87,6 +88,7 @@ export class CameraUI {
       diagnosticsList: document.getElementById('diagnostics-list'),
     };
 
+    this._isIOS = false;
     this.state = {
       aspectRatio: '4:3',
       gridVisible: false,
@@ -536,13 +538,13 @@ export class CameraUI {
     }
   }
 
-  renderQualityControls({ resolutionData, megapixelData }) {
+  renderQualityControls({ resolutionData, megapixelData, isIOS = this._isIOS }) {
     if (this.els.resolutionOptions && resolutionData) {
       const { options = [], effectiveSelected = 'max', capWidth, capHeight } = resolutionData;
       if (this.els.resolutionSettingNote) {
         this.els.resolutionSettingNote.textContent =
           capWidth && capHeight
-            ? `センサー上限 ${capWidth}×${capHeight}（変更でカメラ解像度を切替）`
+            ? `ブラウザ取得上限 ${capWidth}×${capHeight}（変更でカメラ解像度を切替）`
             : 'カメラから対応解像度を取得中';
       }
       this.els.resolutionOptions.innerHTML = '';
@@ -570,6 +572,8 @@ export class CameraUI {
         plannedOutHeight,
         plannedOutMp,
         sensorMaxMp,
+        uncropped43Mp,
+        isAspectCropped,
         isWasmCapped,
       } = megapixelData;
       if (this.els.megapixelsSettingNote) {
@@ -577,10 +581,14 @@ export class CameraUI {
           plannedOutWidth && plannedOutHeight
             ? `保存サイズ: ${plannedOutWidth}×${plannedOutHeight} (${formatMegapixelsLabel(plannedOutMp)})`
             : '保存時の出力画素数を設定します';
-        const capHint = isWasmCapped
-          ? ` · センサー上限 ${formatMegapixelsLabel(sensorMaxMp)}（JPEG時はさらに高画素可）`
-          : '';
-        this.els.megapixelsSettingNote.textContent = `${plannedLabel}${capHint}`;
+        const parts = [plannedLabel];
+        if (isAspectCropped && uncropped43Mp) {
+          parts.push(`16:9切抜中（4:3切替で最大 ${formatMegapixelsLabel(uncropped43Mp)} 可）`);
+        }
+        if (isWasmCapped) {
+          parts.push(`取得上限 ${formatMegapixelsLabel(sensorMaxMp)}（JPEG時はさらに高画素可）`);
+        }
+        this.els.megapixelsSettingNote.textContent = parts.join(' · ');
       }
       this.els.megapixelsOptions.innerHTML = '';
       for (const opt of options) {
@@ -600,6 +608,15 @@ export class CameraUI {
           this.handlers.onSelectMegapixels?.(opt.value);
         });
         this.els.megapixelsOptions.appendChild(btn);
+      }
+    }
+
+    if (this.els.iosSensorNote) {
+      const showIosNote = Boolean(isIOS);
+      this.els.iosSensorNote.hidden = !showIosNote;
+      if (showIosNote) {
+        this.els.iosSensorNote.textContent =
+          '※ iPhone（48MP 機種含む）では無音撮影を維持するため映像ストリーム（通常 9〜12MP 相当）から生成します（48MP 静止画 API「takePhoto」は日本仕様で強制シャッター音が鳴るため不使用）。16:9 時は上下トリミングで画素数が下がるため、最大画素で撮る場合は「4:3」をおすすめします。';
       }
     }
   }
@@ -822,6 +839,7 @@ export class CameraUI {
   }
 
   renderPermissionGuide(platform) {
+    this._isIOS = Boolean(platform?.isIOS);
     const container = this.els.permissionGuide;
     if (!container) return;
 

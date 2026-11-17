@@ -476,7 +476,7 @@ async function main() {
     assert.ok((await page.locator('#resolution-options .lens-chip').count()) >= 1);
     assert.ok((await page.locator('#megapixels-options .lens-chip').count()) >= 1);
     const diagText = await page.textContent('#diagnostics-list');
-    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.5.0'));
+    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.5.1'));
     assert.ok(diagText.includes('撮影画質モード') && diagText.includes('高画質 HDR (常時有効)'));
     assert.ok(diagText.includes('解像度設定 / 上限'));
     assert.ok(diagText.includes('保存画素数設定'));
@@ -485,6 +485,7 @@ async function main() {
     assert.ok(diagText.includes('直近の生成ファイル') && diagText.includes('.avif') && diagText.includes('image/avif'));
     assert.ok(diagText.includes('カメラ権限状態'));
     assert.ok(diagText.includes('超広角 (0.5×) カメラ') && diagText.includes('非対応'));
+    assert.equal(await page.locator('#ios-sensor-note').isVisible(), false);
     const guideText = await page.textContent('#permission-guide');
     assert.ok(guideText.includes('iOS Safari') && guideText.includes('Android'));
     if (screenshotDir) {
@@ -630,6 +631,7 @@ async function main() {
     if (screenshotDir) {
       await page.screenshot({ path: path.join(screenshotDir, 'e2e_landscape_844x390.png') });
     }
+    await context.close();
 
     // 18. Permission prompt reload hint & denied recovery flow in isolated contexts
     console.log('[e2e] checking permission reload hint banner and denied fallback UX');
@@ -1425,10 +1427,178 @@ async function main() {
     if (screenshotDir) {
       await hiResPage.click('#btn-info');
       await hiResPage.waitForSelector('#info-modal:not([hidden])');
+      assert.equal(await hiResPage.locator('#ios-sensor-note').isVisible(), false);
       await hiResPage.screenshot({ path: path.join(screenshotDir, 'e2e_hires_settings.png') });
+      await hiResPage.click('#btn-info-close');
+    } else {
+      await hiResPage.click('#btn-info');
+      await hiResPage.waitForSelector('#info-modal:not([hidden])');
+      assert.equal(await hiResPage.locator('#ios-sensor-note').isVisible(), false);
       await hiResPage.click('#btn-info-close');
     }
     await hiResContext.close();
+
+    // 23. iPhone 17 (iOS 26 / 48MP hardware + ImageCapture API present):
+    // verifies 4:3 (12.2MP) vs 16:9 (9.1MP) crop UX, clear 48MP silent-stream explanation,
+    // no misleading "センサー上限" copy, and strict zero-takePhoto silence guarantee.
+    console.log('[e2e] checking iPhone 17 48MP vs 9.1MP/12.2MP settings UX & silent burst invariant');
+    const ios17Context = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+      userAgent:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1',
+      permissions: ['camera'],
+    });
+    const ios17Page = await ios17Context.newPage();
+    ios17Page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(`[ios17] ${msg.text()}`);
+    });
+    ios17Page.on('pageerror', (err) => {
+      pageErrors.push(`[ios17] ${err.message}`);
+    });
+    await ios17Page.addInitScript(() => {
+      window.__IOS17_TAKEPHOTO_CALLS__ = 0;
+      window.__IOS17_SHARE_CALLS__ = [];
+      navigator.canShare = (d) => Array.isArray(d?.files) && d.files.length === 1;
+      navigator.share = async (d) => {
+        window.__IOS17_SHARE_CALLS__.push({
+          fileName: d?.files?.[0]?.name || '',
+          fileType: d?.files?.[0]?.type || '',
+        });
+      };
+
+      // Safari 18.4+ / iOS 26 exposes ImageCapture; Qcam MUST NOT call takePhoto() on iOS to preserve shutter silence
+      window.ImageCapture = class MockSafariImageCapture {
+        constructor(track) {
+          this.track = track;
+        }
+        async getPhotoCapabilities() {
+          return {
+            imageWidth: { min: 640, max: 4032, step: 2 },
+            imageHeight: { min: 480, max: 3024, step: 2 },
+          };
+        }
+        async takePhoto() {
+          window.__IOS17_TAKEPHOTO_CALLS__ += 1;
+          throw new Error('takePhoto must never be invoked on iOS');
+        }
+      };
+
+      navigator.mediaDevices.enumerateDevices = async () => [
+        { kind: 'videoinput', deviceId: 'ios17-back', groupId: 'b', label: '背面カメラ', toJSON() { return this; } },
+        { kind: 'videoinput', deviceId: 'ios17-uw', groupId: 'b', label: '背面超広角カメラ', toJSON() { return this; } },
+      ];
+      navigator.mediaDevices.getUserMedia = async () => {
+        const w = 4032;
+        const h = 3024;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        const paint = () => {
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(0, 0, w, h);
+          ctx.fillStyle = '#f59e0b';
+          ctx.fillRect(240, 240, 800, 600);
+        };
+        paint();
+        const stream = canvas.captureStream(2);
+        const track = stream.getVideoTracks()[0];
+        Object.defineProperty(track, 'label', { configurable: true, get: () => '背面カメラ' });
+        track.getSettings = () => ({
+          deviceId: 'ios17-back',
+          facingMode: 'environment',
+          width: w,
+          height: h,
+          frameRate: 30,
+        });
+        track.getCapabilities = () => ({
+          facingMode: ['environment'],
+          width: { min: 320, max: w },
+          height: { min: 240, max: h },
+        });
+        return stream;
+      };
+    });
+
+    await ios17Page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await ios17Page.waitForFunction(
+      () => window.__QCAM__?.streamInfo?.videoWidth === 4032 && window.__QCAM__?.streamInfo?.videoHeight === 3024,
+      null,
+      { timeout: 10000 }
+    );
+    assert.equal(await ios17Page.evaluate(() => window.__QCAM__.camera.stream.getAudioTracks().length), 0);
+
+    // Check 4:3 -> 12.2 MP in settings
+    await ios17Page.click('#btn-info');
+    await ios17Page.waitForSelector('#info-modal:not([hidden])');
+    const resNote43 = await ios17Page.textContent('#resolution-setting-note');
+    const mpNote43 = await ios17Page.textContent('#megapixels-setting-note');
+    assert.ok(resNote43.includes('ブラウザ取得上限 4032×3024'), `Unexpected resolution note: ${resNote43}`);
+    assert.ok(!resNote43.includes('センサー上限'), `Misleading sensor max label still present: ${resNote43}`);
+    assert.ok(mpNote43.includes('4032×3024') && mpNote43.includes('12.2 MP'), `Expected 12.2 MP in 4:3, got ${mpNote43}`);
+    assert.ok(!mpNote43.includes('16:9切抜中'), `Unexpected crop note in 4:3: ${mpNote43}`);
+    assert.equal(await ios17Page.locator('#ios-sensor-note').isVisible(), true);
+    const ios17NoteText = await ios17Page.textContent('#ios-sensor-note');
+    assert.ok(
+      ios17NoteText.includes('48MP') && ios17NoteText.includes('無音') && ios17NoteText.includes('takePhoto'),
+      `Missing 48MP silent note copy: ${ios17NoteText}`
+    );
+    await ios17Page.click('#btn-info-close');
+
+    // Toggle 16:9 -> Settings explains 9.1 MP crop & 4:3 gives 12.2 MP
+    await ios17Page.click('#btn-aspect');
+    await ios17Page.waitForTimeout(80);
+    await ios17Page.click('#btn-info');
+    await ios17Page.waitForSelector('#info-modal:not([hidden])');
+    const mpNote169 = await ios17Page.textContent('#megapixels-setting-note');
+    const ios17DiagText = await ios17Page.textContent('#diagnostics-list');
+    assert.ok(mpNote169.includes('4032×2268') && mpNote169.includes('9.1 MP'), `Expected 9.1 MP in 16:9, got ${mpNote169}`);
+    assert.ok(mpNote169.includes('16:9切抜中（4:3切替で最大 12.2 MP 可）'), `Missing 4:3 unlock hint: ${mpNote169}`);
+    assert.ok(ios17DiagText.includes('ブラウザ取得上限 4032×3024'), `Missing browser cap in diagnostics: ${ios17DiagText}`);
+    assert.ok(ios17DiagText.includes('静止画 API (takePhoto)') && ios17DiagText.includes('無音維持のため無効'));
+    const sheetLayout = await ios17Page.evaluate(() => {
+      const card = document.querySelector('.sheet-card');
+      const note = document.getElementById('ios-sensor-note');
+      return {
+        scrollW: card.scrollWidth,
+        clientW: card.clientWidth,
+        noteRight: note.getBoundingClientRect().right,
+        cardRight: card.getBoundingClientRect().right,
+      };
+    });
+    assert.ok(
+      sheetLayout.scrollW <= sheetLayout.clientW + 1 && sheetLayout.noteRight <= sheetLayout.cardRight + 1,
+      `iOS 17 settings sheet overflowed: ${JSON.stringify(sheetLayout)}`
+    );
+    if (screenshotDir) {
+      await ios17Page.screenshot({ path: path.join(screenshotDir, 'e2e_ios17_settings.png') });
+    }
+    await ios17Page.click('#btn-info-close');
+
+    // Capture 9.1 MP 16:9 photo and verify takePhoto() was NEVER called even when ImageCapture existed
+    await ios17Page.click('#btn-shutter');
+    await ios17Page.waitForFunction(
+      () => window.__QCAM__.photos.length === 1 && !window.__QCAM__.isCapturing,
+      null,
+      { timeout: 25000 }
+    );
+    const ios17Photo = await ios17Page.evaluate(() => ({
+      width: window.__QCAM__.photos[0].width,
+      height: window.__QCAM__.photos[0].height,
+      format: window.__QCAM__.photos[0].format,
+      source: window.__QCAM__.lastCaptureSource,
+      takePhotoCalls: window.__IOS17_TAKEPHOTO_CALLS__,
+      shareCalls: window.__IOS17_SHARE_CALLS__.length,
+    }));
+    assert.equal(ios17Photo.takePhotoCalls, 0, 'Qcam must never invoke takePhoto() on iOS');
+    assert.equal(ios17Photo.source, 'burstStream');
+    assert.equal(ios17Photo.format, 'avif');
+    assert.equal(ios17Photo.width, 4032);
+    assert.equal(ios17Photo.height, 2268);
+    assert.equal(ios17Photo.shareCalls, 1);
+    await ios17Context.close();
 
     assert.deepEqual(consoleErrors, [], `Console errors encountered: ${consoleErrors.join('; ')}`);
     assert.deepEqual(pageErrors, [], `Page errors encountered: ${pageErrors.join('; ')}`);
@@ -1454,6 +1624,7 @@ async function main() {
         avif8MpPhoto,
         jpegMaxPhoto,
       },
+      ios17Photo,
     }, null, 2));
   } finally {
     await browser.close();

@@ -88,6 +88,17 @@ export function buildInitialConstraintAttempts({
   ];
 
   // Fallback ladder tailored to aspect ratio
+  if (longEdge > 4032) {
+    attempts.push({
+      audio: false,
+      video: {
+        ...baseVideo,
+        width: { ideal: 4032 },
+        height: { ideal: aspectRatio === '4:3' ? 3024 : 2268 },
+      },
+    });
+  }
+
   if (longEdge > 3840) {
     attempts.push({
       audio: false,
@@ -402,6 +413,15 @@ export function getAvailableMegapixelOptions({
     aspectRatio,
   });
 
+  const encoderMax43 = getEncoderMaxDimension({
+    outputFormat,
+    maxTextureSize,
+    supportsNativeAvif,
+    aspectRatio: '4:3',
+  });
+  const uncropped43Crop = computeAspectCrop(rawSourceW, rawSourceH, '4:3', 1, encoderMax43);
+  const uncropped43Mp = (uncropped43Crop.outWidth * uncropped43Crop.outHeight) / 1_000_000;
+
   const sensorCropped = computeAspectCrop(rawSourceW, rawSourceH, aspectRatio, 1, ABSOLUTE_MAX_DIMENSION);
   const encodedMaxCrop = computeAspectCrop(rawSourceW, rawSourceH, aspectRatio, 1, encoderMax);
 
@@ -410,6 +430,9 @@ export function getAvailableMegapixelOptions({
 
   const isWasmCapped =
     outputFormat === 'avif' && !supportsNativeAvif && sensorMaxMp > effectiveMaxMp + 0.6;
+  const isAspectCropped = Boolean(
+    aspectRatio === '16:9' && uncropped43Mp > effectiveMaxMp + 0.4
+  );
 
   const maxSummaryLabel = formatMegapixelsLabel(effectiveMaxMp);
   const options = [
@@ -465,10 +488,15 @@ export function getAvailableMegapixelOptions({
   return {
     options,
     effectiveSelected,
+    aspectRatio,
     sensorSourceWidth: rawSourceW,
     sensorSourceHeight: rawSourceH,
     sensorMaxMp,
     effectiveMaxMp,
+    uncropped43Mp,
+    uncropped43Width: uncropped43Crop.outWidth,
+    uncropped43Height: uncropped43Crop.outHeight,
+    isAspectCropped,
     maxOutWidth: encodedMaxCrop.outWidth,
     maxOutHeight: encodedMaxCrop.outHeight,
     plannedOutWidth: selectedOutCrop.outWidth,

@@ -21,7 +21,10 @@ test('buildInitialConstraintAttempts tailors ideal resolution to aspect ratio wi
   assert.equal(attempts43[0].audio, false);
   assert.equal(attempts43[0].video.width.ideal, 7680);
   assert.equal(attempts43[0].video.height.ideal, 5760);
-  assert.equal(attempts43[1].video.height.ideal, 2880);
+  assert.equal(attempts43[1].video.width.ideal, 4032);
+  assert.equal(attempts43[1].video.height.ideal, 3024);
+  assert.equal(attempts43[2].video.width.ideal, 3840);
+  assert.equal(attempts43[2].video.height.ideal, 2880);
 
   const attempts169 = buildInitialConstraintAttempts({
     resolutionPreset: 'max',
@@ -30,6 +33,8 @@ test('buildInitialConstraintAttempts tailors ideal resolution to aspect ratio wi
   });
   assert.equal(attempts169[0].video.width.ideal, 7680);
   assert.equal(attempts169[0].video.height.ideal, 4320);
+  assert.equal(attempts169[1].video.width.ideal, 4032);
+  assert.equal(attempts169[1].video.height.ideal, 2268);
 
   const exactLensAttempts = buildInitialConstraintAttempts({
     resolutionPreset: 'uhd',
@@ -120,8 +125,8 @@ test('getAvailableResolutionOptions tailors presets per smartphone capability', 
 });
 
 test('getAvailableMegapixelOptions balances full sensor access against safe WASM AVIF ceiling', () => {
-  // 12MP iPhone in WASM AVIF -> zero downscale loss (full 12.2 MP available)
-  const iphoneAvif = getAvailableMegapixelOptions({
+  // 12.2 MP iPhone stream in 4:3 -> zero downscale loss, not cropped
+  const iphoneAvif43 = getAvailableMegapixelOptions({
     streamWidth: 4032,
     streamHeight: 3024,
     preferTakePhoto: false,
@@ -130,9 +135,37 @@ test('getAvailableMegapixelOptions balances full sensor access against safe WASM
     maxTextureSize: 8192,
     supportsNativeAvif: false,
   });
-  assert.equal(iphoneAvif.isWasmCapped, false);
-  assert.equal(iphoneAvif.maxOutWidth, 4032);
-  assert.equal(iphoneAvif.maxOutHeight, 3024);
+  assert.equal(iphoneAvif43.isWasmCapped, false);
+  assert.equal(iphoneAvif43.isAspectCropped, false);
+  assert.equal(iphoneAvif43.maxOutWidth, 4032);
+  assert.equal(iphoneAvif43.maxOutHeight, 3024);
+
+  // Same 4032x3024 (portrait or landscape) iPhone stream cropped to 16:9 -> 4032x2268 (9.1 MP), flags uncropped 12.2 MP in 4:3
+  const iphoneAvif169 = getAvailableMegapixelOptions({
+    streamWidth: 3024,
+    streamHeight: 4032,
+    preferTakePhoto: false,
+    aspectRatio: '16:9',
+    outputFormat: 'avif',
+    maxTextureSize: 8192,
+    supportsNativeAvif: false,
+  });
+  assert.equal(iphoneAvif169.isAspectCropped, true);
+  assert.equal(iphoneAvif169.maxOutWidth, 2268);
+  assert.equal(iphoneAvif169.maxOutHeight, 4032);
+  assert.ok(iphoneAvif169.effectiveMaxMp > 9.1 && iphoneAvif169.effectiveMaxMp < 9.2);
+  assert.ok(iphoneAvif169.uncropped43Mp > 12.1 && iphoneAvif169.uncropped43Mp < 12.3);
+
+  // Native 16:9 stream (e.g. 1920x1080) stays unflagged for aspect cropping
+  const native169 = getAvailableMegapixelOptions({
+    streamWidth: 1920,
+    streamHeight: 1080,
+    preferTakePhoto: false,
+    aspectRatio: '16:9',
+    outputFormat: 'avif',
+    maxTextureSize: 8192,
+  });
+  assert.equal(native169.isAspectCropped, false);
 
   // 48MP Android sensor with takePhoto still capabilities
   const android48Avif = getAvailableMegapixelOptions({

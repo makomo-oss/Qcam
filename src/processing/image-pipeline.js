@@ -170,6 +170,10 @@ export class ImagePipeline {
   }) {
     if (format === 'jpeg') {
       const blob = await canvasToEncodedBlob(canvas, JPEG_MIME_TYPE, jpegQuality);
+      if (canvas) {
+        canvas.width = 1;
+        canvas.height = 1;
+      }
       return {
         blob,
         width,
@@ -185,6 +189,10 @@ export class ImagePipeline {
       if (blob && blob.type === AVIF_MIME_TYPE && blob.size >= 16) {
         const header = await blob.slice(0, 64).arrayBuffer();
         if (isValidAvifBytes(header)) {
+          if (canvas) {
+            canvas.width = 1;
+            canvas.height = 1;
+          }
           return {
             blob,
             width,
@@ -200,6 +208,8 @@ export class ImagePipeline {
     let rgbaPixels;
     if (webgl) {
       rgbaPixels = webgl.readRgbaTopDown().data;
+      webgl.canvas.width = 1;
+      webgl.canvas.height = 1;
     } else {
       const imageData = ctx2d.getImageData(0, 0, width, height);
       rgbaPixels = new Uint8Array(
@@ -207,6 +217,8 @@ export class ImagePipeline {
         imageData.data.byteOffset,
         imageData.data.byteLength
       );
+      canvas.width = 1;
+      canvas.height = 1;
     }
 
     return this._encodeRgbaToAvif({
@@ -458,6 +470,18 @@ export class ImagePipeline {
         });
       }
 
+      for (const frame of frames) {
+        try {
+          frame?.close?.();
+        } catch {
+          // ignore
+        }
+      }
+      for (const tc of tempCanvases) {
+        tc.width = 1;
+        tc.height = 1;
+      }
+
       const encoded = await this._encodeMainCanvas({
         format,
         webgl,
@@ -469,10 +493,6 @@ export class ImagePipeline {
         engineBase: enginePrefix || 'main-webgl',
       });
 
-      for (const tc of tempCanvases) {
-        tc.width = 1;
-        tc.height = 1;
-      }
       return encoded;
     }
 
@@ -501,6 +521,13 @@ export class ImagePipeline {
       crop.outWidth,
       crop.outHeight
     );
+    for (const frame of frames) {
+      try {
+        frame?.close?.();
+      } catch {
+        // ignore
+      }
+    }
     return this._encodeMainCanvas({
       format,
       canvas,

@@ -16,6 +16,27 @@ import {
   warmupAvifEncoder,
 } from '../processing/avif-encoder.js';
 
+function releaseFrames(frames) {
+  if (!Array.isArray(frames)) return;
+  for (const frame of frames) {
+    try {
+      frame?.close?.();
+    } catch {
+      // already closed or transferred
+    }
+  }
+}
+
+function shrinkCanvases(canvases) {
+  if (!Array.isArray(canvases)) return;
+  for (const c of canvases) {
+    if (c) {
+      c.width = 1;
+      c.height = 1;
+    }
+  }
+}
+
 let webglProcessor = null;
 let webglUnavailable = false;
 
@@ -92,6 +113,13 @@ function averageFramesCPU(frames, crop, mirrorX) {
       );
     }
     buffers.push(workCtx.getImageData(0, 0, width, height).data);
+    if (i > 0) {
+      try {
+        frames[i]?.close?.();
+      } catch {
+        // already closed
+      }
+    }
   }
 
   const ref = buffers[0];
@@ -136,6 +164,7 @@ function averageFramesCPU(frames, crop, mirrorX) {
     out[i + 3] = 255;
   }
 
+  buffers.length = 0;
   const outImageData = new ImageData(out, width, height);
   workCtx.setTransform(1, 0, 0, 1, 0, 0);
   workCtx.putImageData(outImageData, 0, 0);
@@ -153,6 +182,10 @@ async function encodeWorkerOutput({
 }) {
   if (format === 'jpeg') {
     const blob = await canvasToEncodedBlob(canvas, JPEG_MIME_TYPE, jpegQuality);
+    if (canvas) {
+      canvas.width = 1;
+      canvas.height = 1;
+    }
     return {
       blob,
       mimeType: JPEG_MIME_TYPE,
@@ -166,6 +199,10 @@ async function encodeWorkerOutput({
     if (blob && blob.type === AVIF_MIME_TYPE && blob.size >= 16) {
       const header = await blob.slice(0, 64).arrayBuffer();
       if (isValidAvifBytes(header)) {
+        if (canvas) {
+          canvas.width = 1;
+          canvas.height = 1;
+        }
         return {
           blob,
           mimeType: AVIF_MIME_TYPE,
@@ -184,6 +221,9 @@ async function encodeWorkerOutput({
     rgbaPixels = read.data;
     width = read.width;
     height = read.height;
+    // Free the full-resolution WebGL drawing buffer before WASM AVIF allocates heap memory
+    webgl.canvas.width = 1;
+    webgl.canvas.height = 1;
   } else {
     const imageData = ctx2d.getImageData(0, 0, canvas.width, canvas.height);
     rgbaPixels = new Uint8Array(
@@ -191,6 +231,8 @@ async function encodeWorkerOutput({
       imageData.data.byteOffset,
       imageData.data.byteLength
     );
+    canvas.width = 1;
+    canvas.height = 1;
   }
 
   const blob = await encodeAvifFromRgba(rgbaPixels, width, height, { quality: avifQuality });
@@ -351,6 +393,11 @@ self.addEventListener('message', async (event) => {
         });
       }
 
+      // WebGL has already rendered to webgl.canvas; release all source bitmaps and temp canvases before encoding
+      releaseFrames(frames);
+      shrinkCanvases(intermediates);
+      intermediates.length = 0;
+
       const encoded = await encodeWorkerOutput({
         format: outputFormat,
         webgl,
@@ -378,6 +425,7 @@ self.addEventListener('message', async (event) => {
     if (typeof OffscreenCanvas === 'function' && mode === 'hq' && frames.length > 1) {
       const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
       const averagedCanvas = averageFramesCPU(frames, crop, mirrorX);
+      releaseFrames(frames);
       const averagedBitmap = averagedCanvas.transferToImageBitmap();
       self.postMessage(
         {
@@ -398,6 +446,7 @@ self.addEventListener('message', async (event) => {
     if (typeof OffscreenCanvas === 'function') {
       const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
       const { canvas, ctx } = cropFrameToCanvas(frames[0], crop, mirrorX);
+      releaseFrames(frames);
       const encoded = await encodeWorkerOutput({
         format: outputFormat,
         canvas,
@@ -437,6 +486,7 @@ self.addEventListener('message', async (event) => {
           fallbackMaxDim
         );
         const { canvas, ctx } = cropFrameToCanvas(frames[0], crop, mirrorX);
+        releaseFrames(frames);
         const encoded = await encodeWorkerOutput({
           format: outputFormat,
           canvas,
@@ -467,16 +517,7 @@ self.addEventListener('message', async (event) => {
       error: err?.message || String(err),
     });
   } finally {
-    for (const frame of frames) {
-      try {
-        frame.close();
-      } catch {
-        // already closed or transferred
-      }
-    }
-    for (const c of intermediates) {
-      c.width = 1;
-      c.height = 1;
-    }
+    releaseFrames(frames);
+    shrinkCanvases(intermediates);
   }
 });

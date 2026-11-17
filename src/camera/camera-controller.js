@@ -488,10 +488,17 @@ export class CameraController {
     const afterH = this.video.videoHeight || sAfter.height || 0;
 
     const targetLong = Math.max(target.width, target.height);
+    const targetShort = Math.min(target.width, target.height);
     const afterLong = Math.max(afterW, afterH);
+    const afterShort = Math.min(afterW, afterH);
 
     // If driver left resolution far from explicitly chosen target, restart stream with ideal constraints
-    if (allowReacquire && targetLong > 0 && Math.abs(afterLong - targetLong) > targetLong * 0.14) {
+    if (
+      allowReacquire &&
+      targetLong > 0 &&
+      (Math.abs(afterLong - targetLong) > targetLong * 0.14 ||
+        Math.abs(afterShort - targetShort) > targetShort * 0.14)
+    ) {
       try {
         const perm = await this.checkPermissionState();
         if (!this.platform.isIOS || perm.state === 'granted') {

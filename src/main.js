@@ -166,7 +166,7 @@ class QcamApp {
       supportsNativeAvif: caps.supportsNativeAvif,
       currentSelection: this.settings.outputMegapixels,
     });
-    return { resolutionData, megapixelData };
+    return { resolutionData, megapixelData, isIOS: Boolean(this.platform.isIOS) };
   }
 
   _refreshQualityControls() {
@@ -819,16 +819,29 @@ class QcamApp {
       resolutionData.capWidth && resolutionData.capHeight
         ? `${resolutionData.capWidth}×${resolutionData.capHeight}`
         : '未取得';
-    const mpLabel =
+    const mpBaseLabel =
       megapixelData.plannedOutWidth && megapixelData.plannedOutHeight
         ? `${megapixelData.plannedOutWidth}×${megapixelData.plannedOutHeight} (${formatMegapixelsLabel(megapixelData.plannedOutMp)})`
         : '未取得';
+    const mpLabel =
+      megapixelData.isAspectCropped && megapixelData.uncropped43Mp
+        ? `${mpBaseLabel} · 16:9切抜（4:3で最大 ${formatMegapixelsLabel(megapixelData.uncropped43Mp)}）`
+        : mpBaseLabel;
     const captureMethodLabel =
       this.lastCaptureSource === 'takePhoto'
         ? 'ImageCapture.takePhoto() + 高画質 HDR'
         : info.supportsTakePhoto
         ? 'ImageCapture.takePhoto() / 4連写 + 高画質 HDR'
+        : this.platform.isIOS
+        ? '4連写ストリーム + 高画質 HDR（無音仕様）'
         : '4連写マルチフレーム + 高画質 HDR';
+    const takePhotoApiLabel = this.platform.isIOS
+      ? info.photoMaxWidth && info.photoMaxHeight
+        ? `無音維持のため無効 (${info.photoMaxWidth}×${info.photoMaxHeight} · ストリーム最高画素を使用)`
+        : '無音維持のため無効（強制シャッター音回避 / ストリーム最高画素を使用）'
+      : info.photoMaxWidth && info.photoMaxHeight
+      ? `${info.photoMaxWidth}×${info.photoMaxHeight}`
+      : 'ストリーム解像度';
 
     const entries = [
       ['アプリバージョン', `v${APP_VERSION}`],
@@ -836,19 +849,14 @@ class QcamApp {
       ['PWA モード', this.platform.isStandalonePWA ? 'スタンドアロン (全画面)' : 'ブラウザ表示'],
       ['カメラ権限状態', permLabelMap[this.lastPermissionState] || this.lastPermissionState],
       ['撮影画質モード', '高画質 HDR (常時有効)'],
-      ['解像度設定 / 上限', `${resPresetLabel} / 上限 ${capLabel}`],
+      ['解像度設定 / 上限', `${resPresetLabel} / ブラウザ取得上限 ${capLabel}`],
       ['保存画素数設定', mpLabel],
       ['超広角 (0.5×) カメラ', ultraWideLabel],
       [
         'プレビュー解像度',
         info.videoWidth && info.videoHeight ? `${info.videoWidth}×${info.videoHeight}` : '未取得',
       ],
-      [
-        '静止画センサー上限',
-        info.photoMaxWidth && info.photoMaxHeight
-          ? `${info.photoMaxWidth}×${info.photoMaxHeight}`
-          : 'ストリーム解像度',
-      ],
+      ['静止画 API (takePhoto)', takePhotoApiLabel],
       ['カメラ起動時間', info.startupTimeMs ? `${info.startupTimeMs} ms` : '--'],
       ['基本撮影方式', captureMethodLabel],
       [
