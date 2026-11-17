@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'qcam-v1.2.0';
+const CACHE_VERSION = 'qcam-v1.3.0';
 const APP_SHELL_ASSETS = [
   './',
   './index.html',
@@ -7,6 +7,7 @@ const APP_SHELL_ASSETS = [
   './src/main.js',
   './src/utils/platform.js',
   './src/utils/geometry.js',
+  './src/utils/camera-lenses.js',
   './src/camera/camera-controller.js',
   './src/processing/glsl-shaders.js',
   './src/processing/webgl-processor.js',

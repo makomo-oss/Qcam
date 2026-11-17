@@ -144,8 +144,9 @@
     <!-- Bottom Controls Dock -->
     <footer class="bottom-dock" aria-label="撮影コントロール">
       <!-- Zoom Presets & Slider -->
-      <div class="zoom-bar" aria-label="デジタルズーム">
+      <div class="zoom-bar" aria-label="レンズ・ズーム倍率">
         <div class="zoom-presets">
+          <button id="btn-zoom-05" type="button" class="zoom-preset zoom-preset--ultrawide" data-zoom="0.5" hidden aria-label="超広角 0.5倍">0.5×</button>
           <button type="button" class="zoom-preset is-active" data-zoom="1">1×</button>
           <button type="button" class="zoom-preset" data-zoom="2">2×</button>
           <button type="button" class="zoom-preset" data-zoom="3">3×</button>
@@ -257,6 +258,12 @@
           </span>
           <input id="toggle-mirror-front" type="checkbox">
         </label>
+      </div>
+
+      <div id="back-lens-section" class="sheet-section" hidden>
+        <h3 class="sheet-subtitle">背面レンズ手動切替（複数レンズ検出時）</h3>
+        <p class="sheet-note">端末が複数の背面カメラを公開している場合、利用するレンズを直接切り替えられます。</p>
+        <div id="back-lens-options" class="lens-chip-list"></div>
       </div>
 
       <div class="sheet-section">

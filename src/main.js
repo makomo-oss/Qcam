@@ -91,6 +91,7 @@ class QcamApp {
       onDeleteCurrentPhoto: () => this.deleteCurrentPhoto(),
       onSaveCurrentPhoto: (preferShare) => this.saveCurrentPhoto(preferShare),
       onSettingChange: (key, val) => this.updateSetting(key, val),
+      onSelectBackLens: (deviceId) => this.selectBackLens(deviceId),
       onRefreshDiagnostics: () => this.refreshDiagnostics(),
       onOpenPermissionGuide: () => this.ui.openInfoModal({ scrollToPermissionGuide: true }),
       onDismissPermissionHint: () => this.dismissPermissionHint(),
@@ -101,6 +102,7 @@ class QcamApp {
     this.camera.onStreamInfo = (info) => {
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
+      this.ui.updateLensControls(info);
       this._syncPreviewTransform();
     };
 
@@ -164,6 +166,7 @@ class QcamApp {
       const info = await this.camera.start({ facingMode: this.settings.facingMode });
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
+      this.ui.updateLensControls(info);
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
 
@@ -214,10 +217,33 @@ class QcamApp {
       this._persistSettings();
       this.streamInfo = info;
       this.ui.updateStreamBadges(info);
+      this.ui.updateLensControls(info);
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
     } catch (err) {
       this.ui.showToast('カメラの切り替えに失敗しました');
+    } finally {
+      this.isSwitchingCamera = false;
+    }
+  }
+
+  async selectBackLens(deviceId) {
+    if (this.isCapturing || this.countdownRemaining > 0 || this.isSwitchingCamera) return;
+    this.isSwitchingCamera = true;
+    try {
+      const info = await this.camera.selectBackLens(deviceId);
+      this.streamInfo = info;
+      this.ui.updateStreamBadges(info);
+      this.ui.updateLensControls(info);
+      this.ui.setExposureDisplay(0);
+      this._syncPreviewTransform();
+    } catch {
+      const refreshed = this.camera.getStreamInfo();
+      this.streamInfo = refreshed;
+      this.ui.updateStreamBadges(refreshed);
+      this.ui.updateLensControls(refreshed);
+      this._syncPreviewTransform();
+      this.ui.showToast('このレンズはブラウザから開けませんでした');
     } finally {
       this.isSwitchingCamera = false;
     }
@@ -251,8 +277,17 @@ class QcamApp {
   }
 
   async applyZoom(zoom) {
-    const res = await this.camera.setZoom(zoom);
-    this._syncPreviewTransform(res);
+    try {
+      const res = await this.camera.setZoom(zoom);
+      this._syncPreviewTransform(res);
+    } catch {
+      const refreshed = this.camera.getStreamInfo();
+      this.streamInfo = refreshed;
+      this.ui.updateStreamBadges(refreshed);
+      this.ui.updateLensControls(refreshed);
+      this._syncPreviewTransform();
+      this.ui.showToast('超広角レンズへの切り替えに失敗しました');
+    }
   }
 
   async applyFocus(normPoint) {
@@ -516,10 +551,20 @@ class QcamApp {
       denied: '拒否',
       unknown: '取得中 / ブラウザ非公開',
     };
+    const ultraWideLabel =
+      this.camera.facingMode === 'user'
+        ? 'アウトカメラ時のみ対応'
+        : info.supportsUltraWide
+        ? info.ultraWideMethod === 'hardware-zoom'
+          ? `対応 (光学ズーム倍率制御 · 下限 ${(info.ultraWideZoom || 0.5).toFixed(1)}×)`
+          : `対応 (超広角レンズ自動切替 · 検出レンズ ${info.backLenses?.length || 1} 個)`
+        : '非対応（端末 / ブラウザが超広角レンズを未公開）';
+
     const entries = [
       ['プラットフォーム', `${this.platform.osLabel} (${this.platform.browserLabel})`],
       ['PWA モード', this.platform.isStandalonePWA ? 'スタンドアロン (全画面)' : 'ブラウザ表示'],
       ['カメラ権限状態', permLabelMap[this.lastPermissionState] || this.lastPermissionState],
+      ['超広角 (0.5×) カメラ', ultraWideLabel],
       [
         'プレビュー解像度',
         info.videoWidth && info.videoHeight ? `${info.videoWidth}×${info.videoHeight}` : '未取得',

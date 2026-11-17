@@ -64,6 +64,44 @@ test('splitZoom avoids double-zooming when hardware zoom is available', () => {
   assert.equal(res3.softwareZoom, 3);
 });
 
+test('splitZoom handles < 1.0 ultra-wide hardware zoom and dedicated 0.5x lens scale without shrinking < 1', () => {
+  // Hardware zoom supporting 0.5x -> 6x
+  const hwUw = splitZoom(0.5, { min: 0.5, max: 6, step: 0.1 }, 6);
+  assert.equal(hwUw.hardwareSupported, true);
+  assert.equal(hwUw.hardwareZoom, 0.5);
+  assert.equal(hwUw.softwareZoom, 1);
+  assert.equal(hwUw.totalZoom, 0.5);
+
+  // Hardware zoom with 0.6x minimum
+  const hw06 = splitZoom(0.5, { min: 0.6, max: 8, step: 0.1 }, 8);
+  assert.equal(hw06.hardwareSupported, true);
+  assert.equal(hw06.hardwareZoom, 0.6);
+  assert.equal(hw06.softwareZoom, 1);
+  assert.equal(hw06.totalZoom, 0.6);
+
+  // Physical ultra-wide lens (baseLensScale: 0.5) at native 0.5x
+  const physBase = splitZoom(0.5, null, 5, { baseLensScale: 0.5 });
+  assert.equal(physBase.hardwareSupported, false);
+  assert.equal(physBase.hardwareZoom, 1);
+  assert.equal(physBase.softwareZoom, 1);
+  assert.equal(physBase.totalZoom, 0.5);
+
+  // Physical ultra-wide lens slightly zoomed to 0.8x (1.6x digital crop on 0.5x sensor)
+  const physZoomed = splitZoom(0.8, null, 5, { baseLensScale: 0.5 });
+  assert.equal(physZoomed.softwareZoom, 1.6);
+  assert.equal(physZoomed.totalZoom, 0.8);
+
+  // Requesting 0.5x on a 1x-only camera clamps cleanly to 1.0x (never shrinking preview < 1.0)
+  const clamped = splitZoom(0.5, { min: 1, max: 5, step: 0.1 }, 5);
+  assert.equal(clamped.hardwareZoom, 1);
+  assert.equal(clamped.softwareZoom, 1);
+  assert.equal(clamped.totalZoom, 1);
+
+  const clampedNoHw = splitZoom(0.5, null, 5);
+  assert.equal(clampedNoHw.softwareZoom, 1);
+  assert.equal(clampedNoHw.totalZoom, 1);
+});
+
 test('mapTapToNormalizedPoint handles center tap, mirroring, and software zoom', () => {
   const rect = { left: 0, top: 0, width: 300, height: 400 };
   // 16:9 landscape frame inside 3:4 portrait container -> width is cropped by object-fit: cover

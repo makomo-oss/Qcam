@@ -45,6 +45,7 @@ export class CameraUI {
 
       saveToast: document.getElementById('save-toast'),
       modalToast: document.getElementById('modal-toast'),
+      btnZoom05: document.getElementById('btn-zoom-05'),
       zoomPresets: Array.from(document.querySelectorAll('.zoom-bar .zoom-preset')),
       zoomSlider: document.getElementById('zoom-slider'),
       zoomReadout: document.getElementById('zoom-readout'),
@@ -75,6 +76,8 @@ export class CameraUI {
       btnInfoClose: document.getElementById('btn-info-close'),
       toggleAutoSave: document.getElementById('toggle-auto-save'),
       toggleMirrorFront: document.getElementById('toggle-mirror-front'),
+      backLensSection: document.getElementById('back-lens-section'),
+      backLensOptions: document.getElementById('back-lens-options'),
       permissionGuide: document.getElementById('permission-guide'),
       diagnosticsList: document.getElementById('diagnostics-list'),
     };
@@ -87,6 +90,7 @@ export class CameraUI {
       mirroredPreview: false,
       softwareZoom: 1,
       totalZoom: 1,
+      minZoom: 1,
       maxZoom: 5,
       previewZoom: 1,
     };
@@ -284,7 +288,7 @@ export class CameraUI {
       const currentDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
       const scale = currentDist / this._pinchStartDist;
       const nextZoom = Math.max(
-        1.0,
+        this.state.minZoom || 1.0,
         Math.min(this.state.maxZoom, this._pinchStartZoom * scale)
       );
       this._showZoomHud(nextZoom);
@@ -421,8 +425,12 @@ export class CameraUI {
     this.els.zoomReadout.textContent = `${totalZoom.toFixed(1)}×`;
 
     for (const preset of this.els.zoomPresets) {
+      if (preset.hidden) {
+        preset.classList.remove('is-active');
+        continue;
+      }
       const pz = Number(preset.dataset.zoom);
-      const isClose = Math.abs(totalZoom - pz) < 0.15;
+      const isClose = Math.abs(totalZoom - pz) < 0.12;
       preset.classList.toggle('is-active', isClose);
     }
   }
@@ -466,6 +474,56 @@ export class CameraUI {
         ? `${info.videoWidth}×${info.videoHeight}`
         : '--×--';
     this.els.resolutionBadge.textContent = resText;
+  }
+
+  updateLensControls(info) {
+    if (!info) return;
+    const supportsUw = Boolean(info.supportsUltraWide && info.facingMode !== 'user');
+    const minZoom = supportsUw ? Math.max(0.25, Number(info.minZoom) || 0.5) : 1.0;
+    const uwZoom = supportsUw ? Number(info.ultraWideZoom) || 0.5 : 1.0;
+    const maxZoom = Math.max(5.0, Number(info.maxZoom) || 5.0);
+
+    this.state.minZoom = minZoom;
+    this.state.maxZoom = maxZoom;
+    this.els.zoomSlider.min = String(minZoom);
+    this.els.zoomSlider.max = String(maxZoom);
+
+    if (this.els.btnZoom05) {
+      this.els.btnZoom05.hidden = !supportsUw;
+      if (supportsUw) {
+        const label = `${uwZoom.toFixed(1)}×`;
+        this.els.btnZoom05.dataset.zoom = String(uwZoom);
+        this.els.btnZoom05.textContent = label;
+        this.els.btnZoom05.setAttribute('aria-label', `超広角 ${uwZoom.toFixed(1)}倍`);
+      } else {
+        this.els.btnZoom05.classList.remove('is-active');
+      }
+    }
+
+    if (this.els.backLensSection && this.els.backLensOptions) {
+      const lenses =
+        info.facingMode !== 'user' && Array.isArray(info.backLenses) ? info.backLenses : [];
+      if (lenses.length > 1) {
+        this.els.backLensOptions.innerHTML = '';
+        for (const lens of lenses) {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          const isActive = Boolean(info.activeDeviceId && lens.deviceId === info.activeDeviceId);
+          btn.className = `lens-chip${isActive ? ' is-active' : ''}`;
+          btn.textContent = lens.label;
+          btn.dataset.deviceId = lens.deviceId;
+          btn.setAttribute('aria-pressed', String(isActive));
+          btn.addEventListener('click', () => {
+            this.handlers.onSelectBackLens?.(lens.deviceId);
+          });
+          this.els.backLensOptions.appendChild(btn);
+        }
+        this.els.backLensSection.hidden = false;
+      } else {
+        this.els.backLensOptions.innerHTML = '';
+        this.els.backLensSection.hidden = true;
+      }
+    }
   }
 
   showCameraOverlay(title, message, options = true) {

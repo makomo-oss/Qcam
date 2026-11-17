@@ -80,40 +80,60 @@ export function computeAspectCrop(
 
 /**
  * Partition requested total zoom into hardware optical/driver zoom and software crop zoom
- * so they never double-apply.
+ * so they never double-apply. Supports < 1.0 hardware ultra-wide zoom as well as
+ * dedicated ultra-wide physical lenses via options.baseLensScale (e.g. 0.5).
  */
-export function splitZoom(targetZoom, zoomCap = null, maxTotalZoom = 5.0) {
-  const clampedTarget = Math.max(1.0, Math.min(maxTotalZoom, Number(targetZoom) || 1.0));
-  if (
+export function splitZoom(
+  targetZoom,
+  zoomCap = null,
+  maxTotalZoom = 5.0,
+  { baseLensScale = 1.0 } = {}
+) {
+  const safeBase = Math.max(0.25, Math.min(1.0, Number(baseLensScale) || 1.0));
+  const hasHwRange = Boolean(
     zoomCap &&
-    typeof zoomCap.min === 'number' &&
-    typeof zoomCap.max === 'number' &&
-    zoomCap.max > zoomCap.min
-  ) {
-    const hwMin = Math.max(1.0, zoomCap.min);
-    const hwMax = Math.max(hwMin, zoomCap.max);
+      typeof zoomCap.min === 'number' &&
+      typeof zoomCap.max === 'number' &&
+      zoomCap.max > zoomCap.min
+  );
+  const hwMinRaw = hasHwRange ? Math.max(0.25, zoomCap.min) : 1.0;
+  const hwMaxRaw = hasHwRange ? Math.max(hwMinRaw, zoomCap.max) : 1.0;
+  const minTotalZoom = Math.min(safeBase, safeBase * hwMinRaw);
+
+  const clampedTarget = Math.max(
+    minTotalZoom,
+    Math.min(maxTotalZoom, Number(targetZoom) || safeBase)
+  );
+  const desiredRelativeZoom = Math.max(hwMinRaw, clampedTarget / safeBase);
+
+  if (hasHwRange) {
+    const hwMin = hwMinRaw;
+    const hwMax = hwMaxRaw;
     const step = typeof zoomCap.step === 'number' && zoomCap.step > 0 ? zoomCap.step : 0.01;
 
-    let hardwareZoom = Math.min(clampedTarget, hwMax);
+    let hardwareZoom = Math.min(desiredRelativeZoom, hwMax);
     hardwareZoom = Math.max(hwMin, hardwareZoom);
     // Snap to hardware step
     hardwareZoom = Math.round((hardwareZoom - hwMin) / step) * step + hwMin;
     hardwareZoom = Number(Math.min(hwMax, Math.max(hwMin, hardwareZoom)).toFixed(3));
 
-    const softwareZoom = Number(Math.max(1.0, clampedTarget / hardwareZoom).toFixed(4));
+    const softwareZoom = Number(
+      Math.max(1.0, desiredRelativeZoom / hardwareZoom).toFixed(4)
+    );
     return {
       hardwareSupported: true,
       hardwareZoom,
       softwareZoom,
-      totalZoom: Number((hardwareZoom * softwareZoom).toFixed(2)),
+      totalZoom: Number((safeBase * hardwareZoom * softwareZoom).toFixed(2)),
     };
   }
 
+  const softwareZoom = Number(Math.max(1.0, clampedTarget / safeBase).toFixed(4));
   return {
     hardwareSupported: false,
     hardwareZoom: 1.0,
-    softwareZoom: Number(clampedTarget.toFixed(4)),
-    totalZoom: Number(clampedTarget.toFixed(2)),
+    softwareZoom,
+    totalZoom: Number((safeBase * softwareZoom).toFixed(2)),
   };
 }
 

@@ -1,8 +1,14 @@
 import { splitZoom } from '../utils/geometry.js';
+import {
+  analyzeCameraEnvironment,
+  classifyVideoDevice,
+  formatBackLensDisplayName,
+} from '../utils/camera-lenses.js';
 
 /**
  * Manages MediaDevices.getUserMedia, ImageCapture API, camera switching,
- * tap-to-focus / exposure, hardware + software zoom, and frame extraction.
+ * 0.5x ultra-wide lens selection, tap-to-focus / exposure, hardware + software zoom,
+ * and frame extraction.
  * Never requests or plays audio so shutter remains strictly silent.
  */
 const DEVICE_STORAGE_KEY = 'qcam_device_ids_v1';
@@ -42,6 +48,34 @@ export class CameraController {
     this.exposureCompensation = 0;
     this.startupTimeMs = 0;
     this.onStreamInfo = null;
+
+    this.baseLensScale = 1.0;
+    this.activeBackLens = 'wide';
+    this.activeDeviceId = null;
+    this.activeDeviceLabel = '';
+    this.backLenses = [];
+    this.standardBackDeviceId = null;
+    this.ultraWideDeviceId = null;
+    this.ultraWideMethod = 'none';
+    this.supportsUltraWide = false;
+    this.ultraWideZoom = 1.0;
+    this.minZoom = 1.0;
+    this.blockedDeviceIds = new Set();
+    this._lensSwitchPromise = null;
+  }
+
+  _resetLensState(activeRole = 'wide') {
+    this.baseLensScale = 1.0;
+    this.activeBackLens = activeRole;
+    this.activeDeviceId = null;
+    this.activeDeviceLabel = '';
+    this.backLenses = [];
+    this.standardBackDeviceId = null;
+    this.ultraWideDeviceId = null;
+    this.ultraWideMethod = 'none';
+    this.supportsUltraWide = false;
+    this.ultraWideZoom = 1.0;
+    this.minZoom = 1.0;
   }
 
   async checkPermissionState() {
@@ -81,12 +115,27 @@ export class CameraController {
   async _getPreferredDeviceId(facingMode) {
     const stored = readStoredDeviceIds()[facingMode];
     if (!stored || !navigator.mediaDevices?.enumerateDevices) return null;
+    if (this.blockedDeviceIds.has(stored)) return null;
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
       const match = devices.find(
         (d) => d.kind === 'videoinput' && d.deviceId === stored && Boolean(d.label)
       );
-      return match ? match.deviceId : null;
+      if (!match) return null;
+      if (facingMode === 'environment') {
+        const classified = classifyVideoDevice(match, {
+          isMobile: Boolean(this.platform?.isMobile),
+        });
+        if (
+          classified.isDeskOrVirtual ||
+          classified.facing === 'front' ||
+          classified.role === 'ultrawide-physical' ||
+          classified.role === 'telephoto'
+        ) {
+          return null;
+        }
+      }
+      return match.deviceId;
     } catch {
       return null;
     }
@@ -101,6 +150,26 @@ export class CameraController {
         // ignore
       }
     }
+  }
+
+  async _acquireConstraintsList(constraintAttempts) {
+    let acquired = null;
+    let errOut = null;
+    for (const constraints of constraintAttempts) {
+      try {
+        acquired = await navigator.mediaDevices.getUserMedia(constraints);
+        break;
+      } catch (err) {
+        errOut = err;
+        if (err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
+          throw err;
+        }
+      }
+    }
+    if (!acquired) {
+      throw errOut || new Error('カメラの起動に失敗しました。');
+    }
+    return acquired;
   }
 
   async start({ facingMode = this.facingMode, keepOldStreamDuringAcquire = false } = {}) {
@@ -148,29 +217,9 @@ export class CameraController {
       },
     ];
 
-    const acquire = async () => {
-      let acquired = null;
-      let errOut = null;
-      for (const constraints of constraintAttempts) {
-        try {
-          acquired = await navigator.mediaDevices.getUserMedia(constraints);
-          break;
-        } catch (err) {
-          errOut = err;
-          if (err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
-            throw err;
-          }
-        }
-      }
-      if (!acquired) {
-        throw errOut || new Error('カメラの起動に失敗しました。');
-      }
-      return acquired;
-    };
-
     let stream = null;
     try {
-      stream = await acquire();
+      stream = await this._acquireConstraintsList(constraintAttempts);
       if (keepOldStreamDuringAcquire && oldStream) {
         this._stopTracks(oldStream);
       }
@@ -183,11 +232,11 @@ export class CameraController {
         err?.name !== 'PermissionDeniedError'
       ) {
         this.stop();
-        stream = await acquire();
+        stream = await this._acquireConstraintsList(constraintAttempts);
       } else if (err?.name === 'NotReadableError' || err?.name === 'AbortError') {
         // Previous tab/reload may still be releasing camera sensor; brief backoff retry once
         await new Promise((r) => setTimeout(r, 220));
-        stream = await acquire();
+        stream = await this._acquireConstraintsList(constraintAttempts);
       } else {
         throw err;
       }
@@ -196,12 +245,12 @@ export class CameraController {
     this.facingMode = facingMode;
     this.stream = stream;
     this.track = stream.getVideoTracks()[0] || null;
-    if (this.track && typeof this.track.getSettings === 'function') {
-      const settings = this.track.getSettings();
-      if (settings.deviceId) {
-        writeStoredDeviceId(facingMode, settings.deviceId);
-      }
-    }
+    const settings =
+      this.track && typeof this.track.getSettings === 'function'
+        ? this.track.getSettings()
+        : {};
+    this.activeDeviceId = settings.deviceId || null;
+    this.activeDeviceLabel = this.track?.label || '';
 
     this.video.srcObject = stream;
     this.video.muted = true;
@@ -210,8 +259,17 @@ export class CameraController {
     await this._waitForVideoReady();
 
     this._inspectCapabilities();
+    await this._refreshLensCapabilities({ preserveStandardId: false });
+
+    if (
+      this.activeDeviceId &&
+      (facingMode === 'user' || (facingMode === 'environment' && this.activeBackLens === 'wide'))
+    ) {
+      writeStoredDeviceId(facingMode, this.activeDeviceId);
+    }
+
     // Reset zoom & exposure on new camera stream
-    this.targetZoom = 1.0;
+    this.targetZoom = this.baseLensScale;
     this.hardwareZoom = 1.0;
     this.softwareZoom = 1.0;
     this.exposureCompensation = 0;
@@ -271,11 +329,12 @@ export class CameraController {
     this.photoCapabilities = null;
     this.imageCapture = null;
 
-    if (!this.track) return;
+    const capturedTrack = this.track;
+    if (!capturedTrack) return;
 
-    if (typeof this.track.getCapabilities === 'function') {
+    if (typeof capturedTrack.getCapabilities === 'function') {
       try {
-        this.capabilities = this.track.getCapabilities() || {};
+        this.capabilities = capturedTrack.getCapabilities() || {};
       } catch {
         this.capabilities = {};
       }
@@ -283,22 +342,92 @@ export class CameraController {
 
     if (this.platform.supportsImageCapture) {
       try {
-        this.imageCapture = new window.ImageCapture(this.track);
+        this.imageCapture = new window.ImageCapture(capturedTrack);
         if (typeof this.imageCapture.getPhotoCapabilities === 'function') {
           this.imageCapture
             .getPhotoCapabilities()
             .then((caps) => {
+              if (this.track !== capturedTrack) return;
               this.photoCapabilities = caps;
               if (typeof this.onStreamInfo === 'function') {
                 this.onStreamInfo(this.getStreamInfo());
               }
             })
             .catch(() => {
-              this.photoCapabilities = null;
+              if (this.track === capturedTrack) {
+                this.photoCapabilities = null;
+              }
             });
         }
       } catch {
         this.imageCapture = null;
+      }
+    }
+  }
+
+  async _refreshLensCapabilities({ preserveStandardId = false } = {}) {
+    if (this.facingMode !== 'environment') {
+      this._resetLensState('front');
+      return;
+    }
+
+    let devices = [];
+    if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
+      try {
+        devices = await navigator.mediaDevices.enumerateDevices();
+      } catch {
+        devices = [];
+      }
+    }
+
+    const env = analyzeCameraEnvironment({
+      devices,
+      activeDeviceId: this.activeDeviceId,
+      trackCapabilities: this.capabilities,
+      facingMode: this.facingMode,
+      isMobile: Boolean(this.platform?.isMobile),
+      blockedDeviceIds: this.blockedDeviceIds,
+    });
+
+    this.backLenses = env.backLenses;
+    if (
+      !preserveStandardId ||
+      !this.standardBackDeviceId ||
+      this.blockedDeviceIds.has(this.standardBackDeviceId)
+    ) {
+      this.standardBackDeviceId =
+        env.standardBackDevice?.deviceId ||
+        (env.activeRole === 'wide' ? this.activeDeviceId : null);
+    }
+
+    this.ultraWideDeviceId = env.ultraWideDevice?.deviceId || null;
+    this.supportsUltraWide = env.supportsUltraWide;
+    this.ultraWideMethod = env.ultraWideMethod;
+    this.ultraWideZoom = env.ultraWideZoom;
+    this.minZoom = env.minZoom;
+
+    if (env.activeRole === 'ultrawide') {
+      this.activeBackLens = 'ultrawide';
+    } else if (
+      env.activeRole === 'telephoto' ||
+      (this.standardBackDeviceId &&
+        this.activeDeviceId &&
+        this.activeDeviceId !== this.standardBackDeviceId)
+    ) {
+      this.activeBackLens = 'custom';
+    } else {
+      this.activeBackLens = 'wide';
+    }
+
+    this.baseLensScale =
+      this.ultraWideMethod === 'device-switch' && this.activeBackLens === 'ultrawide'
+        ? 0.5
+        : 1.0;
+
+    if (!this.activeDeviceLabel && this.activeDeviceId && devices.length) {
+      const matched = devices.find((d) => d.deviceId === this.activeDeviceId);
+      if (matched?.label) {
+        this.activeDeviceLabel = matched.label;
       }
     }
   }
@@ -315,6 +444,17 @@ export class CameraController {
       this.capabilities.zoom && typeof this.capabilities.zoom.max === 'number'
         ? this.capabilities.zoom.max
         : null;
+    const minHardwareZoom =
+      this.capabilities.zoom && typeof this.capabilities.zoom.min === 'number'
+        ? this.capabilities.zoom.min
+        : null;
+
+    const formattedLenses = (this.backLenses || []).map((lens, idx) => ({
+      deviceId: lens.deviceId,
+      role: lens.role,
+      label: formatBackLensDisplayName(lens, idx),
+      rawLabel: lens.label,
+    }));
 
     return {
       videoWidth,
@@ -322,8 +462,19 @@ export class CameraController {
       frameRate: settings.frameRate ? Math.round(settings.frameRate) : null,
       facingMode: actualFacing,
       startupTimeMs: this.startupTimeMs,
-      supportsHardwareZoom: Boolean(maxHardwareZoom && maxHardwareZoom > 1),
+      supportsHardwareZoom: Boolean(
+        (maxHardwareZoom && maxHardwareZoom > 1) ||
+          (minHardwareZoom && minHardwareZoom < 0.99)
+      ),
+      minZoom: this.minZoom,
       maxZoom: Math.max(5.0, maxHardwareZoom || 5.0),
+      supportsUltraWide: this.supportsUltraWide,
+      ultraWideMethod: this.ultraWideMethod,
+      ultraWideZoom: this.ultraWideZoom,
+      activeBackLens: this.activeBackLens,
+      activeDeviceId: this.activeDeviceId,
+      activeDeviceLabel: this.activeDeviceLabel,
+      backLenses: formattedLenses,
       supportsPointsOfInterest: Boolean(this.capabilities.pointsOfInterest),
       supportsFocusMode: Array.isArray(this.capabilities.focusMode),
       supportsHardwareExposure: Boolean(this.capabilities.exposureCompensation),
@@ -340,15 +491,212 @@ export class CameraController {
 
   async switchCamera() {
     const nextFacing = this.facingMode === 'environment' ? 'user' : 'environment';
+    this._resetLensState(nextFacing === 'user' ? 'front' : 'wide');
     return this.start({
       facingMode: nextFacing,
       keepOldStreamDuringAcquire: this.platform.isIOS,
     });
   }
 
-  async setZoom(requestedZoom) {
+  async selectBackLens(targetDeviceId, { targetZoom = null } = {}) {
+    if (!targetDeviceId || this.facingMode !== 'environment') {
+      return this.getStreamInfo();
+    }
+    const runSwitch = () => this._performSelectBackLens(targetDeviceId, { targetZoom });
+    const queued = this._lensSwitchPromise
+      ? this._lensSwitchPromise.then(runSwitch, runSwitch)
+      : runSwitch();
+    this._lensSwitchPromise = queued.finally(() => {
+      if (this._lensSwitchPromise === queued) {
+        this._lensSwitchPromise = null;
+      }
+    });
+    return queued;
+  }
+
+  async _performSelectBackLens(targetDeviceId, { targetZoom = null } = {}) {
+    if (
+      this.activeDeviceId === targetDeviceId &&
+      this.track &&
+      this.track.readyState === 'live'
+    ) {
+      if (typeof targetZoom === 'number') {
+        await this._applySplitZoom(targetZoom);
+        this.onStreamInfo?.(this.getStreamInfo());
+      }
+      return this.getStreamInfo();
+    }
+
+    const prevDeviceId = this.activeDeviceId;
+    const savedStandardId = this.standardBackDeviceId;
+    const oldStream = this.stream;
+    const keepOldStreamDuringAcquire = Boolean(this.platform?.isIOS);
+
+    if (!keepOldStreamDuringAcquire) {
+      this.stop({ clearLensCache: false });
+    }
+
+    // Request exact deviceId WITHOUT pairing facingMode to avoid HAL OverconstrainedError on auxiliary lenses
+    const exactAttempts = [
+      {
+        audio: false,
+        video: {
+          deviceId: { exact: targetDeviceId },
+          width: { ideal: 3840 },
+          height: { ideal: 2160 },
+        },
+      },
+      {
+        audio: false,
+        video: {
+          deviceId: { exact: targetDeviceId },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
+      },
+      {
+        audio: false,
+        video: {
+          deviceId: { exact: targetDeviceId },
+        },
+      },
+    ];
+
+    let stream = null;
+    try {
+      try {
+        stream = await this._acquireConstraintsList(exactAttempts);
+        if (keepOldStreamDuringAcquire && oldStream) {
+          this._stopTracks(oldStream);
+        }
+      } catch (err) {
+        if (
+          keepOldStreamDuringAcquire &&
+          oldStream &&
+          err?.name !== 'NotAllowedError' &&
+          err?.name !== 'PermissionDeniedError'
+        ) {
+          this.stop({ clearLensCache: false });
+          stream = await this._acquireConstraintsList(exactAttempts);
+        } else {
+          throw err;
+        }
+      }
+    } catch (err) {
+      if (err?.name !== 'NotAllowedError' && err?.name !== 'PermissionDeniedError') {
+        this.blockedDeviceIds.add(targetDeviceId);
+      }
+      if (!this.stream || !this.track || this.track.readyState === 'ended') {
+        const recoverId =
+          prevDeviceId &&
+          prevDeviceId !== targetDeviceId &&
+          !this.blockedDeviceIds.has(prevDeviceId)
+            ? prevDeviceId
+            : savedStandardId &&
+              savedStandardId !== targetDeviceId &&
+              !this.blockedDeviceIds.has(savedStandardId)
+            ? savedStandardId
+            : null;
+        try {
+          if (recoverId) {
+            const recoverStream = await this._acquireConstraintsList([
+              {
+                audio: false,
+                video: {
+                  deviceId: { exact: recoverId },
+                  width: { ideal: 3840 },
+                  height: { ideal: 2160 },
+                },
+              },
+              {
+                audio: false,
+                video: { deviceId: { exact: recoverId } },
+              },
+            ]);
+            this.facingMode = 'environment';
+            this.stream = recoverStream;
+            this.track = recoverStream.getVideoTracks()[0] || null;
+            const rSettings = this.track?.getSettings?.() || {};
+            this.activeDeviceId = rSettings.deviceId || recoverId;
+            this.activeDeviceLabel = this.track?.label || '';
+            this.video.srcObject = recoverStream;
+            this.video.muted = true;
+            this.video.playsInline = true;
+            await this._waitForVideoReady();
+            this._inspectCapabilities();
+            await this._refreshLensCapabilities({ preserveStandardId: true });
+            if (
+              !this.standardBackDeviceId &&
+              savedStandardId &&
+              !this.blockedDeviceIds.has(savedStandardId)
+            ) {
+              this.standardBackDeviceId = savedStandardId;
+            }
+          } else {
+            await this.start({ facingMode: 'environment' });
+          }
+        } catch {
+          // Leave clean state if recovery also failed
+        }
+      } else {
+        await this._refreshLensCapabilities({ preserveStandardId: true });
+      }
+      this.onStreamInfo?.(this.getStreamInfo());
+      throw err;
+    }
+
+    this.facingMode = 'environment';
+    this.stream = stream;
+    this.track = stream.getVideoTracks()[0] || null;
+    const settings =
+      this.track && typeof this.track.getSettings === 'function'
+        ? this.track.getSettings()
+        : {};
+    this.activeDeviceId = settings.deviceId || targetDeviceId;
+    this.activeDeviceLabel = this.track?.label || '';
+
+    this.video.srcObject = stream;
+    this.video.muted = true;
+    this.video.playsInline = true;
+
+    await this._waitForVideoReady();
+
+    this._inspectCapabilities();
+    await this._refreshLensCapabilities({ preserveStandardId: true });
+    if (
+      !this.standardBackDeviceId &&
+      savedStandardId &&
+      !this.blockedDeviceIds.has(savedStandardId)
+    ) {
+      this.standardBackDeviceId = savedStandardId;
+    }
+
+    if (this.activeDeviceId && this.activeBackLens === 'wide') {
+      writeStoredDeviceId('environment', this.activeDeviceId);
+    }
+
+    this.exposureCompensation = 0;
+    const desiredZoom =
+      typeof targetZoom === 'number' && Number.isFinite(targetZoom)
+        ? targetZoom
+        : this.baseLensScale;
+    await this._applySplitZoom(desiredZoom);
+
+    const info = this.getStreamInfo();
+    if (typeof this.onStreamInfo === 'function') {
+      this.onStreamInfo(info);
+    }
+    return info;
+  }
+
+  async _applySplitZoom(requestedZoom) {
     const maxTotal = Math.max(5.0, this.capabilities?.zoom?.max || 5.0);
-    const result = splitZoom(requestedZoom, this.capabilities?.zoom || null, maxTotal);
+    const result = splitZoom(
+      requestedZoom,
+      this.capabilities?.zoom || null,
+      maxTotal,
+      { baseLensScale: this.baseLensScale }
+    );
     this.targetZoom = result.totalZoom;
     this.hardwareZoom = result.hardwareZoom;
     this.softwareZoom = result.softwareZoom;
@@ -363,19 +711,72 @@ export class CameraController {
           advanced: [{ zoom: result.hardwareZoom }],
         });
       } catch {
-        // Fallback smoothly to software zoom if driver rejects constraint
+        // Fallback safely without ever shrinking preview (< 1.0 software crop)
+        const fallbackSoftware = Number(
+          Math.max(1.0, result.totalZoom / this.baseLensScale).toFixed(4)
+        );
+        const fallbackTotal = Number((this.baseLensScale * fallbackSoftware).toFixed(2));
         this.hardwareZoom = 1.0;
-        this.softwareZoom = result.totalZoom;
+        this.softwareZoom = fallbackSoftware;
+        this.targetZoom = fallbackTotal;
         return {
-          ...result,
           hardwareSupported: false,
           hardwareZoom: 1.0,
-          softwareZoom: result.totalZoom,
+          softwareZoom: fallbackSoftware,
+          totalZoom: fallbackTotal,
         };
       }
     }
 
     return result;
+  }
+
+  async setZoom(requestedZoom) {
+    const req = Number(requestedZoom);
+    const safeReq = Number.isFinite(req) ? req : this.baseLensScale;
+
+    if (this.facingMode === 'environment') {
+      const shouldSwitchToUltraWide =
+        this.ultraWideMethod === 'device-switch' &&
+        Boolean(this.ultraWideDeviceId) &&
+        this.activeBackLens !== 'ultrawide' &&
+        safeReq <= 0.75;
+
+      if (shouldSwitchToUltraWide) {
+        const uwTarget = Math.max(this.ultraWideZoom || 0.5, Math.min(0.9, safeReq));
+        await this.selectBackLens(this.ultraWideDeviceId, { targetZoom: uwTarget });
+        return {
+          hardwareSupported: this.hardwareZoom !== 1.0,
+          hardwareZoom: this.hardwareZoom,
+          softwareZoom: this.softwareZoom,
+          totalZoom: this.targetZoom,
+        };
+      }
+
+      const maxTrackZoom =
+        this.capabilities?.zoom && typeof this.capabilities.zoom.max === 'number'
+          ? this.capabilities.zoom.max
+          : 1.0;
+      const shouldSwitchBackToWide =
+        this.activeBackLens === 'ultrawide' &&
+        Boolean(this.standardBackDeviceId) &&
+        this.standardBackDeviceId !== this.activeDeviceId &&
+        safeReq >= 0.95 &&
+        (this.ultraWideMethod === 'device-switch' || maxTrackZoom < 1.5);
+
+      if (shouldSwitchBackToWide) {
+        const wideTarget = Math.max(1.0, safeReq);
+        await this.selectBackLens(this.standardBackDeviceId, { targetZoom: wideTarget });
+        return {
+          hardwareSupported: this.hardwareZoom !== 1.0,
+          hardwareZoom: this.hardwareZoom,
+          softwareZoom: this.softwareZoom,
+          totalZoom: this.targetZoom,
+        };
+      }
+    }
+
+    return this._applySplitZoom(safeReq);
   }
 
   async focusAt(normalizedX, normalizedY) {
@@ -570,7 +971,7 @@ export class CameraController {
     return createImageBitmap(canvas);
   }
 
-  stop() {
+  stop({ clearLensCache = true } = {}) {
     if (this.stream) {
       for (const track of this.stream.getTracks()) {
         try {
@@ -585,6 +986,12 @@ export class CameraController {
     this.imageCapture = null;
     this.capabilities = {};
     this.photoCapabilities = null;
+    this.activeDeviceId = null;
+    this.activeDeviceLabel = '';
+    this.baseLensScale = 1.0;
+    if (clearLensCache) {
+      this._resetLensState(this.facingMode === 'user' ? 'front' : 'wide');
+    }
     if (this.video) {
       this.video.srcObject = null;
     }

@@ -1066,6 +1066,38 @@ input:focus-visible {
   accent-color: var(--accent-amber);
 }
 
+.sheet-note {
+  margin: -4px 0 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.lens-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.lens-chip {
+  min-height: 34px;
+  padding: 6px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+}
+
+.lens-chip.is-active {
+  background: var(--accent-amber-soft);
+  border-color: rgba(245, 158, 11, 0.55);
+  color: #fde68a;
+  font-weight: 600;
+}
+
 /* OS-specific Camera Permission Guide */
 .permission-guide {
   display: flex;
@@ -1214,13 +1246,21 @@ input:focus-visible {
   }
 
   .zoom-bar {
-    gap: 6px;
+    gap: 5px;
     padding: 4px 8px;
   }
 
+  .zoom-presets {
+    gap: 3px;
+  }
+
   .zoom-preset {
-    min-width: 28px;
+    min-width: 26px;
     padding: 0 6px;
+  }
+
+  .zoom-slider {
+    min-width: 52px;
   }
 }
 
@@ -1286,7 +1326,7 @@ input:focus-visible {
     right: calc(100% + 12px);
     bottom: calc(10px + env(safe-area-inset-bottom));
     flex-direction: row;
-    width: min(300px, calc(100vw - var(--landscape-dock-w) - env(safe-area-inset-right) - env(safe-area-inset-left) - 24px));
+    width: min(340px, calc(100vw - var(--landscape-dock-w) - env(safe-area-inset-right) - env(safe-area-inset-left) - 24px));
     padding: 3px 10px;
     border-radius: 999px;
     gap: 6px;

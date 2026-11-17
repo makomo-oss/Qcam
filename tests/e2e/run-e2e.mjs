@@ -195,7 +195,9 @@ async function main() {
     }
 
     console.log('[e2e] checking zoom and WebGL orientation');
-    // 6. Verify Zoom preset (2x)
+    // 6. Verify 0.5x button stays hidden when hardware does not advertise ultra-wide, and Zoom preset (2x) works
+    assert.equal(await page.locator('#btn-zoom-05').isVisible(), false);
+    assert.equal(await page.evaluate(() => window.__QCAM__.ui.state.minZoom), 1);
     await page.click('.zoom-preset[data-zoom="2"]');
     assert.equal(await page.textContent('#zoom-readout'), '2.0×');
     await page.click('.zoom-preset[data-zoom="1"]');
@@ -372,6 +374,7 @@ async function main() {
     const diagText = await page.textContent('#diagnostics-list');
     assert.ok(diagText.includes('WebGL') || diagText.includes('worker') || diagText.includes('canvas'));
     assert.ok(diagText.includes('カメラ権限状態'));
+    assert.ok(diagText.includes('超広角 (0.5×) カメラ') && diagText.includes('非対応'));
     const guideText = await page.textContent('#permission-guide');
     assert.ok(guideText.includes('iOS Safari') && guideText.includes('Android'));
     if (screenshotDir) {
@@ -628,6 +631,339 @@ async function main() {
     assert.ok(iosGuideText.includes('設定') && iosGuideText.includes('Safari') && iosGuideText.includes('許可'));
     await iosContext.close();
 
+    // 20. Android Chrome 0.5x hardware zoom simulation (capabilities.zoom.min = 0.5) & compact layout check
+    console.log('[e2e] checking Android 0.5x hardware zoom & compact 360x640 / landscape layout');
+    const androidUwContext = await browser.newContext({
+      viewport: { width: 360, height: 640 },
+      hasTouch: true,
+      isMobile: true,
+      acceptDownloads: true,
+      userAgent:
+        'Mozilla/5.0 (Linux; Android 15; SC-51E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36',
+      permissions: ['camera'],
+    });
+    const androidUwPage = await androidUwContext.newPage();
+    androidUwPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(`[android-uw] ${msg.text()}`);
+    });
+    androidUwPage.on('pageerror', (err) => {
+      pageErrors.push(`[android-uw] ${err.message}`);
+    });
+    await androidUwPage.addInitScript(() => {
+      window.__APPLIED_CONSTRAINTS__ = [];
+      const devicesList = [
+        {
+          kind: 'videoinput',
+          deviceId: 'android-back-0',
+          groupId: 'g-back',
+          label: 'camera2 0, facing back',
+          toJSON() { return this; },
+          getCapabilities: () => ({
+            facingMode: ['environment'],
+            zoom: { min: 0.5, max: 6.0, step: 0.1 },
+            width: { min: 320, max: 1920 },
+            height: { min: 240, max: 1080 },
+          }),
+        },
+        {
+          kind: 'videoinput',
+          deviceId: 'android-front-1',
+          groupId: 'g-front',
+          label: 'camera2 1, facing front',
+          toJSON() { return this; },
+          getCapabilities: () => ({
+            facingMode: ['user'],
+            width: { min: 320, max: 1920 },
+            height: { min: 240, max: 1080 },
+          }),
+        },
+      ];
+
+      navigator.mediaDevices.enumerateDevices = async () => devicesList;
+      navigator.mediaDevices.getUserMedia = async (constraints) => {
+        const v = constraints?.video || {};
+        const reqFacing = typeof v === 'object' ? (v.facingMode?.ideal || v.facingMode || 'environment') : 'environment';
+        const isFront = reqFacing === 'user';
+        const deviceId = isFront ? 'android-front-1' : 'android-back-0';
+        const canvas = document.createElement('canvas');
+        canvas.width = 1280;
+        canvas.height = 720;
+        const ctx = canvas.getContext('2d');
+        let tick = 0;
+        const paint = () => {
+          tick += 1;
+          ctx.fillStyle = isFront ? '#122233' : '#182418';
+          ctx.fillRect(0, 0, 1280, 720);
+          ctx.fillStyle = '#f59e0b';
+          ctx.fillRect(40 + (tick % 10), 40, 220, 90);
+        };
+        paint();
+        const iv = setInterval(paint, 120);
+        const stream = canvas.captureStream(15);
+        const track = stream.getVideoTracks()[0];
+        const origStop = track.stop.bind(track);
+        track.stop = () => {
+          clearInterval(iv);
+          return origStop();
+        };
+        track.getSettings = () => ({
+          deviceId,
+          facingMode: isFront ? 'user' : 'environment',
+          width: 1280,
+          height: 720,
+          frameRate: 30,
+        });
+        track.getCapabilities = () =>
+          isFront
+            ? { facingMode: ['user'], width: { min: 320, max: 1920 }, height: { min: 240, max: 1080 } }
+            : {
+                facingMode: ['environment'],
+                zoom: { min: 0.5, max: 6.0, step: 0.1 },
+                width: { min: 320, max: 1920 },
+                height: { min: 240, max: 1080 },
+              };
+        track.applyConstraints = async (c) => {
+          window.__APPLIED_CONSTRAINTS__.push(c);
+        };
+        return stream;
+      };
+    });
+
+    await androidUwPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await androidUwPage.waitForFunction(() => {
+      const v = document.getElementById('camera-video');
+      return v && v.videoWidth > 0 && v.videoHeight > 0;
+    }, { timeout: 6000 });
+
+    assert.equal(await androidUwPage.locator('#btn-zoom-05').isVisible(), true);
+    assert.equal((await androidUwPage.textContent('#btn-zoom-05')).trim(), '0.5×');
+
+    const uwCompactOverflow = await androidUwPage.evaluate(() => {
+      const zb = document.querySelector('.zoom-bar');
+      const sl = document.getElementById('zoom-slider').getBoundingClientRect();
+      const zbr = zb.getBoundingClientRect();
+      return {
+        scrollW: zb.scrollWidth,
+        clientW: zb.clientWidth,
+        sliderRight: sl.right,
+        barRight: zbr.right,
+      };
+    });
+    assert.ok(
+      uwCompactOverflow.scrollW <= uwCompactOverflow.clientW + 1,
+      `0.5x zoom bar overflowed 360px: ${JSON.stringify(uwCompactOverflow)}`
+    );
+
+    await androidUwPage.click('#btn-zoom-05');
+    await androidUwPage.waitForFunction(
+      () => Math.abs(window.__QCAM__.camera.targetZoom - 0.5) < 0.01
+    );
+    assert.equal(await androidUwPage.textContent('#zoom-readout'), '0.5×');
+    const hwUwState = await androidUwPage.evaluate(() => ({
+      softwareZoom: window.__QCAM__.camera.softwareZoom,
+      hardwareZoom: window.__QCAM__.camera.hardwareZoom,
+      constraints: window.__APPLIED_CONSTRAINTS__,
+      transform: document.getElementById('camera-video').style.transform,
+      uwActive: document.getElementById('btn-zoom-05').classList.contains('is-active'),
+      wideActive: document.querySelector('.zoom-preset[data-zoom="1"]').classList.contains('is-active'),
+    }));
+    assert.equal(hwUwState.softwareZoom, 1);
+    assert.equal(hwUwState.hardwareZoom, 0.5);
+    assert.equal(hwUwState.transform, 'scale(1, 1)');
+    assert.equal(hwUwState.uwActive, true);
+    assert.equal(hwUwState.wideActive, false);
+    assert.ok(
+      hwUwState.constraints.some((c) => c?.advanced?.[0]?.zoom === 0.5),
+      `Expected hardware zoom 0.5 constraint, got ${JSON.stringify(hwUwState.constraints)}`
+    );
+    if (screenshotDir) {
+      await androidUwPage.waitForTimeout(200);
+      await androidUwPage.screenshot({ path: path.join(screenshotDir, 'e2e_ultrawide_360x640.png') });
+    }
+
+    const uwDlPromise = androidUwPage.waitForEvent('download', { timeout: 6000 });
+    await androidUwPage.click('#btn-shutter');
+    const uwDl = await uwDlPromise;
+    assert.ok(uwDl.suggestedFilename().endsWith('.jpg'));
+
+    // Check 844x390 landscape with 0.5x visible
+    await androidUwPage.setViewportSize({ width: 844, height: 390 });
+    await androidUwPage.waitForTimeout(160);
+    const uwLandStats = await androidUwPage.evaluate(() => {
+      const zb = document.querySelector('.zoom-bar');
+      const zbr = zb.getBoundingClientRect();
+      const dock = document.querySelector('.bottom-dock').getBoundingClientRect();
+      return {
+        scrollW: zb.scrollWidth,
+        clientW: zb.clientWidth,
+        zbRight: zbr.right,
+        dockLeft: dock.left,
+      };
+    });
+    assert.ok(uwLandStats.scrollW <= uwLandStats.clientW + 1);
+    assert.ok(uwLandStats.zbRight <= uwLandStats.dockLeft + 1);
+    if (screenshotDir) {
+      await androidUwPage.screenshot({ path: path.join(screenshotDir, 'e2e_ultrawide_landscape.png') });
+    }
+
+    // Switch to front camera -> 0.5x must hide cleanly; switch back -> reappears
+    await androidUwPage.click('#btn-switch-camera');
+    await androidUwPage.waitForFunction(
+      () => !window.__QCAM__.isSwitchingCamera && window.__QCAM__.streamInfo?.facingMode === 'user'
+    );
+    assert.equal(await androidUwPage.locator('#btn-zoom-05').isVisible(), false);
+    assert.equal(await androidUwPage.evaluate(() => window.__QCAM__.ui.state.minZoom), 1);
+
+    await androidUwPage.click('#btn-switch-camera');
+    await androidUwPage.waitForFunction(
+      () => !window.__QCAM__.isSwitchingCamera && window.__QCAM__.streamInfo?.facingMode === 'environment'
+    );
+    assert.equal(await androidUwPage.locator('#btn-zoom-05').isVisible(), true);
+
+    await androidUwPage.click('#btn-info');
+    await androidUwPage.waitForSelector('#info-modal:not([hidden])');
+    const hwDiag = await androidUwPage.textContent('#diagnostics-list');
+    assert.ok(hwDiag.includes('光学ズーム倍率制御'));
+    await androidUwContext.close();
+
+    // 21. iPhone Safari multi-lens enumeration ("背面超広角カメラ") -> 0.5x switch & persistence guard
+    console.log('[e2e] checking iPhone Safari enumerateDevices 0.5x ultra-wide switch & rollback');
+    const iosUwContext = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+      userAgent:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1',
+      permissions: ['camera'],
+    });
+    const iosUwPage = await iosUwContext.newPage();
+    iosUwPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(`[ios-uw] ${msg.text()}`);
+    });
+    iosUwPage.on('pageerror', (err) => {
+      pageErrors.push(`[ios-uw] ${err.message}`);
+    });
+    await iosUwPage.addInitScript(() => {
+      window.__GUM_CALLS__ = [];
+      navigator.canShare = (d) => Array.isArray(d?.files) && d.files.length === 1;
+      navigator.share = async () => {};
+
+      const iosDevices = [
+        { kind: 'videoinput', deviceId: 'ios-front', groupId: 'f1', label: '前面カメラ', toJSON() { return this; } },
+        { kind: 'videoinput', deviceId: 'ios-front-uw', groupId: 'f2', label: 'Front Ultra Wide Camera', toJSON() { return this; } },
+        { kind: 'videoinput', deviceId: 'ios-desk', groupId: 'f3', label: 'デスクビューカメラ', toJSON() { return this; } },
+        { kind: 'videoinput', deviceId: 'ios-back-std', groupId: 'b1', label: '背面カメラ', toJSON() { return this; } },
+        { kind: 'videoinput', deviceId: 'ios-back-uw', groupId: 'b2', label: '背面超広角カメラ', toJSON() { return this; } },
+        { kind: 'videoinput', deviceId: 'ios-back-triple', groupId: 'b3', label: '背面トリプルカメラ', toJSON() { return this; } },
+      ];
+
+      navigator.mediaDevices.enumerateDevices = async () => iosDevices;
+      navigator.mediaDevices.getUserMedia = async (constraints) => {
+        const v = constraints?.video || {};
+        window.__GUM_CALLS__.push(JSON.parse(JSON.stringify(v)));
+        const exactId = typeof v === 'object' ? (v.deviceId?.exact || v.deviceId?.ideal) : null;
+        const reqFacing = typeof v === 'object' ? (v.facingMode?.ideal || v.facingMode) : null;
+
+        let chosen = iosDevices.find((d) => d.deviceId === exactId);
+        if (!chosen) {
+          chosen = reqFacing === 'user' ? iosDevices[0] : iosDevices[3]; // ios-back-std by default
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = 1280;
+        canvas.height = 960;
+        const ctx = canvas.getContext('2d');
+        const paint = () => {
+          ctx.fillStyle = chosen.deviceId === 'ios-back-uw' ? '#0f2d2e' : '#1b1d29';
+          ctx.fillRect(0, 0, 1280, 960);
+          ctx.fillStyle = '#38bdf8';
+          ctx.fillRect(80, 80, 180, 180);
+        };
+        paint();
+        const iv = setInterval(paint, 120);
+        const stream = canvas.captureStream(15);
+        const track = stream.getVideoTracks()[0];
+        const origStop = track.stop.bind(track);
+        track.stop = () => {
+          clearInterval(iv);
+          return origStop();
+        };
+        Object.defineProperty(track, 'label', { configurable: true, get: () => chosen.label });
+        track.getSettings = () => ({
+          deviceId: chosen.deviceId,
+          facingMode: chosen.deviceId.startsWith('ios-front') ? 'user' : 'environment',
+          width: 1280,
+          height: 960,
+          frameRate: 30,
+        });
+        // iOS Safari omits track.getCapabilities().zoom
+        track.getCapabilities = () => ({
+          facingMode: [chosen.deviceId.startsWith('ios-front') ? 'user' : 'environment'],
+          width: { min: 320, max: 1920 },
+          height: { min: 240, max: 1440 },
+        });
+        return stream;
+      };
+    });
+
+    await iosUwPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await iosUwPage.waitForFunction(() => {
+      const v = document.getElementById('camera-video');
+      return v && v.videoWidth > 0 && v.videoHeight > 0 && window.__QCAM__.streamInfo?.activeDeviceId === 'ios-back-std';
+    }, { timeout: 6000 });
+
+    assert.equal(await iosUwPage.locator('#btn-zoom-05').isVisible(), true);
+    assert.equal(await iosUwPage.evaluate(() => window.__QCAM__.camera.activeDeviceId), 'ios-back-std');
+
+    // Click 0.5x preset -> switches strictly via deviceId: { exact: 'ios-back-uw' } without facingMode
+    await iosUwPage.click('#btn-zoom-05');
+    await iosUwPage.waitForFunction(
+      () =>
+        window.__QCAM__.streamInfo?.activeDeviceId === 'ios-back-uw' &&
+        Math.abs(window.__QCAM__.camera.targetZoom - 0.5) < 0.01
+    );
+    assert.equal(await iosUwPage.textContent('#zoom-readout'), '0.5×');
+    assert.equal(await iosUwPage.evaluate(() => window.__QCAM__.camera.softwareZoom), 1);
+
+    const uwGumCall = await iosUwPage.evaluate(() =>
+      window.__GUM_CALLS__.find((c) => c?.deviceId?.exact === 'ios-back-uw')
+    );
+    assert.ok(uwGumCall, 'Expected exact deviceId call for ios-back-uw');
+    assert.equal(uwGumCall.facingMode, undefined, 'Exact lens switch must not pair facingMode');
+
+    // Persisted standard environment ID must NOT be overwritten by ios-back-uw
+    const storedMap = await iosUwPage.evaluate(() =>
+      JSON.parse(localStorage.getItem('qcam_device_ids_v1') || '{}')
+    );
+    assert.equal(storedMap.environment, 'ios-back-std');
+
+    // Manual back lens list inside #info-modal excludes Front Ultra Wide and Desk View
+    await iosUwPage.click('#btn-info');
+    await iosUwPage.waitForSelector('#back-lens-section:not([hidden])');
+    const chipTexts = await iosUwPage.locator('#back-lens-options .lens-chip').allTextContents();
+    assert.equal(chipTexts.length, 3);
+    assert.ok(chipTexts.some((t) => t.includes('超広角 (0.5×)')));
+    assert.ok(!chipTexts.some((t) => t.includes('Front') || t.includes('デスク')));
+    await iosUwPage.click('#btn-info-close');
+
+    // Clicking 2x while on 0.5x switches cleanly back to standard lens ('ios-back-std') then zooms to 2.0x
+    await iosUwPage.click('.zoom-preset[data-zoom="2"]');
+    await iosUwPage.waitForFunction(
+      () =>
+        window.__QCAM__.streamInfo?.activeDeviceId === 'ios-back-std' &&
+        Math.abs(window.__QCAM__.camera.targetZoom - 2.0) < 0.01
+    );
+    assert.equal(await iosUwPage.textContent('#zoom-readout'), '2.0×');
+    assert.equal(await iosUwPage.evaluate(() => window.__QCAM__.camera.softwareZoom), 2);
+
+    // Reload comes back on 1.0x standard lens cleanly
+    await iosUwPage.reload({ waitUntil: 'domcontentloaded', timeout: 10000 });
+    await iosUwPage.waitForFunction(
+      () => window.__QCAM__.streamInfo?.activeDeviceId === 'ios-back-std'
+    );
+    assert.equal(await iosUwPage.textContent('#zoom-readout'), '1.0×');
+    await iosUwContext.close();
+
     assert.deepEqual(consoleErrors, [], `Console errors encountered: ${consoleErrors.join('; ')}`);
     assert.deepEqual(pageErrors, [], `Page errors encountered: ${pageErrors.join('; ')}`);
 
@@ -639,6 +975,8 @@ async function main() {
       compactStats,
       pwa: pwaStatus,
       iosShareCalls: 3,
+      ultraWideHardware05x: true,
+      ultraWideDeviceSwitch05x: true,
     }, null, 2));
   } finally {
     await browser.close();
