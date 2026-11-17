@@ -1,0 +1,90 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  computeAspectCrop,
+  splitZoom,
+  mapTapToNormalizedPoint,
+} from '../../src/utils/geometry.js';
+
+test('computeAspectCrop crops 16:9 landscape source to 4:3 cleanly', () => {
+  const crop = computeAspectCrop(3840, 2160, '4:3', 1.0);
+  assert.equal(crop.sw, 2880);
+  assert.equal(crop.sh, 2160);
+  assert.equal(crop.sx, 480);
+  assert.equal(crop.sy, 0);
+  assert.equal(crop.outWidth, 2880);
+  assert.equal(crop.outHeight, 2160);
+});
+
+test('computeAspectCrop handles portrait orientation for 4:3 (3:4) and 16:9 (9:16)', () => {
+  const crop43 = computeAspectCrop(2160, 3840, '4:3', 1.0);
+  assert.equal(crop43.sw, 2160);
+  assert.equal(crop43.sh, 2880);
+  assert.equal(crop43.sx, 0);
+  assert.equal(crop43.sy, 480);
+
+  const crop169 = computeAspectCrop(2160, 3840, '16:9', 1.0);
+  assert.equal(crop169.sw, 2160);
+  assert.equal(crop169.sh, 3840);
+  assert.equal(crop169.sx, 0);
+  assert.equal(crop169.sy, 0);
+});
+
+test('computeAspectCrop applies software digital zoom centered and keeps output dimensions', () => {
+  const crop = computeAspectCrop(3840, 2160, '16:9', 2.0);
+  assert.equal(crop.sw, 1920);
+  assert.equal(crop.sh, 1080);
+  assert.equal(crop.sx, 960);
+  assert.equal(crop.sy, 540);
+  assert.equal(crop.outWidth, 3840);
+  assert.equal(crop.outHeight, 2160);
+});
+
+test('computeAspectCrop clamps output size to maxDimension', () => {
+  const crop = computeAspectCrop(8000, 6000, '4:3', 1.0, 4096);
+  assert.equal(crop.outWidth, 4096);
+  assert.equal(crop.outHeight, 3072);
+});
+
+test('splitZoom avoids double-zooming when hardware zoom is available', () => {
+  const res1 = splitZoom(2.5, { min: 1, max: 4, step: 0.1 }, 5);
+  assert.equal(res1.hardwareSupported, true);
+  assert.equal(res1.hardwareZoom, 2.5);
+  assert.equal(res1.softwareZoom, 1);
+
+  const res2 = splitZoom(5.0, { min: 1, max: 4, step: 0.1 }, 5);
+  assert.equal(res2.hardwareSupported, true);
+  assert.equal(res2.hardwareZoom, 4);
+  assert.equal(res2.softwareZoom, 1.25);
+
+  const res3 = splitZoom(3.0, null, 5);
+  assert.equal(res3.hardwareSupported, false);
+  assert.equal(res3.hardwareZoom, 1);
+  assert.equal(res3.softwareZoom, 3);
+});
+
+test('mapTapToNormalizedPoint handles center tap, mirroring, and software zoom', () => {
+  const rect = { left: 0, top: 0, width: 300, height: 400 };
+  // 16:9 landscape frame inside 3:4 portrait container -> width is cropped by object-fit: cover
+  const center = mapTapToNormalizedPoint(150, 200, rect, 1920, 1080, {
+    mirrored: false,
+    softwareZoom: 1,
+  });
+  assert.equal(center.x, 0.5);
+  assert.equal(center.y, 0.5);
+
+  // Tap near right edge when mirrored should map to left side (< 0.5)
+  const rightMirrored = mapTapToNormalizedPoint(270, 200, rect, 1200, 1600, {
+    mirrored: true,
+    softwareZoom: 1,
+  });
+  assert.ok(rightMirrored.x < 0.2);
+  assert.equal(rightMirrored.y, 0.5);
+
+  // Software zoom 2x compresses mapped range around center
+  const zoomedEdge = mapTapToNormalizedPoint(300, 200, rect, 1200, 1600, {
+    mirrored: false,
+    softwareZoom: 2,
+  });
+  assert.equal(zoomedEdge.x, 0.75);
+});
