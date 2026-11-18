@@ -32,11 +32,19 @@ test('resolveOutputFormat defaults to avif and honors explicit jpeg', () => {
   assert.equal(resolveOutputFormat('jpeg'), 'jpeg');
 });
 
-test('normalizeAvifOptions applies Qcam defaults and clamps quality/speed', () => {
+test('normalizeAvifOptions applies Qcam Pro SharpYUV defaults and clamps quality/speed', () => {
+  assert.equal(AVIF_DEFAULT_OPTIONS.quality, 86);
+  assert.equal(AVIF_DEFAULT_OPTIONS.speed, 8);
+  assert.equal(AVIF_DEFAULT_OPTIONS.subsample, 1);
+  assert.equal(AVIF_DEFAULT_OPTIONS.enableSharpYUV, true);
+  assert.equal(AVIF_DEFAULT_OPTIONS.chromaDeltaQ, true);
+
   const defaults = normalizeAvifOptions();
   assert.equal(defaults.quality, AVIF_DEFAULT_OPTIONS.quality);
   assert.equal(defaults.speed, AVIF_DEFAULT_OPTIONS.speed);
   assert.equal(defaults.subsample, 1);
+  assert.equal(defaults.enableSharpYUV, true);
+  assert.equal(defaults.chromaDeltaQ, true);
 
   const clamped = normalizeAvifOptions({ quality: 250, speed: -4 });
   assert.equal(clamped.quality, 100);

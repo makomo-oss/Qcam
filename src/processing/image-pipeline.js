@@ -5,10 +5,13 @@ import {
 } from '../utils/resolution.js';
 import { WebGLImageProcessor } from './webgl-processor.js';
 import {
+  COLOR_PROFILES,
   STABILIZATION_MODES,
   alignBitmapBurst,
   applyStabilizedInsetToCrop,
+  computeProDevelopProfile,
   drawAlignedFrameToCanvas,
+  normalizeColorProfile,
   normalizeStabilizationMode,
   summarizeAlignmentPlan,
 } from './frame-aligner.js';
@@ -24,7 +27,7 @@ import {
   warmupAvifEncoder,
 } from './avif-encoder.js';
 
-const JPEG_QUALITY = 0.95;
+const JPEG_QUALITY = 0.96;
 
 /**
  * Coordinates image processing across Web Worker (preferred) and main-thread WebGL / Canvas2D fallback.
@@ -178,6 +181,9 @@ export class ImagePipeline {
   }) {
     if (format === 'jpeg') {
       const blob = await canvasToEncodedBlob(canvas, JPEG_MIME_TYPE, jpegQuality);
+      if (webgl) {
+        webgl.releaseWorkingBuffers();
+      }
       if (canvas) {
         canvas.width = 1;
         canvas.height = 1;
@@ -197,6 +203,9 @@ export class ImagePipeline {
       if (blob && blob.type === AVIF_MIME_TYPE && blob.size >= 16) {
         const header = await blob.slice(0, 64).arrayBuffer();
         if (isValidAvifBytes(header)) {
+          if (webgl) {
+            webgl.releaseWorkingBuffers();
+          }
           if (canvas) {
             canvas.width = 1;
             canvas.height = 1;
@@ -216,6 +225,7 @@ export class ImagePipeline {
     let rgbaPixels;
     if (webgl) {
       rgbaPixels = webgl.readRgbaTopDown().data;
+      webgl.releaseWorkingBuffers();
       webgl.canvas.width = 1;
       webgl.canvas.height = 1;
     } else {
@@ -252,12 +262,14 @@ export class ImagePipeline {
     outputMegapixels = 'max',
     maxDimension = null,
     stabilizationMode = STABILIZATION_MODES.HIGH,
+    colorProfile = COLOR_PROFILES.NATURAL,
     jpegQuality = JPEG_QUALITY,
     avifQuality = AVIF_DEFAULT_OPTIONS.quality,
   }) {
     const startTs = performance.now();
     const format = resolveOutputFormat(outputFormat);
     const safeStabMode = normalizeStabilizationMode(stabilizationMode);
+    const safeColorProfile = normalizeColorProfile(colorProfile);
 
     if (!frames.length) {
       throw new Error('処理するフレームがありません。');
@@ -285,6 +297,7 @@ export class ImagePipeline {
               outputMegapixels,
               maxDimension,
               stabilizationMode: safeStabMode,
+              colorProfile: safeColorProfile,
               jpegQuality,
               avifQuality,
             },
@@ -318,6 +331,10 @@ export class ImagePipeline {
               outputMegapixels,
               maxDimension,
               stabilizationMode: safeStabMode,
+              colorProfile: result.colorProfile || safeColorProfile,
+              sceneStats: result.sceneStats || null,
+              preMergedCoverage:
+                typeof result.preMergedCoverage === 'number' ? result.preMergedCoverage : -1.0,
               jpegQuality,
               avifQuality,
               preCropped: true,
@@ -352,6 +369,7 @@ export class ImagePipeline {
         outputMegapixels,
         maxDimension,
         stabilizationMode: safeStabMode,
+        colorProfile: safeColorProfile,
         jpegQuality,
         avifQuality,
         preCropped: false,
@@ -382,12 +400,16 @@ export class ImagePipeline {
     outputMegapixels = 'max',
     maxDimension = null,
     stabilizationMode = STABILIZATION_MODES.HIGH,
+    colorProfile = COLOR_PROFILES.NATURAL,
+    sceneStats = null,
+    preMergedCoverage = -1.0,
     jpegQuality = JPEG_QUALITY,
     avifQuality = AVIF_DEFAULT_OPTIONS.quality,
     preCropped,
     enginePrefix,
   }) {
     const safeStabMode = normalizeStabilizationMode(stabilizationMode);
+    const safeColorProfile = normalizeColorProfile(colorProfile);
     const srcW = frames[0].width;
     const srcH = frames[0].height;
     const format = resolveOutputFormat(outputFormat);
@@ -417,17 +439,18 @@ export class ImagePipeline {
     let alignmentPlan = null;
     let stabilizationInfo = null;
 
-    if (!preCropped && mode === 'hq' && frames.length > 1) {
+    if (!preCropped) {
       alignmentPlan = alignBitmapBurst({
         frames,
         stabilizationMode: safeStabMode,
+        colorProfile: safeColorProfile,
         createCanvas: (w, h) => {
           const c = document.createElement('canvas');
           c.width = w;
           c.height = h;
           return c;
         },
-        maxFrames: 4,
+        maxFrames: mode === 'hq' ? 4 : 1,
       });
       workingFrames = alignmentPlan.selectedIndices.map((idx) => frames[idx]);
       const adoptedSet = new Set(alignmentPlan.selectedIndices);
@@ -440,8 +463,21 @@ export class ImagePipeline {
           }
         }
       }
-      stabilizationInfo = summarizeAlignmentPlan(alignmentPlan, frames.length, safeStabMode);
+      if (mode === 'hq' && frames.length > 1) {
+        stabilizationInfo = summarizeAlignmentPlan(alignmentPlan, frames.length, safeStabMode);
+      }
     }
+
+    const mergedEstimate =
+      preMergedCoverage > 0.15 ? Math.max(2, Math.round(1 + preMergedCoverage * 3)) : workingFrames.length;
+    const developProfile =
+      alignmentPlan?.developProfile ||
+      computeProDevelopProfile(alignmentPlan?.sceneStats || sceneStats || null, {
+        frameCount: preMergedCoverage > 0 ? 4 : workingFrames.length,
+        mergedCount: mergedEstimate,
+        stabilizationMode: safeStabMode,
+        colorProfile: safeColorProfile,
+      });
 
     if (webgl) {
       const baseCrop = preCropped
@@ -511,8 +547,8 @@ export class ImagePipeline {
           mirrorX: applyMirrorInShader,
           exposureEv,
           frameAlignments,
-          patchTol2: safeStabMode === STABILIZATION_MODES.OFF ? 0.0085 : 0.0018,
-          sharpen: safeStabMode === STABILIZATION_MODES.HIGH ? 0.62 : 0.54,
+          developProfile,
+          preMergedCoverage,
         });
       } else {
         webgl.processStandard(gpuSources[0], {
@@ -521,6 +557,7 @@ export class ImagePipeline {
           cropNorm,
           mirrorX: applyMirrorInShader,
           exposureEv,
+          developProfile,
         });
       }
 
@@ -544,7 +581,7 @@ export class ImagePipeline {
         height: crop.outHeight,
         avifQuality,
         jpegQuality,
-        engineBase: enginePrefix || 'main-webgl',
+        engineBase: enginePrefix || 'main-WebGL-pro',
       });
 
       return {

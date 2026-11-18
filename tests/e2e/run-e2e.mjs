@@ -478,17 +478,19 @@ async function main() {
     await page.click('#btn-timer');
     await page.click('#btn-timer');
 
-    // 13. Open Settings / Info Sheet, verify AVIF/HDR/EIS diagnostics, quality controls & version, test JPEG & EIS switches, then switch back to AVIF
+    // 13. Open Settings / Info Sheet, verify AVIF/HDR/EIS/Look diagnostics, quality controls & version, test JPEG, Look & EIS switches, then switch back to AVIF
     assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 強');
     await page.click('#btn-info');
     await page.waitForSelector('#info-modal:not([hidden])');
     assert.equal(await page.getAttribute('#btn-format-avif', 'aria-checked'), 'true');
     assert.equal(await page.getAttribute('#btn-stab-high', 'aria-checked'), 'true');
+    assert.equal(await page.getAttribute('#btn-look-natural', 'aria-checked'), 'true');
     assert.ok((await page.locator('#resolution-options .lens-chip').count()) >= 1);
     assert.ok((await page.locator('#megapixels-options .lens-chip').count()) >= 1);
     const diagText = await page.textContent('#diagnostics-list');
-    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.6.0'));
+    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.7.0'));
     assert.ok(diagText.includes('撮影画質モード') && diagText.includes('高画質 HDR (常時有効)'));
+    assert.ok(diagText.includes('仕上がりトーン') && diagText.includes('Pro ナチュラル'));
     assert.ok(diagText.includes('手ぶれ補正モード') && diagText.includes('高品質 (強'));
     assert.ok(diagText.includes('直近のブレ補正') && diagText.includes('採用'));
     assert.ok(diagText.includes('解像度設定 / 上限'));
@@ -505,7 +507,9 @@ async function main() {
       await page.screenshot({ path: path.join(screenshotDir, 'e2e_info_sheet.png') });
     }
 
-    // Toggle stabilization to 'standard' inside Info Sheet and verify top pill updates
+    // Select 'vivid' Look profile and toggle stabilization to 'standard' inside Info Sheet
+    await page.click('#btn-look-vivid');
+    assert.equal(await page.getAttribute('#btn-look-vivid', 'aria-checked'), 'true');
     await page.click('#btn-stab-standard');
     assert.equal(await page.getAttribute('#btn-stab-standard', 'aria-checked'), 'true');
     assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 標準');
@@ -558,7 +562,7 @@ async function main() {
       'Transient visibilitychange must keep active camera stream alive without re-prompting'
     );
 
-    // 16. Verify persisted settings (16:9, grid ON, HDR always on, EIS standard, user facing) survive page reload cleanly
+    // 16. Verify persisted settings (16:9, grid ON, HDR always on, Look vivid, EIS standard, user facing) survive page reload cleanly
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 10000 });
     await page.waitForFunction(() => {
       const v = document.getElementById('camera-video');
@@ -567,6 +571,7 @@ async function main() {
     assert.equal(await page.textContent('#aspect-label'), '16:9');
     assert.equal(await page.getAttribute('#btn-grid', 'aria-pressed'), 'true');
     assert.equal(await page.evaluate(() => window.__QCAM__.settings.mode), 'hq');
+    assert.equal(await page.evaluate(() => window.__QCAM__.settings.colorProfile), 'vivid');
     assert.equal(await page.evaluate(() => window.__QCAM__.settings.stabilization), 'standard');
     assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 標準');
     assert.equal(await page.evaluate(() => window.__QCAM__.camera.facingMode), 'user');
@@ -771,7 +776,7 @@ async function main() {
 
     // Direct capture triggers Web Share immediately with strictly { files: [...] } and _HDR.avif / image/avif
     await iosPage.click('#btn-shutter');
-    await iosPage.waitForFunction(() => window.__SHARE_CALLS__.length === 1, { timeout: 10000 });
+    await iosPage.waitForFunction(() => window.__SHARE_CALLS__.length === 1, null, { timeout: 20000 });
     const firstShareCall = await iosPage.evaluate(() => window.__SHARE_CALLS__[0]);
     assert.deepEqual(firstShareCall.keys, ['files']);
     assert.ok(firstShareCall.fileName.includes('_HDR.avif'), `Expected _HDR.avif filename, got ${firstShareCall.fileName}`);
@@ -779,12 +784,12 @@ async function main() {
     assert.equal(await iosPage.locator('#preview-modal').isVisible(), false);
 
     // Simulate NotAllowedError on next capture (e.g., slow burst) -> Preview Modal opens automatically with visible toast & direct .avif DL
-    await iosPage.waitForFunction(() => !window.__QCAM__.isCapturing, { timeout: 6000 });
+    await iosPage.waitForFunction(() => !window.__QCAM__.isCapturing, null, { timeout: 10000 });
     await iosPage.evaluate(() => {
       window.__SHARE_MODE__ = 'expire';
     });
     await iosPage.click('#btn-shutter');
-    await iosPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 10000 });
+    await iosPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 20000 });
     assert.ok(
       (await iosPage.textContent('#btn-modal-save')).includes('AVIF') ||
         (await iosPage.textContent('#btn-modal-save')).includes('.avif'),
@@ -1946,6 +1951,420 @@ async function main() {
 
     await stabContext.close();
 
+    // 25. Pro ISP 2.0 Computational Photography E2E Test:
+    // Verifies 5-pass linear HDR pipeline: low-light 4-frame denoising with sharp edge preservation,
+    // halo-free backlit Local HDR + AgX highlight rolloff, smooth gradient ramp, 3-Look tone/color differentiation,
+    // and RGBA8 packed HDR shader fallback (`forcePackedHdr: true`).
+    console.log('[e2e] checking Pro ISP 2.0 linear HDR, burst denoise, Look profiles & packed HDR fallback');
+    const proIspContext = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+      permissions: ['camera'],
+    });
+    const proIspPage = await proIspContext.newPage();
+    proIspPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(`[pro-isp] ${msg.text()}`);
+    });
+    proIspPage.on('pageerror', (err) => {
+      pageErrors.push(`[pro-isp] ${err.message}`);
+    });
+    await proIspPage.addInitScript(() => {
+      navigator.mediaDevices.enumerateDevices = async () => [
+        {
+          kind: 'videoinput',
+          deviceId: 'pro-isp-cam',
+          groupId: 'g-pro',
+          label: 'Pro Camera',
+          toJSON() { return this; },
+        },
+      ];
+      navigator.mediaDevices.getUserMedia = async () => {
+        const c = document.createElement('canvas');
+        c.width = 320;
+        c.height = 240;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#1f2937';
+        ctx.fillRect(0, 0, 320, 240);
+        const stream = c.captureStream(5);
+        const track = stream.getVideoTracks()[0];
+        track.getSettings = () => ({ deviceId: 'pro-isp-cam', facingMode: 'environment', width: 320, height: 240 });
+        track.getCapabilities = () => ({ facingMode: ['environment'], width: { min: 320, max: 320 }, height: { min: 240, max: 240 } });
+        return stream;
+      };
+    });
+    await proIspPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await proIspPage.waitForFunction(() => Boolean(window.__QCAM__?.pipeline), { timeout: 6000 });
+
+    const proIspResult = await proIspPage.evaluate(async ({ wantVisuals }) => {
+      const { WebGLImageProcessor } = await import('/src/processing/webgl-processor.js');
+      const { analyzeRgbaScene, computeProDevelopProfile } = await import('/src/processing/frame-aligner.js');
+
+      const decodeBlobToImageData = async (blob) => {
+        const bmp = await createImageBitmap(blob);
+        const c = document.createElement('canvas');
+        c.width = bmp.width;
+        c.height = bmp.height;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(bmp, 0, 0);
+        bmp.close();
+        return { canvas: c, imageData: ctx.getImageData(0, 0, c.width, c.height) };
+      };
+
+      const measureRegionStats = (imgData, x0, y0, x1, y1) => {
+        const { width, data } = imgData;
+        let sumL = 0;
+        let sumL2 = 0;
+        let sumChroma = 0;
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+        let minL = 255;
+        let maxL = 0;
+        let n = 0;
+        for (let y = y0; y < y1; y++) {
+          for (let x = x0; x < x1; x++) {
+            const p = (y * width + x) * 4;
+            const r = data[p];
+            const g = data[p + 1];
+            const b = data[p + 2];
+            const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            sumL += l;
+            sumL2 += l * l;
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            sumChroma += Math.max(r, g, b) - Math.min(r, g, b);
+            if (l < minL) minL = l;
+            if (l > maxL) maxL = l;
+            n += 1;
+          }
+        }
+        const meanL = sumL / Math.max(1, n);
+        const stdL = Math.sqrt(Math.max(0, sumL2 / Math.max(1, n) - meanL * meanL));
+        return {
+          meanL,
+          stdL,
+          meanChroma: sumChroma / Math.max(1, n),
+          meanRgb: [sumR / Math.max(1, n), sumG / Math.max(1, n), sumB / Math.max(1, n)],
+          minL,
+          maxL,
+        };
+      };
+
+      // (a) Low-light noisy 4-frame burst + crisp architectural bar
+      const w = 320;
+      const h = 240;
+      const noisyCanvases = [];
+      for (let f = 0; f < 4; f++) {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext('2d');
+        const img = ctx.createImageData(w, h);
+        const d = img.data;
+        let seed = 0x2468ace0 + f * 7919;
+        const nextRand = () => {
+          seed = (seed * 1664525 + 1013904223) >>> 0;
+          return seed / 4294967296;
+        };
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            const p = (y * w + x) * 4;
+            const inBar = x >= 150 && x < 180 && y >= 40 && y < 200;
+            const baseR = inBar ? 228 : 40;
+            const baseG = inBar ? 222 : 42;
+            const baseB = inBar ? 208 : 48;
+            const nR = Math.round((nextRand() + nextRand() - 1) * 28);
+            const nG = Math.round((nextRand() + nextRand() - 1) * 28);
+            const nB = Math.round((nextRand() + nextRand() - 1) * 28);
+            d[p] = Math.max(0, Math.min(255, baseR + nR));
+            d[p + 1] = Math.max(0, Math.min(255, baseG + nG));
+            d[p + 2] = Math.max(0, Math.min(255, baseB + nB));
+            d[p + 3] = 255;
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+        noisyCanvases.push(c);
+      }
+      const rawFrame0Data = noisyCanvases[0].getContext('2d').getImageData(0, 0, w, h);
+      const rawFlatStats = measureRegionStats(rawFrame0Data, 24, 48, 120, 192);
+      const noisyBmps = await Promise.all(noisyCanvases.map((c) => createImageBitmap(c)));
+      const denoiseRes = await window.__QCAM__.pipeline.process({
+        mode: 'hq',
+        frames: noisyBmps,
+        aspectRatio: '4:3',
+        softwareZoom: 1,
+        outputFormat: 'avif',
+        stabilizationMode: 'high',
+        colorProfile: 'natural',
+      });
+      const denoisedDecoded = await decodeBlobToImageData(denoiseRes.blob);
+      const denoisedFlatStats = measureRegionStats(denoisedDecoded.imageData, 24, 48, 120, 192);
+      // Measure edge sharpness across x=150 vertical boundary inside the denoised image
+      let maxEdgeGrad = 0;
+      for (let y = 70; y < 170; y++) {
+        for (let x = 146; x <= 154; x++) {
+          const idxL = (y * w + (x - 1)) * 4;
+          const idxR = (y * w + (x + 1)) * 4;
+          const gL = 0.2126 * denoisedDecoded.imageData.data[idxL] + 0.7152 * denoisedDecoded.imageData.data[idxL + 1] + 0.0722 * denoisedDecoded.imageData.data[idxL + 2];
+          const gR = 0.2126 * denoisedDecoded.imageData.data[idxR] + 0.7152 * denoisedDecoded.imageData.data[idxR + 1] + 0.0722 * denoisedDecoded.imageData.data[idxR + 2];
+          maxEdgeGrad = Math.max(maxEdgeGrad, Math.abs(gR - gL));
+        }
+      }
+
+      // (b) Halo-free high-DR backlit chart + AgX highlights + vibrant red + skin patch
+      const makeBacklitCanvas = () => {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext('2d');
+        const skyGrad = ctx.createLinearGradient(0, 0, 0, 100);
+        skyGrad.addColorStop(0, 'rgb(255, 245, 212)');
+        skyGrad.addColorStop(1, 'rgb(220, 232, 248)');
+        ctx.fillStyle = skyGrad;
+        ctx.fillRect(0, 0, w, 100);
+
+        ctx.fillStyle = 'rgb(24, 26, 30)';
+        ctx.fillRect(0, 100, w, h - 100);
+
+        // Dark architectural grid inside shadow building
+        ctx.strokeStyle = 'rgb(42, 46, 54)';
+        ctx.lineWidth = 2;
+        for (let gx = 110; gx <= 198; gx += 18) {
+          ctx.beginPath();
+          ctx.moveTo(gx, 118);
+          ctx.lineTo(gx, 224);
+          ctx.stroke();
+        }
+
+        // Saturated primary red flower patch & warm skin tone reference square
+        ctx.fillStyle = 'rgb(232, 30, 28)';
+        ctx.fillRect(28, 132, 68, 68);
+        ctx.fillStyle = 'rgb(220, 165, 130)';
+        ctx.fillRect(220, 132, 68, 68);
+        return c;
+      };
+      const backlitRawCanvas = makeBacklitCanvas();
+
+      const processBacklitWithLook = async (look) => {
+        const bmps = await Promise.all([
+          createImageBitmap(backlitRawCanvas),
+          createImageBitmap(backlitRawCanvas),
+        ]);
+        const res = await window.__QCAM__.pipeline.process({
+          mode: 'hq',
+          frames: bmps,
+          aspectRatio: '4:3',
+          softwareZoom: 1,
+          outputFormat: 'avif',
+          stabilizationMode: 'off',
+          colorProfile: look,
+        });
+        return decodeBlobToImageData(res.blob);
+      };
+
+      const lookNat = await processBacklitWithLook('natural');
+      const lookViv = await processBacklitWithLook('vivid');
+      const lookFilm = await processBacklitWithLook('film');
+
+      const shadowBorder = measureRegionStats(lookNat.imageData, 115, 105, 195, 112);
+      const shadowInterior = measureRegionStats(lookNat.imageData, 115, 156, 195, 200);
+      const skyTop = measureRegionStats(lookNat.imageData, 40, 8, 280, 22);
+      const skyLower = measureRegionStats(lookNat.imageData, 40, 76, 280, 90);
+      const redPatchNat = measureRegionStats(lookNat.imageData, 40, 144, 84, 184);
+      const fullNat = measureRegionStats(lookNat.imageData, 20, 120, 300, 210);
+      const fullViv = measureRegionStats(lookViv.imageData, 20, 120, 300, 210);
+      const shadowFilm = measureRegionStats(lookFilm.imageData, 115, 156, 195, 200);
+
+      // (c) Smooth gradient ramp continuity test (dark-to-mid tonal ramp at matching 4:3 aspect)
+      const rampCanvas = document.createElement('canvas');
+      rampCanvas.width = 256;
+      rampCanvas.height = 192;
+      const rctx = rampCanvas.getContext('2d');
+      const rimg = rctx.createImageData(256, 192);
+      for (let y = 0; y < 192; y++) {
+        for (let x = 0; x < 256; x++) {
+          const val = Math.round(16 + (x / 255) * 208);
+          const p = (y * 256 + x) * 4;
+          rimg.data[p] = val;
+          rimg.data[p + 1] = val;
+          rimg.data[p + 2] = val;
+          rimg.data[p + 3] = 255;
+        }
+      }
+      rctx.putImageData(rimg, 0, 0);
+      const rampBmp = await createImageBitmap(rampCanvas);
+      const rampRes = await window.__QCAM__.pipeline.process({
+        mode: 'hq',
+        frames: [rampBmp],
+        aspectRatio: '4:3',
+        softwareZoom: 1,
+        outputFormat: 'avif',
+        stabilizationMode: 'off',
+        colorProfile: 'natural',
+      });
+      const rampDecoded = await decodeBlobToImageData(rampRes.blob);
+      const rampW = rampDecoded.imageData.width;
+      const rampH = rampDecoded.imageData.height;
+      let maxRampJump = 0;
+      let monotonicViolations = 0;
+      let prevColL = -1;
+      for (let x = 16; x <= rampW - 24; x += 8) {
+        const st = measureRegionStats(rampDecoded.imageData, x, 32, x + 4, rampH - 32);
+        if (prevColL >= 0) {
+          const diff = st.meanL - prevColL;
+          if (diff < -1.5) monotonicViolations += 1;
+          maxRampJump = Math.max(maxRampJump, Math.abs(diff));
+        }
+        prevColL = st.meanL;
+      }
+
+      // (d) Forced RGBA8 packed HDR shader path (`forcePackedHdr: true`)
+      const glCanvas = document.createElement('canvas');
+      const packedProc = new WebGLImageProcessor(glCanvas, { forcePackedHdr: true });
+      const rawBacklitData = backlitRawCanvas.getContext('2d').getImageData(0, 0, w, h);
+      const sceneStats = analyzeRgbaScene(rawBacklitData.data, w, h);
+      const packedDevProfile = computeProDevelopProfile(sceneStats, {
+        frameCount: 1,
+        colorProfile: 'natural',
+      });
+      packedProc.processHQ([backlitRawCanvas], {
+        outWidth: w,
+        outHeight: h,
+        cropNorm: { x: 0, y: 0, w: 1, h: 1 },
+        developProfile: packedDevProfile,
+      });
+      const packedRead = packedProc.readRgbaTopDown();
+      const packedImgData = new ImageData(new Uint8ClampedArray(packedRead.data), packedRead.width, packedRead.height);
+      const packedSky = measureRegionStats(packedImgData, 40, 12, 280, 32);
+      const packedShadow = measureRegionStats(packedImgData, 115, 156, 195, 200);
+      const packedRed = measureRegionStats(packedImgData, 40, 144, 84, 184);
+      const usingPackedHdr = packedProc.usingPackedHdr;
+      packedProc.dispose();
+
+      // Optional side-by-side PNG visual sheets for visual inspection
+      let looksDataUrl = null;
+      let denoiseDataUrl = null;
+      if (wantVisuals) {
+        const panelGap = 12;
+        const headerH = 26;
+        const sheetW = w * 4 + panelGap * 5;
+        const sheetH = h + headerH + 16;
+        const sheet = document.createElement('canvas');
+        sheet.width = sheetW;
+        sheet.height = sheetH;
+        const sctx = sheet.getContext('2d');
+        sctx.fillStyle = '#0f172a';
+        sctx.fillRect(0, 0, sheetW, sheetH);
+        sctx.font = 'bold 14px sans-serif';
+        const panels = [
+          ['Raw Backlit Input', backlitRawCanvas],
+          ['Pro Natural', lookNat.canvas],
+          ['Pro Vivid', lookViv.canvas],
+          ['Pro Film', lookFilm.canvas],
+        ];
+        panels.forEach(([title, srcCanvas], idx) => {
+          const px = panelGap + idx * (w + panelGap);
+          sctx.fillStyle = '#e2e8f0';
+          sctx.fillText(title, px, 18);
+          sctx.drawImage(srcCanvas, px, headerH, w, h);
+        });
+        looksDataUrl = sheet.toDataURL('image/png');
+
+        const dSheetW = w * 2 + panelGap * 3;
+        const dSheet = document.createElement('canvas');
+        dSheet.width = dSheetW;
+        dSheet.height = sheetH;
+        const dctx = dSheet.getContext('2d');
+        dctx.fillStyle = '#0f172a';
+        dctx.fillRect(0, 0, dSheetW, sheetH);
+        dctx.font = 'bold 14px sans-serif';
+        [
+          [`Raw Noisy Frame 0 (std=${rawFlatStats.stdL.toFixed(1)})`, noisyCanvases[0]],
+          [`Pro ISP 4-Frame Burst (std=${denoisedFlatStats.stdL.toFixed(1)})`, denoisedDecoded.canvas],
+        ].forEach(([title, srcCanvas], idx) => {
+          const px = panelGap + idx * (w + panelGap);
+          dctx.fillStyle = '#e2e8f0';
+          dctx.fillText(title, px, 18);
+          dctx.drawImage(srcCanvas, px, headerH, w, h);
+        });
+        denoiseDataUrl = dSheet.toDataURL('image/png');
+      }
+
+      return {
+        rawFlatStd: Number(rawFlatStats.stdL.toFixed(2)),
+        denoisedFlatStd: Number(denoisedFlatStats.stdL.toFixed(2)),
+        maxEdgeGrad: Number(maxEdgeGrad.toFixed(1)),
+        shadowBorderL: Number(shadowBorder.meanL.toFixed(1)),
+        shadowInteriorL: Number(shadowInterior.meanL.toFixed(1)),
+        skyTopL: Number(skyTop.meanL.toFixed(1)),
+        skyLowerL: Number(skyLower.meanL.toFixed(1)),
+        redPatchRgb: redPatchNat.meanRgb.map((v) => Math.round(v)),
+        natChroma: Number(fullNat.meanChroma.toFixed(2)),
+        vivChroma: Number(fullViv.meanChroma.toFixed(2)),
+        natShadowL: Number(shadowInterior.meanL.toFixed(2)),
+        filmShadowL: Number(shadowFilm.meanL.toFixed(2)),
+        maxRampJump: Number(maxRampJump.toFixed(2)),
+        monotonicViolations,
+        usingPackedHdr,
+        packedSkyL: Number(packedSky.meanL.toFixed(1)),
+        packedShadowL: Number(packedShadow.meanL.toFixed(1)),
+        packedRedRgb: packedRed.meanRgb.map((v) => Math.round(v)),
+        looksDataUrl,
+        denoiseDataUrl,
+      };
+    }, { wantVisuals: Boolean(screenshotDir) });
+
+    if (screenshotDir && proIspResult.looksDataUrl && proIspResult.denoiseDataUrl) {
+      const writeDataUrlPng = async (dataUrl, fileName) => {
+        const base64 = dataUrl.split(',')[1];
+        await fs.writeFile(path.join(screenshotDir, fileName), Buffer.from(base64, 'base64'));
+      };
+      await writeDataUrlPng(proIspResult.looksDataUrl, 'pro_isp_looks.png');
+      await writeDataUrlPng(proIspResult.denoiseDataUrl, 'pro_isp_denoise.png');
+    }
+
+    assert.ok(
+      proIspResult.denoisedFlatStd < proIspResult.rawFlatStd * 0.55,
+      `Expected >45% low-light noise reduction, got raw=${proIspResult.rawFlatStd} -> denoised=${proIspResult.denoisedFlatStd}`
+    );
+    assert.ok(
+      proIspResult.maxEdgeGrad > 60,
+      `Expected sharp vertical edge preserved after denoising, got grad=${proIspResult.maxEdgeGrad}`
+    );
+    assert.ok(
+      proIspResult.shadowInteriorL > 30,
+      `Backlit shadow building should be lifted (>30), got ${proIspResult.shadowInteriorL}`
+    );
+    assert.ok(
+      Math.abs(proIspResult.shadowBorderL - proIspResult.shadowInteriorL) < 10,
+      `Expected halo-free border vs interior shadow: border=${proIspResult.shadowBorderL}, interior=${proIspResult.shadowInteriorL}`
+    );
+    assert.ok(
+      proIspResult.skyTopL > proIspResult.skyLowerL && proIspResult.skyLowerL < 252,
+      `AgX highlight shoulder should preserve sky gradient modulation: top=${proIspResult.skyTopL}, lower=${proIspResult.skyLowerL}`
+    );
+    assert.ok(
+      proIspResult.redPatchRgb[0] > 180 && proIspResult.redPatchRgb[1] < 75 && proIspResult.redPatchRgb[2] < 75,
+      `Pure red color accuracy check failed: ${proIspResult.redPatchRgb}`
+    );
+    assert.equal(proIspResult.monotonicViolations, 0, 'Smooth ramp should remain monotonic');
+    assert.ok(proIspResult.maxRampJump < 14, `Ramp step too steep/banding: ${proIspResult.maxRampJump}`);
+    assert.ok(
+      proIspResult.vivChroma > proIspResult.natChroma + 2,
+      `Vivid look should boost chroma over Natural: viv=${proIspResult.vivChroma}, nat=${proIspResult.natChroma}`
+    );
+    assert.ok(
+      proIspResult.filmShadowL > proIspResult.natShadowL,
+      `Film look matte fade should lift shadow black floor over Natural: film=${proIspResult.filmShadowL}, nat=${proIspResult.natShadowL}`
+    );
+    assert.equal(proIspResult.usingPackedHdr, true);
+    assert.ok(proIspResult.packedSkyL > 180 && proIspResult.packedShadowL > 30);
+    assert.ok(proIspResult.packedRedRgb[0] > 180 && proIspResult.packedRedRgb[1] < 75);
+
+    await proIspContext.close();
+
     assert.deepEqual(consoleErrors, [], `Console errors encountered: ${consoleErrors.join('; ')}`);
     assert.deepEqual(pageErrors, [], `Page errors encountered: ${pageErrors.join('; ')}`);
 
@@ -1972,6 +2391,21 @@ async function main() {
       },
       ios17Photo,
       stabCompare,
+      proIspMetrics: {
+        rawFlatStd: proIspResult.rawFlatStd,
+        denoisedFlatStd: proIspResult.denoisedFlatStd,
+        maxEdgeGrad: proIspResult.maxEdgeGrad,
+        shadowBorderL: proIspResult.shadowBorderL,
+        shadowInteriorL: proIspResult.shadowInteriorL,
+        skyTopL: proIspResult.skyTopL,
+        skyLowerL: proIspResult.skyLowerL,
+        redPatchRgb: proIspResult.redPatchRgb,
+        natChroma: proIspResult.natChroma,
+        vivChroma: proIspResult.vivChroma,
+        natShadowL: proIspResult.natShadowL,
+        filmShadowL: proIspResult.filmShadowL,
+        usingPackedHdr: proIspResult.usingPackedHdr,
+      },
     }, null, 2));
   } finally {
     await browser.close();

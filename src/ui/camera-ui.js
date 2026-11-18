@@ -77,6 +77,8 @@ export class CameraUI {
 
       infoModal: document.getElementById('info-modal'),
       btnInfoClose: document.getElementById('btn-info-close'),
+      colorProfileSettingNote: document.getElementById('color-profile-setting-note'),
+      colorProfileButtons: Array.from(document.querySelectorAll('[data-color-profile]')),
       stabilizationSettingNote: document.getElementById('stabilization-setting-note'),
       stabilizationButtons: Array.from(document.querySelectorAll('[data-stabilization]')),
       resolutionSettingNote: document.getElementById('resolution-setting-note'),
@@ -98,6 +100,7 @@ export class CameraUI {
       aspectRatio: '4:3',
       gridVisible: false,
       timerSeconds: 0,
+      colorProfile: 'natural',
       stabilization: 'high',
       outputFormat: 'avif',
       mirroredPreview: false,
@@ -126,6 +129,11 @@ export class CameraUI {
   }
 
   _bindEvents() {
+    for (const btn of this.els.colorProfileButtons) {
+      btn.addEventListener('click', () => {
+        this.handlers.onSelectColorProfile?.(btn.dataset.colorProfile);
+      });
+    }
     this.els.btnStabilization?.addEventListener('click', () =>
       this.handlers.onCycleStabilization?.()
     );
@@ -465,6 +473,24 @@ export class CameraUI {
     }
     if (safeMode === 'off') {
       this.setShakeWarning(false);
+    }
+  }
+
+  setColorProfile(profile) {
+    const safeProfile = profile === 'vivid' || profile === 'film' ? profile : 'natural';
+    this.state.colorProfile = safeProfile;
+    for (const btn of this.els.colorProfileButtons || []) {
+      const active = btn.dataset.colorProfile === safeProfile;
+      btn.classList.toggle('is-active', active);
+      btn.setAttribute('aria-checked', String(active));
+    }
+    if (this.els.colorProfileSettingNote) {
+      this.els.colorProfileSettingNote.textContent =
+        safeProfile === 'vivid'
+          ? 'ビビッド: 鮮やかな発色とメリハリのあるコントラストで風景・料理を印象的に描写します'
+          : safeProfile === 'film'
+          ? 'フィルム調: 温かみのあるハイライトと洗練されたシャドウのシネマティックな階調で描写します'
+          : 'Pro ナチュラル: 忠実な発色と自然なダイナミックレンジで描写します';
     }
   }
 

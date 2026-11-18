@@ -1,11 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  COLOR_PROFILES,
   STABILIZATION_MODES,
   analyzeFrameMetrics,
+  analyzeRgbaScene,
   buildBurstAlignmentPlan,
+  computeProDevelopProfile,
   computeStabilizedSafeCrop,
   estimateSimilarityAlignment,
+  normalizeColorProfile,
   normalizeStabilizationMode,
   refineAlignmentWithNativePatches,
   similarityToUvMatrix,
@@ -266,3 +270,163 @@ test('computeStabilizedSafeCrop bounds inset ratio safely', () => {
   assert.equal(safe.insetX, 0.042);
   assert.equal(safe.insetY, 0.042);
 });
+
+function makeSolidOrPatternRgba(width, height, pixelFn) {
+  const out = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      const [r, g, b] = pixelFn(x, y);
+      out[idx] = r;
+      out[idx + 1] = g;
+      out[idx + 2] = b;
+      out[idx + 3] = 255;
+    }
+  }
+  return out;
+}
+
+test('normalizeColorProfile defaults unknown values to natural and preserves valid profiles', () => {
+  assert.equal(normalizeColorProfile(undefined), COLOR_PROFILES.NATURAL);
+  assert.equal(normalizeColorProfile('unknown'), COLOR_PROFILES.NATURAL);
+  assert.equal(normalizeColorProfile('natural'), COLOR_PROFILES.NATURAL);
+  assert.equal(normalizeColorProfile('vivid'), COLOR_PROFILES.VIVID);
+  assert.equal(normalizeColorProfile('film'), COLOR_PROFILES.FILM);
+});
+
+test('analyzeRgbaScene separates crisp structural edges from real sensor noise', () => {
+  const w = 128;
+  const h = 128;
+  // Clean sharp black & white checker blocks (zero noise)
+  const cleanRgba = makeSolidOrPatternRgba(w, h, (x, y) => {
+    const checker = ((Math.floor(x / 24) + Math.floor(y / 24)) & 1) === 0;
+    return checker ? [225, 225, 225] : [30, 30, 30];
+  });
+  const cleanStats = analyzeRgbaScene(cleanRgba, w, h);
+  assert.ok(
+    cleanStats.noiseSigma <= 0.005,
+    `Clean structural edges should not inflate noiseSigma, got ${cleanStats.noiseSigma}`
+  );
+
+  // Low-light flat patch with deterministic zero-mean ISO noise ±24
+  let seed = 0x13579bdf;
+  const nextRand = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  const noisyRgba = makeSolidOrPatternRgba(w, h, () => {
+    const n1 = Math.round((nextRand() + nextRand() - 1) * 26);
+    const n2 = Math.round((nextRand() + nextRand() - 1) * 26);
+    const n3 = Math.round((nextRand() + nextRand() - 1) * 26);
+    return [
+      Math.max(0, Math.min(255, 42 + n1)),
+      Math.max(0, Math.min(255, 44 + n2)),
+      Math.max(0, Math.min(255, 48 + n3)),
+    ];
+  });
+  const noisyStats = analyzeRgbaScene(noisyRgba, w, h);
+  assert.ok(
+    noisyStats.noiseSigma >= 0.025,
+    `Noisy low-light patch should detect noiseSigma >= 0.025, got ${noisyStats.noiseSigma}`
+  );
+  assert.ok(noisyStats.noiseSigma > cleanStats.noiseSigma * 5);
+});
+
+test('analyzeRgbaScene confidence-gates Auto White Balance without corrupting saturated scenes', () => {
+  const w = 96;
+  const h = 96;
+  // Warm-cast neutral gray wall: R slightly > G > B inside neutral reflectance tolerance
+  const warmGray = makeSolidOrPatternRgba(w, h, () => [150, 142, 134]);
+  const warmStats = analyzeRgbaScene(warmGray, w, h);
+  assert.ok(warmStats.wbConfidence > 0.5, `Expected high WB confidence, got ${warmStats.wbConfidence}`);
+  assert.ok(
+    warmStats.wbGains[2] > warmStats.wbGains[0] && warmStats.wbGains[0] < 1.0,
+    `Warm gray should cool blue > green > red, got ${warmStats.wbGains}`
+  );
+
+  // 4-quadrant pure saturated chart: zero neutral pixels -> WB stays [1, 1, 1]
+  const satChart = makeSolidOrPatternRgba(w, h, (x, y) => {
+    if (x < w / 2 && y < h / 2) return [255, 0, 0];
+    if (x >= w / 2 && y < h / 2) return [0, 255, 0];
+    if (x < w / 2 && y >= h / 2) return [0, 0, 255];
+    return [255, 255, 0];
+  });
+  const satStats = analyzeRgbaScene(satChart, w, h);
+  assert.equal(satStats.wbConfidence, 0);
+  assert.deepEqual(satStats.wbGains, [1, 1, 1]);
+
+  // High dynamic range backlit scene (25% deep shadow 18, 25% bright sky 248, 50% mid 128)
+  const hdrChart = makeSolidOrPatternRgba(w, h, (_x, y) => {
+    if (y < h * 0.25) return [248, 246, 236];
+    if (y >= h * 0.75) return [18, 20, 24];
+    return [126, 128, 132];
+  });
+  const hdrStats = analyzeRgbaScene(hdrChart, w, h);
+  assert.ok(hdrStats.dynamicRangeEv > 5.0, `Expected high dynamic range EV > 5, got ${hdrStats.dynamicRangeEv}`);
+  assert.ok(hdrStats.shadowFraction >= 0.2);
+});
+
+test('computeProDevelopProfile adapts look presets, noise denoising, and burst sharpening', () => {
+  const cleanScene = {
+    noiseSigma: 0.004,
+    midtoneLuma: 0.45,
+    sceneMidLogL: -2.1,
+    p50: 0.45,
+    dynamicRangeEv: 4.2,
+    shadowFraction: 0.12,
+    highlightFraction: 0.04,
+    clippedFraction: 0,
+    wbGains: [1, 1, 1],
+  };
+  const noisyScene = {
+    ...cleanScene,
+    noiseSigma: 0.045,
+    midtoneLuma: 0.18,
+    p50: 0.18,
+    shadowFraction: 0.45,
+  };
+
+  const nat = computeProDevelopProfile(cleanScene, {
+    frameCount: 4,
+    mergedCount: 4,
+    colorProfile: COLOR_PROFILES.NATURAL,
+  });
+  const viv = computeProDevelopProfile(cleanScene, {
+    frameCount: 4,
+    mergedCount: 4,
+    colorProfile: COLOR_PROFILES.VIVID,
+  });
+  const film = computeProDevelopProfile(cleanScene, {
+    frameCount: 4,
+    mergedCount: 4,
+    colorProfile: COLOR_PROFILES.FILM,
+  });
+  const night = computeProDevelopProfile(noisyScene, {
+    frameCount: 1,
+    mergedCount: 1,
+    colorProfile: COLOR_PROFILES.NATURAL,
+  });
+
+  assert.equal(nat.colorProfile, COLOR_PROFILES.NATURAL);
+  assert.ok(viv.saturation > nat.saturation && nat.saturation > film.saturation);
+  assert.ok(viv.vibrance > nat.vibrance);
+  assert.ok(film.filmFade > 0 && film.warmth > 0);
+  assert.ok(night.denoiseStrength > nat.denoiseStrength * 2);
+  assert.ok(night.sharpen < nat.sharpen, 'Noisy single frame should pull back CAS sharpening');
+  assert.ok(night.autoExposureEv > nat.autoExposureEv, 'Underexposed frame should lift autoExposureEv');
+});
+
+test('analyzeFrameMetrics trimmedMeanLuma resists clipped highlights and pure black corners', () => {
+  const w = 64;
+  const h = 64;
+  const luma = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      luma[y * w + x] = y < 12 ? 255 : 120;
+    }
+  }
+  const metrics = analyzeFrameMetrics(luma, w, h);
+  assert.ok(Math.abs(metrics.trimmedMeanLuma - 120) < 1, `Expected trimmedMeanLuma ~120, got ${metrics.trimmedMeanLuma}`);
+  assert.ok(metrics.meanLuma > metrics.trimmedMeanLuma + 5);
+});
+

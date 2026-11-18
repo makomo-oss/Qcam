@@ -9,10 +9,315 @@ export const STABILIZATION_MODES = Object.freeze({
   OFF: 'off',
 });
 
+export const COLOR_PROFILES = Object.freeze({
+  NATURAL: 'natural',
+  VIVID: 'vivid',
+  FILM: 'film',
+});
+
 export function normalizeStabilizationMode(value) {
   if (value === STABILIZATION_MODES.STANDARD) return STABILIZATION_MODES.STANDARD;
   if (value === STABILIZATION_MODES.OFF) return STABILIZATION_MODES.OFF;
   return STABILIZATION_MODES.HIGH;
+}
+
+export function normalizeColorProfile(value) {
+  if (value === COLOR_PROFILES.VIVID) return COLOR_PROFILES.VIVID;
+  if (value === COLOR_PROFILES.FILM) return COLOR_PROFILES.FILM;
+  return COLOR_PROFILES.NATURAL;
+}
+
+function srgbChannelToLinear(c) {
+  const safe = Math.max(0, Math.min(1, c));
+  return safe <= 0.04045 ? safe / 12.92 : Math.pow((safe + 0.055) / 1.055, 2.4);
+}
+
+/**
+ * Analyze an RGBA8 frame (typically downsampled <= 240px long edge) for:
+ * - flat-region sensor noise sigma (Immerkaer Laplacian gated by coarse 2x2 structure gradients)
+ * - linear & sRGB luminance distribution / percentiles / dynamic range in EV
+ * - confidence-gated near-neutral Auto White Balance gains [r, g, b]
+ */
+export function analyzeRgbaScene(rgbaData, width, height) {
+  if (!rgbaData || width < 8 || height < 8) {
+    return {
+      noiseSigma: 0.012,
+      midtoneLuma: 0.42,
+      sceneMidLogL: -2.4,
+      p02: 0.05,
+      p10: 0.12,
+      p50: 0.42,
+      p90: 0.78,
+      p99: 0.92,
+      dynamicRangeEv: 4.5,
+      shadowFraction: 0.15,
+      highlightFraction: 0.05,
+      clippedFraction: 0.005,
+      wbConfidence: 0,
+      wbGains: [1, 1, 1],
+    };
+  }
+
+  const lumaByte = new Uint8Array(width * height);
+  const hist = new Uint32Array(256);
+
+  let shadowCount = 0;
+  let highlightCount = 0;
+  let clippedCount = 0;
+  let midLumaSum = 0;
+  let midLumaCount = 0;
+  let totalCount = 0;
+
+  let neutralLinR = 0;
+  let neutralLinG = 0;
+  let neutralLinB = 0;
+  let neutralCount = 0;
+  let wbEligibleCount = 0;
+
+  for (let i = 0, p = 0; i < lumaByte.length; i++, p += 4) {
+    const r = rgbaData[p];
+    const g = rgbaData[p + 1];
+    const b = rgbaData[p + 2];
+    const yByte = (54 * r + 183 * g + 19 * b) >> 8;
+    lumaByte[i] = yByte;
+    hist[yByte] += 1;
+    totalCount += 1;
+
+    const yNorm = yByte / 255;
+    if (yNorm < 0.16) shadowCount += 1;
+    if (yNorm > 0.86) highlightCount += 1;
+    if (yNorm > 0.97) clippedCount += 1;
+    if (yNorm >= 0.08 && yNorm <= 0.90) {
+      midLumaSum += yNorm;
+      midLumaCount += 1;
+    }
+
+    // Subsample every 2nd pixel for linear-light gray-zone WB stats
+    if ((i & 1) === 0 && r < 248 && g < 248 && b < 248 && (r > 22 || g > 22 || b > 22)) {
+      wbEligibleCount += 1;
+      const lr = srgbChannelToLinear(r / 255);
+      const lg = srgbChannelToLinear(g / 255);
+      const lb = srgbChannelToLinear(b / 255);
+      const maxC = Math.max(lr, lg, lb);
+      const minC = Math.min(lr, lg, lb);
+      if (maxC > 0.015 && (maxC - minC) <= maxC * 0.24) {
+        neutralLinR += lr;
+        neutralLinG += lg;
+        neutralLinB += lb;
+        neutralCount += 1;
+      }
+    }
+  }
+
+  const percentileNorm = (q) => {
+    const target = Math.max(1, Math.min(totalCount, Math.round(totalCount * q)));
+    let acc = 0;
+    for (let v = 0; v < 256; v++) {
+      acc += hist[v];
+      if (acc >= target) return v / 255;
+    }
+    return 1;
+  };
+
+  const p02 = percentileNorm(0.02);
+  const p10 = percentileNorm(0.10);
+  const p50 = percentileNorm(0.50);
+  const p90 = percentileNorm(0.90);
+  const p99 = percentileNorm(0.99);
+
+  const lin02 = Math.max(0.0025, srgbChannelToLinear(p02));
+  const lin50 = Math.max(0.004, srgbChannelToLinear(p50));
+  const lin99 = Math.max(lin02 + 0.004, srgbChannelToLinear(p99));
+  const dynamicRangeEv = Math.max(1.5, Math.min(11.0, Math.log2(lin99 / lin02)));
+  const sceneMidLogL = Math.max(-7.5, Math.min(0.2, Math.log2(lin50)));
+
+  // Immerkaer 3x3 high-pass noise estimate restricted to structurally smooth blocks
+  const gridStep = Math.max(1, Math.floor(Math.min(width, height) / 140));
+  const candidates = [];
+  for (let y = 2; y < height - 2; y += gridStep) {
+    const row = y * width;
+    const rowUp = (y - 1) * width;
+    const rowDn = (y + 1) * width;
+    const rowUp2 = (y - 2) * width;
+    const rowDn2 = (y + 2) * width;
+    for (let x = 2; x < width - 2; x += gridStep) {
+      const lap =
+        4 * lumaByte[row + x] -
+        2 * (lumaByte[row + x - 1] + lumaByte[row + x + 1] + lumaByte[rowUp + x] + lumaByte[rowDn + x]) +
+        (lumaByte[rowUp + x - 1] + lumaByte[rowUp + x + 1] + lumaByte[rowDn + x - 1] + lumaByte[rowDn + x + 1]);
+      // Coarse 2x2 smoothed gradient suppresses real sharp edges without biasing noise variance
+      const boxL =
+        lumaByte[rowUp + x - 2] + lumaByte[rowUp + x - 1] + lumaByte[row + x - 2] + lumaByte[row + x - 1];
+      const boxR =
+        lumaByte[rowUp + x + 1] + lumaByte[rowUp + x + 2] + lumaByte[row + x + 1] + lumaByte[row + x + 2];
+      const boxT =
+        lumaByte[rowUp2 + x] + lumaByte[rowUp2 + x + 1] + lumaByte[rowUp + x] + lumaByte[rowUp + x + 1];
+      const boxB =
+        lumaByte[rowDn + x] + lumaByte[rowDn + x + 1] + lumaByte[rowDn2 + x] + lumaByte[rowDn2 + x + 1];
+      const structGrad = (Math.abs(boxR - boxL) + Math.abs(boxB - boxT)) * 0.25;
+      candidates.push({ absLap: lap < 0 ? -lap : lap, structGrad });
+    }
+  }
+
+  let noiseSigma = 0.008;
+  if (candidates.length >= 16) {
+    candidates.sort((u, v) => u.structGrad - v.structGrad);
+    const flatCount = Math.max(8, Math.floor(candidates.length * 0.45));
+    let lapSum = 0;
+    for (let k = 0; k < flatCount; k++) {
+      lapSum += candidates[k].absLap;
+    }
+    const meanAbsLap = lapSum / flatCount;
+    // Scale by sqrt(pi/2) / 6 to convert |K*I| mean to std dev in [0..1]
+    noiseSigma = Math.max(0, Math.min(0.18, (meanAbsLap * 0.2089) / 255));
+  }
+
+  // Confidence-gated conservative Auto White Balance over neutral gray-zone reflectance
+  let wbGains = [1, 1, 1];
+  let wbConfidence = 0;
+  const neutralFraction = wbEligibleCount > 24 ? neutralCount / wbEligibleCount : 0;
+  if (neutralFraction >= 0.12 && neutralLinR > 1e-4 && neutralLinG > 1e-4 && neutralLinB > 1e-4) {
+    const rMean = neutralLinR / neutralCount;
+    const gMean = neutralLinG / neutralCount;
+    const bMean = neutralLinB / neutralCount;
+    const avgMean = (rMean + gMean + bMean) / 3;
+    const rawR = avgMean / rMean;
+    const rawG = avgMean / gMean;
+    const rawB = avgMean / bMean;
+    // Normalize relative to green and blend gently by neutral coverage confidence
+    const normR = rawR / rawG;
+    const normB = rawB / rawG;
+    wbConfidence = Math.max(0, Math.min(1, (neutralFraction - 0.12) / 0.30));
+    const strength = 0.58 * wbConfidence;
+    const gR = Math.max(0.88, Math.min(1.14, 1 + (normR - 1) * strength));
+    const gB = Math.max(0.88, Math.min(1.14, 1 + (normB - 1) * strength));
+    wbGains = [Number(gR.toFixed(4)), 1.0, Number(gB.toFixed(4))];
+  }
+
+  return {
+    noiseSigma: Number(noiseSigma.toFixed(5)),
+    midtoneLuma: midLumaCount > 0 ? midLumaSum / midLumaCount : p50,
+    sceneMidLogL: Number(sceneMidLogL.toFixed(4)),
+    p02,
+    p10,
+    p50,
+    p90,
+    p99,
+    dynamicRangeEv: Number(dynamicRangeEv.toFixed(2)),
+    shadowFraction: totalCount > 0 ? shadowCount / totalCount : 0,
+    highlightFraction: totalCount > 0 ? highlightCount / totalCount : 0,
+    clippedFraction: totalCount > 0 ? clippedCount / totalCount : 0,
+    wbConfidence: Number(wbConfidence.toFixed(3)),
+    wbGains,
+  };
+}
+
+/**
+ * Compute adaptive Pro ISP development parameters from scene statistics,
+ * multi-frame merge count, stabilization mode, and user look profile.
+ */
+export function computeProDevelopProfile(
+  sceneStats = null,
+  {
+    frameCount = 1,
+    mergedCount = frameCount,
+    stabilizationMode = STABILIZATION_MODES.HIGH,
+    colorProfile = COLOR_PROFILES.NATURAL,
+  } = {}
+) {
+  const stats = sceneStats || analyzeRgbaScene(null, 0, 0);
+  const mode = normalizeStabilizationMode(stabilizationMode);
+  const profile = normalizeColorProfile(colorProfile);
+  const effectiveMerged = Math.max(1, Math.min(4, Number(mergedCount) || Number(frameCount) || 1));
+  const noise = Math.max(0, Math.min(0.18, Number(stats.noiseSigma) || 0));
+
+  // Highlight-safe auto exposure lift for genuinely dark frames without blowing bright areas
+  const underexposed = Math.max(0, 0.34 - (stats.midtoneLuma ?? 0.42));
+  const safeHiRoom = Math.max(0, 1 - (stats.clippedFraction ?? 0) * 16 - (stats.highlightFraction ?? 0) * 2.5);
+  const autoExposureEv = Number(
+    Math.max(0, Math.min(0.45, underexposed * 2.2 * safeHiRoom)).toFixed(3)
+  );
+
+  // Backlit / high dynamic range detection drives bilateral Local HDR dodge & burn
+  const highDrFactor = Math.max(0, Math.min(1, ((stats.dynamicRangeEv ?? 4.5) - 3.0) / 5.0));
+  const backlitMix =
+    stats.shadowFraction > 0.14 && stats.highlightFraction > 0.06 ? 0.18 : 0;
+  const localHdrStrength = Number(
+    Math.max(0.24, Math.min(0.84, 0.28 + 0.42 * highDrFactor + backlitMix)).toFixed(3)
+  );
+
+  // Shadow toe lift balances shadow rescue against keeping clean darks anchored
+  const shadowNeed = Math.max(
+    0,
+    Math.min(1, (stats.shadowFraction ?? 0.15) * 1.4 + Math.max(0, 0.38 - (stats.p50 ?? 0.42)) * 1.2)
+  );
+  const shadowLift = Number(Math.max(0.22, Math.min(0.76, 0.26 + 0.48 * shadowNeed)).toFixed(3));
+
+  // Highlight roll-off responds to bright clouds / clipped regions
+  const hiNeed = Math.max(
+    0,
+    Math.min(1, (stats.highlightFraction ?? 0.05) * 2.4 + (stats.clippedFraction ?? 0.005) * 10)
+  );
+  const highlightRoll = Number(Math.max(0.42, Math.min(0.9, 0.48 + 0.40 * hiNeed)).toFixed(3));
+
+  // Clarity boosts micro-contrast softly, pulled back slightly on noisy high-ISO night shots
+  const baseClarity = profile === COLOR_PROFILES.VIVID ? 0.16 : profile === COLOR_PROFILES.FILM ? 0.14 : 0.12;
+  const clarity = Number(
+    Math.max(0.04, Math.min(0.22, baseClarity + 0.04 * (1 - Math.min(1, noise * 22)))).toFixed(3)
+  );
+
+  // CAS sharpening boosted gently on multi-frame clean bursts, tempered gracefully when noise is high
+  const baseSharpen = mode === STABILIZATION_MODES.HIGH ? 0.62 : 0.54;
+  const mergeBonus = effectiveMerged >= 3 ? 0.06 : effectiveMerged >= 2 ? 0.03 : 0;
+  const noisePenalty = Math.min(0.22, noise * 4.5);
+  const sharpen = Number(Math.max(0.32, Math.min(0.74, baseSharpen + mergeBonus - noisePenalty)).toFixed(3));
+
+  // Denoise strength adapts continuously to detected ISO noise
+  const denoiseStrength = Number(
+    Math.max(0.18, Math.min(1.0, 0.20 + Math.min(0.80, noise * 24))).toFixed(3)
+  );
+
+  // Patch tolerance adapts in perceptual YCoCg space to frame noise + stabilization strictness
+  const basePatchTol2 = mode === STABILIZATION_MODES.OFF ? 0.0075 : 0.0016;
+  const patchTol2 = Number((basePatchTol2 + Math.min(0.0016, noise * noise * 0.45)).toFixed(6));
+
+  let vibrance = 0.14;
+  let saturation = 1.02;
+  let contrast = 1.04;
+  let filmFade = 0.0;
+  let warmth = 0.0;
+
+  if (profile === COLOR_PROFILES.VIVID) {
+    vibrance = 0.30;
+    saturation = 1.12;
+    contrast = 1.09;
+  } else if (profile === COLOR_PROFILES.FILM) {
+    vibrance = 0.06;
+    saturation = 0.94;
+    contrast = 1.06;
+    filmFade = 0.014;
+    warmth = 0.045;
+  }
+
+  return {
+    colorProfile: profile,
+    wbGains: Array.isArray(stats.wbGains) ? stats.wbGains : [1, 1, 1],
+    noiseSigma: noise,
+    sceneMidLogL: stats.sceneMidLogL ?? -2.4,
+    autoExposureEv,
+    localHdrStrength,
+    shadowLift,
+    highlightRoll,
+    clarity,
+    sharpen,
+    denoiseStrength,
+    patchTol2,
+    vibrance,
+    saturation,
+    contrast,
+    filmFade,
+    warmth,
+  };
 }
 
 /**
@@ -57,12 +362,12 @@ export function downsampleLuma(src, srcW, srcH, dstW, dstH) {
 }
 
 /**
- * Compute mean luminance and central Tenengrad + Laplacian sharpness score
+ * Compute mean luminance, trimmed midtone luminance, and central Tenengrad + Laplacian sharpness score
  * to automatically select the sharpest reference frame and reject motion-blurred frames.
  */
 export function analyzeFrameMetrics(luma, width, height) {
   if (!luma || width < 16 || height < 16) {
-    return { sharpness: 0, meanLuma: 128 };
+    return { sharpness: 0, meanLuma: 128, trimmedMeanLuma: 128 };
   }
   const marginX = Math.max(2, Math.floor(width * 0.12));
   const marginY = Math.max(2, Math.floor(height * 0.12));
@@ -72,6 +377,8 @@ export function analyzeFrameMetrics(luma, width, height) {
 
   let edgeEnergySum = 0;
   let lumaSum = 0;
+  let midLumaSum = 0;
+  let midSamples = 0;
   let samples = 0;
 
   for (let y = marginY; y < yEnd; y += step) {
@@ -86,13 +393,19 @@ export function analyzeFrameMetrics(luma, width, height) {
         4 * c - luma[row + x - 1] - luma[row + x + 1] - luma[rowUp + x] - luma[rowDn + x];
       edgeEnergySum += gx * gx + gy * gy + lap * lap * 0.5;
       lumaSum += c;
+      if (c >= 18 && c <= 236) {
+        midLumaSum += c;
+        midSamples++;
+      }
       samples++;
     }
   }
 
+  const meanLuma = samples > 0 ? lumaSum / samples : 128;
   return {
     sharpness: samples > 0 ? Math.sqrt(edgeEnergySum / samples) : 0,
-    meanLuma: samples > 0 ? lumaSum / samples : 128,
+    meanLuma,
+    trimmedMeanLuma: midSamples > 12 ? midLumaSum / midSamples : meanLuma,
   };
 }
 
@@ -1202,6 +1515,7 @@ export function buildBurstAlignmentPlan({
   stabilizationMode = STABILIZATION_MODES.HIGH,
   extractPatchFn = null,
   maxFrames = 4,
+  noiseSigma = 0.012,
 }) {
   const mode = normalizeStabilizationMode(stabilizationMode);
   const total = lumaFrames.length;
@@ -1247,8 +1561,10 @@ export function buildBurstAlignmentPlan({
 
   const refLuma = lumaFrames[refIndex];
   const refMetric = metrics[refIndex];
+  const refMidLuma = refMetric.trimmedMeanLuma ?? refMetric.meanLuma;
   const minSharpRatio = mode === STABILIZATION_MODES.HIGH ? 0.72 : 0.65;
-  const maxResidualReject = mode === STABILIZATION_MODES.HIGH ? 20 : 25;
+  const noisePad = Math.min(8, Math.round((Number(noiseSigma) || 0) * 255 * 0.45));
+  const maxResidualReject = (mode === STABILIZATION_MODES.HIGH ? 20 : 25) + noisePad;
 
   const candidates = [];
   for (let i = 0; i < total; i++) {
@@ -1305,14 +1621,15 @@ export function buildBurstAlignmentPlan({
           0,
           Math.min(
             1,
-            sharpRatio * Math.exp(-Math.max(0, residual - 2.5) / 14)
+            sharpRatio * Math.exp(-Math.max(0, residual - (2.5 + noisePad * 0.25)) / 14)
           )
         )
       : 0;
 
+    const movMidLuma = metrics[i].trimmedMeanLuma ?? metrics[i].meanLuma;
     const lumaGain =
-      metrics[i].meanLuma > 4 && refMetric.meanLuma > 4
-        ? Math.max(0.75, Math.min(1.33, refMetric.meanLuma / metrics[i].meanLuma))
+      movMidLuma > 6 && refMidLuma > 6
+        ? Math.max(0.82, Math.min(1.22, refMidLuma / movMidLuma))
         : 1.0;
 
     candidates.push({
@@ -1408,6 +1725,10 @@ export function drawAlignedFrameToCanvas(ctx, bitmap, crop, mirrorX, alignEntry,
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, outW, outH);
+  ctx.imageSmoothingEnabled = true;
+  if ('imageSmoothingQuality' in ctx) {
+    ctx.imageSmoothingQuality = 'high';
+  }
 
   const scaleX = outW / crop.sw;
   const scaleY = outH / crop.sh;
@@ -1435,20 +1756,46 @@ export function drawAlignedFrameToCanvas(ctx, bitmap, crop, mirrorX, alignEntry,
 }
 
 /**
- * Align captured ImageBitmaps / frames using medium luminance pyramids plus native-scale patch refinement.
+ * Analyze a single ImageBitmap on a lightweight probe canvas to collect noise, WB, and DR telemetry.
+ */
+export function analyzeBitmapScene(bitmap, createCanvas) {
+  if (!bitmap || !bitmap.width || !bitmap.height || typeof createCanvas !== 'function') {
+    return analyzeRgbaScene(null, 0, 0);
+  }
+  const srcW = bitmap.width;
+  const srcH = bitmap.height;
+  const probeLong = Math.min(240, Math.max(srcW, srcH));
+  const scale = probeLong / Math.max(srcW, srcH);
+  const probeW = Math.max(24, Math.round(srcW * scale));
+  const probeH = Math.max(24, Math.round(srcH * scale));
+  const canvas = createCanvas(probeW, probeH);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(bitmap, 0, 0, srcW, srcH, 0, 0, probeW, probeH);
+  const imgData = ctx.getImageData(0, 0, probeW, probeH);
+  canvas.width = 1;
+  canvas.height = 1;
+  return analyzeRgbaScene(imgData.data, probeW, probeH);
+}
+
+/**
+ * Align captured ImageBitmaps / frames using medium luminance pyramids plus native-scale patch refinement,
+ * and analyze the sharpest reference frame for Pro ISP tone/noise/WB parameters.
  */
 export function alignBitmapBurst({
   frames,
   stabilizationMode = STABILIZATION_MODES.HIGH,
+  colorProfile = COLOR_PROFILES.NATURAL,
   createCanvas,
   maxFrames = 4,
 }) {
   const mode = normalizeStabilizationMode(stabilizationMode);
+  const safeProfile = normalizeColorProfile(colorProfile);
   const srcW = frames[0]?.width || 1;
   const srcH = frames[0]?.height || 1;
 
   if (frames.length <= 1 || mode === STABILIZATION_MODES.OFF || typeof createCanvas !== 'function') {
-    return buildBurstAlignmentPlan({
+    const sceneStats = analyzeBitmapScene(frames[0], createCanvas);
+    const basePlan = buildBurstAlignmentPlan({
       lumaFrames: frames.map(() => new Uint8Array(0)),
       medW: 16,
       medH: 16,
@@ -1456,7 +1803,19 @@ export function alignBitmapBurst({
       srcH,
       stabilizationMode: mode,
       maxFrames,
+      noiseSigma: sceneStats.noiseSigma,
     });
+    const mergedCount = basePlan.selectedIndices.length || 1;
+    return {
+      ...basePlan,
+      sceneStats,
+      developProfile: computeProDevelopProfile(sceneStats, {
+        frameCount: frames.length,
+        mergedCount,
+        stabilizationMode: mode,
+        colorProfile: safeProfile,
+      }),
+    };
   }
 
   const medLong = Math.min(560, Math.max(srcW, srcH));
@@ -1467,16 +1826,20 @@ export function alignBitmapBurst({
   const medCanvas = createCanvas(medW, medH);
   const medCtx = medCanvas.getContext('2d', { willReadFrequently: true });
   const lumaFrames = [];
+  const rgbaFrames = [];
 
   for (let i = 0; i < frames.length; i++) {
     medCtx.setTransform(1, 0, 0, 1, 0, 0);
     medCtx.clearRect(0, 0, medW, medH);
     medCtx.drawImage(frames[i], 0, 0, srcW, srcH, 0, 0, medW, medH);
     const imgData = medCtx.getImageData(0, 0, medW, medH);
+    rgbaFrames.push(imgData.data);
     lumaFrames.push(rgbaToLuma(imgData.data, medW, medH));
   }
   medCanvas.width = 1;
   medCanvas.height = 1;
+
+  const probeNoiseStats = analyzeRgbaScene(rgbaFrames[0], medW, medH);
 
   let patchCanvas = null;
   let patchCtx = null;
@@ -1522,6 +1885,7 @@ export function alignBitmapBurst({
     stabilizationMode: mode,
     extractPatchFn,
     maxFrames,
+    noiseSigma: probeNoiseStats.noiseSigma,
   });
 
   if (patchCanvas) {
@@ -1529,7 +1893,22 @@ export function alignBitmapBurst({
     patchCanvas.height = 1;
   }
 
-  return plan;
+  const refIdx = Math.max(0, Math.min(rgbaFrames.length - 1, plan.refIndex || 0));
+  const sceneStats = refIdx === 0 ? probeNoiseStats : analyzeRgbaScene(rgbaFrames[refIdx], medW, medH);
+  rgbaFrames.length = 0;
+
+  const developProfile = computeProDevelopProfile(sceneStats, {
+    frameCount: frames.length,
+    mergedCount: plan.selectedIndices?.length || 1,
+    stabilizationMode: mode,
+    colorProfile: safeProfile,
+  });
+
+  return {
+    ...plan,
+    sceneStats,
+    developProfile,
+  };
 }
 
 export function summarizeAlignmentPlan(plan, totalCaptured, stabilizationMode) {
@@ -1563,4 +1942,5 @@ export function summarizeAlignmentPlan(plan, totalCaptured, stabilizationMode) {
     maxAngleDeg: Number(maxAngleDeg.toFixed(2)),
   };
 }
+
 

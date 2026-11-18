@@ -245,9 +245,20 @@
         <div class="setting-row">
           <div class="setting-label">
             <strong>撮影画質エンジン</strong>
-            <small>高画質 HDR（高精度位置合わせマルチフレーム合成＋WebGL トーンマッピング）で常時撮影します</small>
+            <small>Pro ISP 2.0（5パス リニア HDR 現像 · YCoCg 適応ノイズ低減 · AgX ハイライト復元 · CAS 先鋭化）で常時撮影します</small>
           </div>
-          <span class="setting-badge">高画質 HDR</span>
+          <span class="setting-badge">Pro HDR</span>
+        </div>
+        <div class="setting-row setting-row--stacked">
+          <div class="setting-label">
+            <strong>仕上がりトーン (Pro Look)</strong>
+            <small id="color-profile-setting-note">Pro ナチュラル: 忠実な発色と自然なダイナミックレンジで描写します</small>
+          </div>
+          <div id="color-profile-options" class="lens-chip-list" role="radiogroup" aria-label="仕上がりトーン">
+            <button id="btn-look-natural" type="button" role="radio" aria-checked="true" class="lens-chip is-active" data-color-profile="natural">Pro ナチュラル</button>
+            <button id="btn-look-vivid" type="button" role="radio" aria-checked="false" class="lens-chip" data-color-profile="vivid">ビビッド</button>
+            <button id="btn-look-film" type="button" role="radio" aria-checked="false" class="lens-chip" data-color-profile="film">フィルム調</button>
+          </div>
         </div>
         <div class="setting-row setting-row--stacked">
           <div class="setting-label">

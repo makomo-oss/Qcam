@@ -12,7 +12,9 @@ import {
   selectHqCapturePlan,
 } from './utils/resolution.js';
 import {
+  COLOR_PROFILES,
   STABILIZATION_MODES,
+  normalizeColorProfile,
   normalizeStabilizationMode,
   rgbaToLuma,
 } from './processing/frame-aligner.js';
@@ -76,6 +78,7 @@ class QcamApp {
       gridVisible: Boolean(saved.gridVisible),
       timerSeconds: 0,
       mode: 'hq',
+      colorProfile: normalizeColorProfile(saved.colorProfile || COLOR_PROFILES.NATURAL),
       stabilization: normalizeStabilizationMode(saved.stabilization),
       cameraResolution: normalizeResolutionPreset(saved.cameraResolution),
       outputMegapixels: normalizeMegapixelsSetting(saved.outputMegapixels),
@@ -112,6 +115,7 @@ class QcamApp {
     this.ui = new CameraUI({
       onCycleStabilization: () => this.cycleStabilization(),
       onSelectStabilization: (mode) => this.selectStabilizationMode(mode),
+      onSelectColorProfile: (profile) => this.selectColorProfile(profile),
       onToggleAspect: () => this.toggleAspectRatio(),
       onToggleGrid: () => this.toggleGrid(),
       onCycleTimer: () => this.cycleTimer(),
@@ -155,6 +159,7 @@ class QcamApp {
       aspectRatio: this.settings.aspectRatio,
       gridVisible: this.settings.gridVisible,
       mode: 'hq',
+      colorProfile: this.settings.colorProfile,
       stabilization: this.settings.stabilization,
       cameraResolution: this.settings.cameraResolution,
       outputMegapixels: this.settings.outputMegapixels,
@@ -209,6 +214,7 @@ class QcamApp {
     this.ui.setAspectRatio(this.settings.aspectRatio);
     this.ui.setGridVisible(this.settings.gridVisible);
     this.ui.setTimerSeconds(this.settings.timerSeconds);
+    this.ui.setColorProfile(this.settings.colorProfile);
     this.ui.setStabilizationMode(this.settings.stabilization);
     this.ui.setOutputFormat(this.settings.outputFormat);
     this.ui.els.toggleAutoSave.checked = this.settings.autoSave;
@@ -445,6 +451,22 @@ class QcamApp {
     this.selectStabilizationMode(next);
   }
 
+  selectColorProfile(profile, { silent = true } = {}) {
+    const next = normalizeColorProfile(profile);
+    this.settings.colorProfile = next;
+    this._persistSettings();
+    this.ui.setColorProfile(next);
+    if (!silent) {
+      const label =
+        next === COLOR_PROFILES.VIVID
+          ? '仕上がりトーン: ビビッド'
+          : next === COLOR_PROFILES.FILM
+          ? '仕上がりトーン: フィルム調'
+          : '仕上がりトーン: Pro ナチュラル';
+      this.ui.showToast(label, { durationMs: 2000 });
+    }
+  }
+
   async applyZoom(zoom) {
     try {
       const res = await this.camera.setZoom(zoom);
@@ -581,7 +603,7 @@ class QcamApp {
         }
       }
       if (!frames.length) {
-        const burst = await this.camera.captureBurstFrames(4, 200, { stabilizationMode });
+        const burst = await this.camera.captureBurstFrames(4, 220, { stabilizationMode });
         frames = burst.frames;
         captureSource = burst.sourceType;
       }
@@ -598,6 +620,7 @@ class QcamApp {
         outputMegapixels: this.settings.outputMegapixels,
         maxDimension: plan.maxDimension,
         stabilizationMode,
+        colorProfile: this.settings.colorProfile,
       });
 
       const totalTimeMs = Math.round(performance.now() - totalStart);
@@ -938,12 +961,20 @@ class QcamApp {
           : `採用 ${st.adoptedFrames}/${st.totalFrames}枚 · 基準#${(st.refIndex ?? 0) + 1} · シフト補正 ${st.maxShiftPx}px / 傾き ${st.maxAngleDeg}°`;
     }
 
+    const lookLabel =
+      this.settings.colorProfile === COLOR_PROFILES.VIVID
+        ? 'ビビッド'
+        : this.settings.colorProfile === COLOR_PROFILES.FILM
+        ? 'フィルム調'
+        : 'Pro ナチュラル';
+
     const entries = [
       ['アプリバージョン', `v${APP_VERSION}`],
       ['プラットフォーム', `${this.platform.osLabel} (${this.platform.browserLabel})`],
       ['PWA モード', this.platform.isStandalonePWA ? 'スタンドアロン (全画面)' : 'ブラウザ表示'],
       ['カメラ権限状態', permLabelMap[this.lastPermissionState] || this.lastPermissionState],
       ['撮影画質モード', '高画質 HDR (常時有効)'],
+      ['仕上がりトーン', lookLabel],
       ['手ぶれ補正モード', stabilizationModeLabel],
       ['直近のブレ補正', lastStabLabel],
       ['解像度設定 / 上限', `${resPresetLabel} / ブラウザ取得上限 ${capLabel}`],
@@ -959,8 +990,8 @@ class QcamApp {
       [
         '保存フォーマット',
         this.settings.outputFormat === 'jpeg'
-          ? 'JPEG (.jpg · 品質 0.95)'
-          : 'AVIF (.avif · クライアント圧縮)',
+          ? 'JPEG (.jpg · 品質 0.96)'
+          : 'AVIF (.avif · SharpYUV 高画質圧縮)',
       ],
       ['直近の生成ファイル', lastFileLabel],
       ['画像処理エンジン', this.lastProcessEngine],

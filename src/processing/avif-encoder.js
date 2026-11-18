@@ -7,16 +7,16 @@ export const AVIF_MIME_TYPE = 'image/avif';
 export const JPEG_MIME_TYPE = 'image/jpeg';
 
 export const AVIF_DEFAULT_OPTIONS = Object.freeze({
-  quality: 80,
+  quality: 86,
   qualityAlpha: -1,
   denoiseLevel: 0,
   tileColsLog2: 0,
   tileRowsLog2: 0,
-  speed: 9,
+  speed: 8,
   subsample: 1, // YUV 4:2:0
-  chromaDeltaQ: false,
+  chromaDeltaQ: true,
   sharpness: 0,
-  enableSharpYUV: false,
+  enableSharpYUV: true,
   tune: 0, // AVIFTune.auto
   bitDepth: 8,
 });
@@ -29,6 +29,8 @@ export function normalizeAvifOptions(options = {}) {
   const merged = { ...AVIF_DEFAULT_OPTIONS, ...options };
   merged.quality = Math.max(1, Math.min(100, Math.round(Number(merged.quality) || AVIF_DEFAULT_OPTIONS.quality)));
   merged.speed = Math.max(0, Math.min(10, Math.round(Number(merged.speed ?? AVIF_DEFAULT_OPTIONS.speed))));
+  merged.chromaDeltaQ = Boolean(merged.chromaDeltaQ);
+  merged.enableSharpYUV = Boolean(merged.enableSharpYUV);
   return merged;
 }
 
@@ -277,7 +279,15 @@ export async function encodeAvifFromRgba(rgbaPixels, width, height, options = {}
     );
   }
 
-  const opts = normalizeAvifOptions(options);
+  const pixelCount = safeW * safeH;
+  const adaptiveOpts = { ...options };
+  if (adaptiveOpts.speed === undefined && pixelCount <= 2_100_000) {
+    adaptiveOpts.speed = 7;
+  }
+  if (adaptiveOpts.enableSharpYUV === undefined && pixelCount > 2_100_000) {
+    adaptiveOpts.enableSharpYUV = false;
+  }
+  const opts = normalizeAvifOptions(adaptiveOpts);
   const mod = await loadAvifEncoderModule();
   const encoded = mod.encode(rgbaView, safeW, safeH, opts);
 

@@ -1123,9 +1123,11 @@ export class CameraController {
     };
   }
 
-  _scoreBitmapSharpness(bitmap) {
+  _scoreBitmapMetrics(bitmap) {
     try {
-      if (!bitmap || bitmap.width < 16 || bitmap.height < 16) return 0;
+      if (!bitmap || bitmap.width < 16 || bitmap.height < 16) {
+        return { sharpness: 0, meanLuma: 128, trimmedMeanLuma: 128 };
+      }
       const w = 160;
       const h = 120;
       if (!this._sharpnessCtx && typeof document !== 'undefined') {
@@ -1135,25 +1137,31 @@ export class CameraController {
         this._sharpnessCanvas = c;
         this._sharpnessCtx = c.getContext('2d', { willReadFrequently: true });
       }
-      if (!this._sharpnessCtx) return 1;
+      if (!this._sharpnessCtx) {
+        return { sharpness: 1, meanLuma: 128, trimmedMeanLuma: 128 };
+      }
       this._sharpnessCtx.clearRect(0, 0, w, h);
       this._sharpnessCtx.drawImage(bitmap, 0, 0, w, h);
       const img = this._sharpnessCtx.getImageData(0, 0, w, h);
       const luma = rgbaToLuma(img.data, w, h);
-      return analyzeFrameMetrics(luma, w, h).sharpness;
+      return analyzeFrameMetrics(luma, w, h);
     } catch {
-      return 1;
+      return { sharpness: 1, meanLuma: 128, trimmedMeanLuma: 128 };
     }
   }
 
+  _scoreBitmapSharpness(bitmap) {
+    return this._scoreBitmapMetrics(bitmap).sharpness;
+  }
+
   /**
-   * Capture N frames consecutively across ~0.2s for multi-frame stabilization and HDR stacking.
-   * In 'high' stabilization mode, samples 5 frames rapidly and sheds the weakest/tap-shaken frame
-   * immediately so <= 4 crisp frames advance to the GPU/Worker pipeline.
+   * Capture N frames consecutively across ~0.22s for multi-frame stabilization and HDR stacking.
+   * In 'high' stabilization mode, samples 5 frames rapidly and sheds the weakest/tap-shaken
+   * or exposure-drifted frame immediately so <= 4 crisp frames advance to the Pro ISP pipeline.
    */
   async captureBurstFrames(
     frameCount = 4,
-    targetDurationMs = 200,
+    targetDurationMs = 220,
     { stabilizationMode = STABILIZATION_MODES.HIGH } = {}
   ) {
     const mode = normalizeStabilizationMode(stabilizationMode);
@@ -1161,7 +1169,7 @@ export class CameraController {
     const captureCount =
       mode === STABILIZATION_MODES.HIGH && keepCount === 4 ? 5 : keepCount;
     const intervalMs = Math.max(32, Math.floor(targetDurationMs / captureCount));
-    const minWaitMs = mode === STABILIZATION_MODES.HIGH ? 22 : 28;
+    const minWaitMs = mode === STABILIZATION_MODES.HIGH ? 24 : 28;
     const candidates = [];
 
     this._lastVideoFrameMeta = null;
@@ -1171,18 +1179,38 @@ export class CameraController {
         await this._waitNextFrameOrInterval(intervalMs, minWaitMs);
       }
       const bitmap = await this._grabStreamBitmap();
-      const score = captureCount > keepCount ? this._scoreBitmapSharpness(bitmap) : 1;
-      candidates.push({ bitmap, score, index: i });
+      const metrics =
+        captureCount > keepCount
+          ? this._scoreBitmapMetrics(bitmap)
+          : { sharpness: 1, meanLuma: 128, trimmedMeanLuma: 128 };
+      candidates.push({
+        bitmap,
+        score: metrics.sharpness,
+        trimmedMeanLuma: metrics.trimmedMeanLuma ?? metrics.meanLuma ?? 128,
+        index: i,
+      });
     }
 
-    // Drop lowest-sharpness candidate(s) immediately so peak live bitmaps stay <= keepCount
+    // Drop lowest sharpness + exposure-consistent candidate(s) so peak live bitmaps stay <= keepCount
     while (candidates.length > keepCount) {
+      const sortedLumas = candidates
+        .map((c) => c.trimmedMeanLuma)
+        .sort((a, b) => a - b);
+      const medianLuma = sortedLumas[Math.floor(sortedLumas.length / 2)] || 128;
+
+      const weightedScoreFor = (c) => {
+        const lumaDiff = Math.abs((c.trimmedMeanLuma ?? medianLuma) - medianLuma);
+        const exposureConsistency = Math.max(0.76, 1 - Math.max(0, lumaDiff - 8) / 90);
+        const tapWeight = c.index === 0 ? 0.985 : 1.0;
+        return c.score * exposureConsistency * tapWeight;
+      };
+
       let worstPos = 0;
-      let worstWeightedScore = candidates[0].score * (candidates[0].index === 0 ? 0.985 : 1.0);
+      let worstWeightedScore = weightedScoreFor(candidates[0]);
       for (let k = 1; k < candidates.length; k++) {
-        const s = candidates[k].score * (candidates[k].index === 0 ? 0.985 : 1.0);
-        if (s < worstWeightedScore) {
-          worstWeightedScore = s;
+        const ws = weightedScoreFor(candidates[k]);
+        if (ws < worstWeightedScore) {
+          worstWeightedScore = ws;
           worstPos = k;
         }
       }

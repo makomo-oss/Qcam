@@ -5,10 +5,13 @@ import {
 } from '../utils/resolution.js';
 import { WebGLImageProcessor } from '../processing/webgl-processor.js';
 import {
+  COLOR_PROFILES,
   STABILIZATION_MODES,
   alignBitmapBurst,
   applyStabilizedInsetToCrop,
+  computeProDevelopProfile,
   drawAlignedFrameToCanvas,
+  normalizeColorProfile,
   normalizeStabilizationMode,
   summarizeAlignmentPlan,
 } from '../processing/frame-aligner.js';
@@ -23,6 +26,8 @@ import {
   supportsNativeCanvasAvif,
   warmupAvifEncoder,
 } from '../processing/avif-encoder.js';
+
+const DEFAULT_JPEG_QUALITY = 0.96;
 
 function releaseFrames(frames) {
   if (!Array.isArray(frames)) return;
@@ -81,10 +86,10 @@ function cropFrameToCanvas(bitmap, crop, mirrorX, alignEntry = null) {
 }
 
 /**
- * Stabilized motion-aware pixel averaging across up to 4 aligned frames
+ * Stabilized noise-calibrated motion-aware pixel averaging across up to 4 aligned frames
  * (used when OffscreenCanvas lacks WebGL, e.g., older Safari builds).
  */
-function averageFramesCPU(frames, crop, mirrorX, alignEntries = null) {
+function averageFramesCPU(frames, crop, mirrorX, alignEntries = null, noiseSigma = 0.012) {
   const width = crop.outWidth;
   const height = crop.outHeight;
   const buffers = [];
@@ -121,6 +126,13 @@ function averageFramesCPU(frames, crop, mirrorX, alignEntries = null) {
   const ref = buffers[0];
   const out = new Uint8ClampedArray(ref.length);
   const frameCount = buffers.length;
+  const noiseLift = Math.round(Math.max(0, Number(noiseSigma) || 0) * 180);
+  const tightThresh = 22 + noiseLift;
+  const looseThresh = 44 + Math.round(noiseLift * 1.5);
+  const falloffSpan = Math.max(8, looseThresh - tightThresh);
+
+  let extraWeightSum = 0;
+  const pixelCount = Math.max(1, ref.length / 4);
 
   for (let i = 0; i < ref.length; i += 4) {
     const r0 = ref[i];
@@ -146,16 +158,17 @@ function averageFramesCPU(frames, crop, mirrorX, alignEntries = null) {
       const diff = Math.abs(rf - r0) + Math.abs(gf - g0) + Math.abs(bf - b0);
 
       let w = 0;
-      if (diff < 24) {
+      if (diff < tightThresh) {
         w = 4 * conf;
-      } else if (diff < 46) {
-        w = 2 * conf * ((46 - diff) / 22);
+      } else if (diff < looseThresh) {
+        w = 2 * conf * ((looseThresh - diff) / falloffSpan);
       }
       if (w > 0) {
         sumR += rf * w;
         sumG += gf * w;
         sumB += bf * w;
         totalW += w;
+        extraWeightSum += w * 0.25;
       }
     }
 
@@ -169,7 +182,12 @@ function averageFramesCPU(frames, crop, mirrorX, alignEntries = null) {
   const outImageData = new ImageData(out, width, height);
   workCtx.setTransform(1, 0, 0, 1, 0, 0);
   workCtx.putImageData(outImageData, 0, 0);
-  return workCanvas;
+
+  const preMergedCoverage =
+    frameCount > 1
+      ? Math.max(0, Math.min(1, extraWeightSum / (pixelCount * 3)))
+      : 0;
+  return { canvas: workCanvas, preMergedCoverage };
 }
 
 async function encodeWorkerOutput({
@@ -178,11 +196,14 @@ async function encodeWorkerOutput({
   canvas,
   ctx2d,
   avifQuality = AVIF_DEFAULT_OPTIONS.quality,
-  jpegQuality = 0.95,
+  jpegQuality = DEFAULT_JPEG_QUALITY,
   engineBase,
 }) {
   if (format === 'jpeg') {
     const blob = await canvasToEncodedBlob(canvas, JPEG_MIME_TYPE, jpegQuality);
+    if (webgl) {
+      webgl.releaseWorkingBuffers();
+    }
     if (canvas) {
       canvas.width = 1;
       canvas.height = 1;
@@ -200,6 +221,9 @@ async function encodeWorkerOutput({
     if (blob && blob.type === AVIF_MIME_TYPE && blob.size >= 16) {
       const header = await blob.slice(0, 64).arrayBuffer();
       if (isValidAvifBytes(header)) {
+        if (webgl) {
+          webgl.releaseWorkingBuffers();
+        }
         if (canvas) {
           canvas.width = 1;
           canvas.height = 1;
@@ -222,7 +246,8 @@ async function encodeWorkerOutput({
     rgbaPixels = read.data;
     width = read.width;
     height = read.height;
-    // Free the full-resolution WebGL drawing buffer before WASM AVIF allocates heap memory
+    // Free intermediate WebGL textures/FBOs & full-resolution canvas before WASM AVIF allocates heap memory
+    webgl.releaseWorkingBuffers();
     webgl.canvas.width = 1;
     webgl.canvas.height = 1;
   } else {
@@ -272,7 +297,7 @@ self.addEventListener('message', async (event) => {
       width,
       height,
       avifQuality = AVIF_DEFAULT_OPTIONS.quality,
-      engine = 'main-webgl+worker-avif',
+      engine = 'main-webgl-pro+worker-avif',
     } = msg;
     try {
       const blob = await encodeAvifFromRgba(rgbaBuffer, width, height, { quality: avifQuality });
@@ -308,14 +333,14 @@ self.addEventListener('message', async (event) => {
     exposureEv = 0,
     outputMegapixels = 'max',
     maxDimension = null,
-    jpegQuality = 0.95,
+    jpegQuality = DEFAULT_JPEG_QUALITY,
     avifQuality = AVIF_DEFAULT_OPTIONS.quality,
   } = msg;
   const outputFormat = resolveOutputFormat(msg.outputFormat);
   const stabilizationMode = normalizeStabilizationMode(msg.stabilizationMode);
+  const colorProfile = normalizeColorProfile(msg.colorProfile || COLOR_PROFILES.NATURAL);
 
   const intermediates = [];
-
   let fallbackMaxDim = 4096;
 
   try {
@@ -352,12 +377,13 @@ self.addEventListener('message', async (event) => {
     let alignmentPlan = null;
     let stabilizationInfo = null;
 
-    if (typeof OffscreenCanvas === 'function' && mode === 'hq' && frames.length > 1) {
+    if (typeof OffscreenCanvas === 'function') {
       alignmentPlan = alignBitmapBurst({
         frames,
         stabilizationMode,
+        colorProfile,
         createCanvas: (w, h) => new OffscreenCanvas(w, h),
-        maxFrames: 4,
+        maxFrames: mode === 'hq' ? 4 : 1,
       });
       workingFrames = alignmentPlan.selectedIndices.map((idx) => frames[idx]);
       const adoptedSet = new Set(alignmentPlan.selectedIndices);
@@ -370,8 +396,19 @@ self.addEventListener('message', async (event) => {
           }
         }
       }
-      stabilizationInfo = summarizeAlignmentPlan(alignmentPlan, frames.length, stabilizationMode);
+      if (mode === 'hq' && frames.length > 1) {
+        stabilizationInfo = summarizeAlignmentPlan(alignmentPlan, frames.length, stabilizationMode);
+      }
     }
+
+    const developProfile =
+      alignmentPlan?.developProfile ||
+      computeProDevelopProfile(alignmentPlan?.sceneStats || null, {
+        frameCount: workingFrames.length,
+        mergedCount: workingFrames.length,
+        stabilizationMode,
+        colorProfile,
+      });
 
     if (webgl) {
       const baseCrop = computeAspectCrop(
@@ -423,8 +460,7 @@ self.addEventListener('message', async (event) => {
           mirrorX: applyMirrorInShader,
           exposureEv,
           frameAlignments,
-          patchTol2: stabilizationMode === STABILIZATION_MODES.OFF ? 0.0085 : 0.0018,
-          sharpen: stabilizationMode === STABILIZATION_MODES.HIGH ? 0.62 : 0.54,
+          developProfile,
         });
       } else {
         webgl.processStandard(gpuSources[0], {
@@ -433,6 +469,7 @@ self.addEventListener('message', async (event) => {
           cropNorm,
           mirrorX: applyMirrorInShader,
           exposureEv,
+          developProfile,
         });
       }
 
@@ -447,7 +484,7 @@ self.addEventListener('message', async (event) => {
         canvas: webgl.canvas,
         avifQuality,
         jpegQuality,
-        engineBase: 'worker-webgl',
+        engineBase: 'worker-webgl-pro',
       });
 
       self.postMessage({
@@ -465,18 +502,19 @@ self.addEventListener('message', async (event) => {
     }
 
     // Fallback when Worker OffscreenCanvas lacks WebGL (e.g. iOS 16.4-16.6 Safari):
-    // Still perform full frame selection, alignment, and low-ghost averaging inside Worker!
+    // Still perform full frame selection, alignment, noise analysis, and ghost-free averaging inside Worker!
     if (typeof OffscreenCanvas === 'function' && mode === 'hq' && workingFrames.length > 1) {
       const baseCrop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
       const crop = applyStabilizedInsetToCrop(baseCrop, alignmentPlan?.safeCrop);
-      const averagedCanvas = averageFramesCPU(
+      const avgResult = averageFramesCPU(
         workingFrames,
         crop,
         mirrorX,
-        alignmentPlan?.entries || null
+        alignmentPlan?.entries || null,
+        alignmentPlan?.sceneStats?.noiseSigma
       );
       releaseFrames(frames);
-      const averagedBitmap = averagedCanvas.transferToImageBitmap();
+      const averagedBitmap = avgResult.canvas.transferToImageBitmap();
       self.postMessage(
         {
           id,
@@ -485,8 +523,11 @@ self.addEventListener('message', async (event) => {
           averagedBitmap,
           width: crop.outWidth,
           height: crop.outHeight,
-          engine: 'worker-cpu-avg+main-webgl',
+          engine: 'worker-cpu-avg+main-webgl-pro',
           stabilizationInfo,
+          colorProfile,
+          sceneStats: alignmentPlan?.sceneStats || null,
+          preMergedCoverage: avgResult.preMergedCoverage,
         },
         [averagedBitmap]
       );
