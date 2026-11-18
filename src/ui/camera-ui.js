@@ -12,20 +12,17 @@ export class CameraUI {
       topHud: document.getElementById('top-hud'),
       topBar: document.querySelector('.top-bar'),
       bottomDock: document.querySelector('.bottom-dock'),
-      zoomBar: document.querySelector('.zoom-bar'),
-      silentBadge: document.getElementById('silent-badge'),
-      resolutionBadge: document.getElementById('resolution-badge'),
-      btnStabilization: document.getElementById('btn-stabilization'),
-      stabBadgeLabel: document.getElementById('stab-badge-label'),
+      zoomDock: document.getElementById('zoom-dock'),
+      zoomBar: document.getElementById('zoom-bar'),
+      zoomSliderPanel: document.getElementById('zoom-slider-panel'),
+      btnZoomSliderToggle: document.getElementById('btn-zoom-slider-toggle'),
+      btnZoomSliderClose: document.getElementById('btn-zoom-slider-close'),
       btnAspect: document.getElementById('btn-aspect'),
       aspectLabel: document.getElementById('aspect-label'),
       btnGrid: document.getElementById('btn-grid'),
       btnTimer: document.getElementById('btn-timer'),
       timerLabel: document.getElementById('timer-label'),
       btnInfo: document.getElementById('btn-info'),
-      permHintBanner: document.getElementById('perm-hint-banner'),
-      btnPermHintOpen: document.getElementById('btn-perm-hint-open'),
-      btnPermHintDismiss: document.getElementById('btn-perm-hint-dismiss'),
 
       stage: document.getElementById('viewfinder-stage'),
       frame: document.getElementById('viewfinder-frame'),
@@ -38,7 +35,6 @@ export class CameraUI {
       shutterBlackout: document.getElementById('shutter-blackout'),
       countdownOverlay: document.getElementById('countdown-overlay'),
       countdownNumber: document.getElementById('countdown-number'),
-      shakeWarningPill: document.getElementById('shake-warning-pill'),
       zoomHudPill: document.getElementById('zoom-hud-pill'),
 
       cameraOverlay: document.getElementById('camera-overlay'),
@@ -50,7 +46,7 @@ export class CameraUI {
       saveToast: document.getElementById('save-toast'),
       modalToast: document.getElementById('modal-toast'),
       btnZoom05: document.getElementById('btn-zoom-05'),
-      zoomPresets: Array.from(document.querySelectorAll('.zoom-bar .zoom-preset')),
+      zoomPresets: Array.from(document.querySelectorAll('#zoom-bar .zoom-preset')),
       zoomSlider: document.getElementById('zoom-slider'),
       zoomReadout: document.getElementById('zoom-readout'),
 
@@ -134,9 +130,6 @@ export class CameraUI {
         this.handlers.onSelectColorProfile?.(btn.dataset.colorProfile);
       });
     }
-    this.els.btnStabilization?.addEventListener('click', () =>
-      this.handlers.onCycleStabilization?.()
-    );
     for (const btn of this.els.stabilizationButtons) {
       btn.addEventListener('click', () => {
         this.handlers.onSelectStabilization?.(btn.dataset.stabilization);
@@ -151,12 +144,6 @@ export class CameraUI {
       if (e.target === this.els.infoModal) this.closeInfoModal();
     });
 
-    this.els.btnPermHintOpen?.addEventListener('click', () => {
-      this.handlers.onOpenPermissionGuide?.();
-    });
-    this.els.btnPermHintDismiss?.addEventListener('click', () => {
-      this.handlers.onDismissPermissionHint?.();
-    });
     this.els.btnOverlayHelp?.addEventListener('click', () => {
       this.handlers.onOpenPermissionGuide?.();
     });
@@ -171,6 +158,9 @@ export class CameraUI {
         this.handlers.onZoomChange(Number(preset.dataset.zoom));
       });
     }
+
+    this.els.btnZoomSliderToggle?.addEventListener('click', () => this.toggleZoomSlider(true));
+    this.els.btnZoomSliderClose?.addEventListener('click', () => this.toggleZoomSlider(false));
 
     this.els.zoomSlider.addEventListener('input', (e) => {
       this.handlers.onZoomChange(Number(e.target.value));
@@ -236,11 +226,14 @@ export class CameraUI {
       this.handlers.onSettingChange('mirrorFrontSave', Boolean(e.target.checked));
     });
 
-    // Keyboard shortcuts (Space/Enter to shoot when modal closed, Esc to close modals)
+    // Keyboard shortcuts (Space/Enter to shoot when modal closed, Esc to close modals/slider)
     window.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         if (!this.els.previewModal.hidden) this.closePreviewModal();
-        if (!this.els.infoModal.hidden) this.closeInfoModal();
+        else if (!this.els.infoModal.hidden) this.closeInfoModal();
+        else if (this.els.zoomSliderPanel && !this.els.zoomSliderPanel.hidden) {
+          this.toggleZoomSlider(false);
+        }
       } else if (
         (e.code === 'Space' || e.key === 'Enter') &&
         this.els.previewModal.hidden &&
@@ -424,8 +417,10 @@ export class CameraUI {
 
   setTimerSeconds(seconds) {
     this.state.timerSeconds = seconds;
-    this.els.timerLabel.textContent = seconds > 0 ? `${seconds}s` : 'OFF';
-    this.els.btnTimer.classList.toggle('is-active', seconds > 0);
+    const active = seconds > 0;
+    this.els.timerLabel.hidden = !active;
+    this.els.timerLabel.textContent = active ? `${seconds}s` : '';
+    this.els.btnTimer.classList.toggle('is-active', active);
   }
 
   setOutputFormat(format) {
@@ -442,22 +437,6 @@ export class CameraUI {
     const safeMode = mode === 'standard' || mode === 'off' ? mode : 'high';
     this.state.stabilization = safeMode;
 
-    if (this.els.btnStabilization) {
-      this.els.btnStabilization.classList.toggle('is-active', safeMode === 'high');
-      this.els.btnStabilization.classList.toggle('is-standard', safeMode === 'standard');
-      this.els.btnStabilization.setAttribute(
-        'aria-label',
-        safeMode === 'high'
-          ? '手ぶれ補正: 高品質 (強)'
-          : safeMode === 'standard'
-          ? '手ぶれ補正: 標準'
-          : '手ぶれ補正: オフ'
-      );
-    }
-    if (this.els.stabBadgeLabel) {
-      this.els.stabBadgeLabel.textContent =
-        safeMode === 'high' ? 'EIS 強' : safeMode === 'standard' ? 'EIS 標準' : 'EIS OFF';
-    }
     for (const btn of this.els.stabilizationButtons) {
       const active = btn.dataset.stabilization === safeMode;
       btn.classList.toggle('is-active', active);
@@ -470,9 +449,6 @@ export class CameraUI {
           : safeMode === 'standard'
           ? '標準: 4連写位置合わせ合成・残像除去＋ブレフレーム除外'
           : 'オフ (三脚): 位置補正なしで 4 フレームを直接合成（三脚固定撮影向け）';
-    }
-    if (safeMode === 'off') {
-      this.setShakeWarning(false);
     }
   }
 
@@ -494,9 +470,41 @@ export class CameraUI {
     }
   }
 
-  setShakeWarning(active) {
-    if (this.els.shakeWarningPill) {
-      this.els.shakeWarningPill.hidden = !active;
+  toggleZoomSlider(open) {
+    if (!this.els.zoomSliderPanel || !this.els.zoomBar) return;
+    const showSlider = typeof open === 'boolean' ? open : this.els.zoomSliderPanel.hidden;
+    this.els.zoomSliderPanel.hidden = !showSlider;
+    this.els.zoomBar.hidden = showSlider;
+    this.els.btnZoomSliderToggle?.setAttribute('aria-expanded', String(showSlider));
+  }
+
+  _formatZoomBadge(zoom) {
+    const roundedInt = Math.round(zoom);
+    return Math.abs(zoom - roundedInt) < 0.05 ? `${roundedInt}×` : `${zoom.toFixed(1)}×`;
+  }
+
+  _syncZoomPresets(totalZoom) {
+    const visiblePresets = this.els.zoomPresets
+      .filter((p) => !p.hidden)
+      .sort((a, b) => Number(a.dataset.zoom) - Number(b.dataset.zoom));
+
+    let activePreset = visiblePresets[0] || null;
+    for (const p of visiblePresets) {
+      if (Number(p.dataset.zoom) <= totalZoom + 0.02) {
+        activePreset = p;
+      }
+    }
+
+    const activeText = this._formatZoomBadge(totalZoom);
+    for (const preset of this.els.zoomPresets) {
+      if (preset.hidden) {
+        preset.classList.remove('is-active');
+        continue;
+      }
+      const isActive = preset === activePreset;
+      preset.classList.toggle('is-active', isActive);
+      const baseLabel = preset.dataset.label || preset.dataset.zoom;
+      preset.textContent = isActive ? activeText : baseLabel;
     }
   }
 
@@ -519,16 +527,7 @@ export class CameraUI {
 
     this.els.zoomSlider.value = String(totalZoom);
     this.els.zoomReadout.textContent = `${totalZoom.toFixed(1)}×`;
-
-    for (const preset of this.els.zoomPresets) {
-      if (preset.hidden) {
-        preset.classList.remove('is-active');
-        continue;
-      }
-      const pz = Number(preset.dataset.zoom);
-      const isClose = Math.abs(totalZoom - pz) < 0.12;
-      preset.classList.toggle('is-active', isClose);
-    }
+    this._syncZoomPresets(totalZoom);
   }
 
   setExposureDisplay(ev) {
@@ -563,15 +562,6 @@ export class CameraUI {
     }
   }
 
-  updateStreamBadges(info) {
-    if (!info) return;
-    const resText =
-      info.videoWidth && info.videoHeight
-        ? `${info.videoWidth}×${info.videoHeight}`
-        : '--×--';
-    this.els.resolutionBadge.textContent = resText;
-  }
-
   updateLensControls(info) {
     if (!info) return;
     const supportsUw = Boolean(info.supportsUltraWide && info.facingMode !== 'user');
@@ -587,14 +577,15 @@ export class CameraUI {
     if (this.els.btnZoom05) {
       this.els.btnZoom05.hidden = !supportsUw;
       if (supportsUw) {
-        const label = `${uwZoom.toFixed(1)}×`;
+        const baseLabel = uwZoom.toFixed(1);
         this.els.btnZoom05.dataset.zoom = String(uwZoom);
-        this.els.btnZoom05.textContent = label;
+        this.els.btnZoom05.dataset.label = baseLabel;
         this.els.btnZoom05.setAttribute('aria-label', `超広角 ${uwZoom.toFixed(1)}倍`);
       } else {
         this.els.btnZoom05.classList.remove('is-active');
       }
     }
+    this._syncZoomPresets(this.state.totalZoom);
 
     if (this.els.backLensSection && this.els.backLensOptions) {
       const lenses =
@@ -719,18 +710,6 @@ export class CameraUI {
 
   hideCameraOverlay() {
     this.els.cameraOverlay.hidden = true;
-  }
-
-  showPermissionHintBanner() {
-    if (this.els.permHintBanner) {
-      this.els.permHintBanner.hidden = false;
-    }
-  }
-
-  hidePermissionHintBanner() {
-    if (this.els.permHintBanner) {
-      this.els.permHintBanner.hidden = true;
-    }
   }
 
   updateThumbnail(latestPhoto, totalCount) {

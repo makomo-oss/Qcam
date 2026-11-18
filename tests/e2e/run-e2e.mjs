@@ -194,10 +194,12 @@ async function main() {
 
     await page.click('#btn-timer');
     assert.equal(await page.textContent('#timer-label'), '3s');
+    assert.equal(await page.locator('#timer-label').isVisible(), true);
     await page.click('#btn-timer');
     assert.equal(await page.textContent('#timer-label'), '10s');
     await page.click('#btn-timer');
-    assert.equal(await page.textContent('#timer-label'), 'OFF');
+    assert.equal(await page.locator('#timer-label').isVisible(), false);
+    assert.equal(await page.textContent('#timer-label'), '');
 
     // 5. Verify Tap-to-Focus reticle & EV control
     const vfBox = await page.locator('#viewfinder-frame').boundingBox();
@@ -209,14 +211,35 @@ async function main() {
       await page.screenshot({ path: path.join(screenshotDir, 'e2e_viewfinder.png') });
     }
 
-    console.log('[e2e] checking zoom and WebGL orientation');
-    // 6. Verify 0.5x button stays hidden when hardware does not advertise ultra-wide, and Zoom preset (2x) works
+    console.log('[e2e] checking zoom pill, collapsible zoom slider, and WebGL orientation');
+    // 6. Verify 0.5x button stays hidden when hardware does not advertise ultra-wide,
+    // compact zoom pill formats active/inactive badges, and collapsible fine slider works
     assert.equal(await page.locator('#btn-zoom-05').isVisible(), false);
     assert.equal(await page.evaluate(() => window.__QCAM__.ui.state.minZoom), 1);
+    assert.equal(await page.textContent('.zoom-preset[data-zoom="1"]'), '1×');
+    assert.equal(await page.textContent('.zoom-preset[data-zoom="2"]'), '2');
+
     await page.click('.zoom-preset[data-zoom="2"]');
     assert.equal(await page.textContent('#zoom-readout'), '2.0×');
+    assert.equal(await page.textContent('.zoom-preset[data-zoom="2"]'), '2×');
+    assert.equal(await page.textContent('.zoom-preset[data-zoom="1"]'), '1');
+
+    await page.click('#btn-zoom-slider-toggle');
+    assert.equal(await page.locator('#zoom-slider-panel').isVisible(), true);
+    assert.equal(await page.locator('#zoom-bar').isVisible(), false);
+    await page.locator('#zoom-slider').evaluate((el) => {
+      el.value = '1.6';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    assert.equal(await page.textContent('#zoom-readout'), '1.6×');
+    assert.equal(await page.textContent('.zoom-preset[data-zoom="1"]'), '1.6×');
+    await page.click('#btn-zoom-slider-close');
+    assert.equal(await page.locator('#zoom-bar').isVisible(), true);
+    assert.equal(await page.locator('#zoom-slider-panel').isVisible(), false);
+
     await page.click('.zoom-preset[data-zoom="1"]');
     assert.equal(await page.textContent('#zoom-readout'), '1.0×');
+    assert.equal(await page.textContent('.zoom-preset[data-zoom="1"]'), '1×');
 
     // 7. Verify WebGL pixel orientation, AVIF ISOBMFF signature, & main-thread offload path
     const orientationCheck = await page.evaluate(async () => {
@@ -477,9 +500,15 @@ async function main() {
     // Reset timer back to OFF
     await page.click('#btn-timer');
     await page.click('#btn-timer');
+    assert.equal(await page.locator('#timer-label').isVisible(), false);
 
-    // 13. Open Settings / Info Sheet, verify AVIF/HDR/EIS/Look diagnostics, quality controls & version, test JPEG, Look & EIS switches, then switch back to AVIF
-    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 強');
+    // 13. Verify distracting viewfinder chrome is absent, open Info Sheet, check v1.8.0 diagnostics, Look/Format/EIS controls
+    assert.equal(await page.locator('#silent-badge').count(), 0);
+    assert.equal(await page.locator('#resolution-badge').count(), 0);
+    assert.equal(await page.locator('#btn-stabilization').count(), 0);
+    assert.equal(await page.locator('#perm-hint-banner').count(), 0);
+    assert.equal(await page.locator('#shake-warning-pill').count(), 0);
+
     await page.click('#btn-info');
     await page.waitForSelector('#info-modal:not([hidden])');
     assert.equal(await page.getAttribute('#btn-format-avif', 'aria-checked'), 'true');
@@ -488,7 +517,7 @@ async function main() {
     assert.ok((await page.locator('#resolution-options .lens-chip').count()) >= 1);
     assert.ok((await page.locator('#megapixels-options .lens-chip').count()) >= 1);
     const diagText = await page.textContent('#diagnostics-list');
-    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.7.0'));
+    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.8.0'));
     assert.ok(diagText.includes('撮影画質モード') && diagText.includes('高画質 HDR (常時有効)'));
     assert.ok(diagText.includes('仕上がりトーン') && diagText.includes('Pro ナチュラル'));
     assert.ok(diagText.includes('手ぶれ補正モード') && diagText.includes('高品質 (強'));
@@ -512,7 +541,6 @@ async function main() {
     assert.equal(await page.getAttribute('#btn-look-vivid', 'aria-checked'), 'true');
     await page.click('#btn-stab-standard');
     assert.equal(await page.getAttribute('#btn-stab-standard', 'aria-checked'), 'true');
-    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 標準');
 
     // Switch output format to JPEG and verify capture saves .jpg
     await page.click('#btn-format-jpeg');
@@ -573,16 +601,18 @@ async function main() {
     assert.equal(await page.evaluate(() => window.__QCAM__.settings.mode), 'hq');
     assert.equal(await page.evaluate(() => window.__QCAM__.settings.colorProfile), 'vivid');
     assert.equal(await page.evaluate(() => window.__QCAM__.settings.stabilization), 'standard');
-    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 標準');
     assert.equal(await page.evaluate(() => window.__QCAM__.camera.facingMode), 'user');
-    assert.equal(await page.locator('#perm-hint-banner').isVisible(), false);
 
-    // Cycle stabilization pill on main HUD: EIS 標準 -> EIS OFF -> EIS 強
-    await page.click('#btn-stabilization');
-    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS OFF');
-    await page.click('#btn-stabilization');
-    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 強');
+    // Switch EIS mode inside Info Sheet: standard -> off -> high
+    await page.click('#btn-info');
+    await page.waitForSelector('#info-modal:not([hidden])');
+    await page.click('#btn-stab-off');
+    assert.equal(await page.getAttribute('#btn-stab-off', 'aria-checked'), 'true');
+    assert.equal(await page.evaluate(() => window.__QCAM__.settings.stabilization), 'off');
+    await page.click('#btn-stab-high');
+    assert.equal(await page.getAttribute('#btn-stab-high', 'aria-checked'), 'true');
     assert.equal(await page.evaluate(() => window.__QCAM__.settings.stabilization), 'high');
+    await page.click('#btn-info-close');
 
     if (screenshotDir) {
       await page.screenshot({ path: path.join(screenshotDir, 'e2e_viewfinder_169.png') });
@@ -594,24 +624,19 @@ async function main() {
     await page.waitForTimeout(140);
     const compactStats = await page.evaluate(() => {
       const topBar = document.querySelector('.top-bar');
-      const resBadge = document.getElementById('resolution-badge');
-      const silentLabel = document.querySelector('.silent-label');
+      const zoomBar = document.getElementById('zoom-bar');
+      const zoomBarRect = zoomBar.getBoundingClientRect();
       const btnInfoRect = document.getElementById('btn-info').getBoundingClientRect();
       const shutterRect = document.getElementById('btn-shutter').getBoundingClientRect();
       const vfRect = document.getElementById('viewfinder-frame').getBoundingClientRect();
 
-      const origRes = resBadge.textContent;
-      resBadge.textContent = '4032×3024';
-      const maxResScrollW = topBar.scrollWidth;
-      const maxResClientW = topBar.clientWidth;
-      resBadge.textContent = origRes;
-
       return {
         topBarScrollW: topBar.scrollWidth,
         topBarClientW: topBar.clientWidth,
-        maxResScrollW,
-        maxResClientW,
-        silentLabelDisplay: getComputedStyle(silentLabel).display,
+        zoomBarScrollW: zoomBar.scrollWidth,
+        zoomBarClientW: zoomBar.clientWidth,
+        zoomBarRight: zoomBarRect.right,
+        zoomBarLeft: zoomBarRect.left,
         btnInfoRight: btnInfoRect.right,
         shutterBottom: shutterRect.bottom,
         shutterTop: shutterRect.top,
@@ -620,11 +645,25 @@ async function main() {
       };
     });
     assert.ok(compactStats.topBarScrollW <= compactStats.topBarClientW + 1, `Top bar overflowed on 360px: ${JSON.stringify(compactStats)}`);
-    assert.ok(compactStats.maxResScrollW <= compactStats.maxResClientW + 1, `Top bar overflowed on 360px with 4032x3024 badge: ${JSON.stringify(compactStats)}`);
-    assert.equal(compactStats.silentLabelDisplay, 'none', 'Silent label should collapse on <=375px width');
+    assert.ok(compactStats.zoomBarScrollW <= compactStats.zoomBarClientW + 1, `Zoom bar overflowed on 360px: ${JSON.stringify(compactStats)}`);
+    assert.ok(compactStats.zoomBarLeft >= 0 && compactStats.zoomBarRight <= 360, `Zoom bar out of bounds on 360px: ${JSON.stringify(compactStats)}`);
     assert.ok(compactStats.btnInfoRight <= 360, `btn-info clipped on 360px: ${compactStats.btnInfoRight}`);
     assert.ok(compactStats.shutterBottom <= 640 && compactStats.shutterTop > 0, `Shutter out of bounds: ${JSON.stringify(compactStats)}`);
     assert.ok(compactStats.vfWidth >= 358, `16:9 portrait on 360x640 should use full 360px width, got ${compactStats.vfWidth}`);
+
+    // Verify expanded zoom slider fits cleanly on 360px as well
+    await page.click('#btn-zoom-slider-toggle');
+    const compactSliderStats = await page.evaluate(() => {
+      const panel = document.getElementById('zoom-slider-panel');
+      const pr = panel.getBoundingClientRect();
+      return { scrollW: panel.scrollWidth, clientW: panel.clientWidth, left: pr.left, right: pr.right };
+    });
+    assert.ok(
+      compactSliderStats.scrollW <= compactSliderStats.clientW + 1 && compactSliderStats.left >= 0 && compactSliderStats.right <= 360,
+      `Zoom slider overflowed 360px: ${JSON.stringify(compactSliderStats)}`
+    );
+    await page.click('#btn-zoom-slider-close');
+
     if (screenshotDir) {
       await page.screenshot({ path: path.join(screenshotDir, 'e2e_compact_360x640.png') });
     }
@@ -642,6 +681,7 @@ async function main() {
     await page.waitForTimeout(160);
     const landStats = await page.evaluate(() => {
       const dock = document.querySelector('.bottom-dock').getBoundingClientRect();
+      const zoomDock = document.getElementById('zoom-dock').getBoundingClientRect();
       const zoomBar = document.querySelector('.zoom-bar').getBoundingClientRect();
       const topHud = document.getElementById('top-hud').getBoundingClientRect();
       const shutter = document.getElementById('btn-shutter').getBoundingClientRect();
@@ -649,6 +689,7 @@ async function main() {
       const vf = document.getElementById('viewfinder-frame').getBoundingClientRect();
       return {
         dock,
+        zoomDock,
         zoomBar,
         topHud,
         shutter,
@@ -659,6 +700,7 @@ async function main() {
     });
     assert.ok(landStats.dock.height <= 391 && landStats.dockScrollH <= 391, `Landscape dock overflowed vertically: ${JSON.stringify(landStats)}`);
     assert.ok(landStats.zoomBar.right <= landStats.dock.left + 1, `Zoom bar overlaps landscape right dock: ${JSON.stringify(landStats)}`);
+    assert.ok(landStats.zoomDock.right <= landStats.dock.left + 1, `Zoom dock overlaps landscape right dock: ${JSON.stringify(landStats)}`);
     assert.ok(landStats.topHud.right <= landStats.dock.left + 1, `Top HUD overlaps landscape right dock: ${JSON.stringify(landStats)}`);
     assert.ok(landStats.shutter.bottom <= 390 && landStats.shutterRow.top >= 0);
     assert.ok(
@@ -666,6 +708,16 @@ async function main() {
       `Landscape shutter row should sit balanced near vertical center, got ${JSON.stringify(landStats.shutterRow)}`
     );
     assert.ok(landStats.vf.left + landStats.vf.width <= landStats.dock.left + 2, `Landscape viewfinder hidden under dock: ${JSON.stringify(landStats.vf)}`);
+
+    // Check expanded zoom slider also avoids right dock in landscape
+    await page.click('#btn-zoom-slider-toggle');
+    const landSliderStats = await page.evaluate(() => {
+      const panel = document.getElementById('zoom-slider-panel').getBoundingClientRect();
+      const dock = document.querySelector('.bottom-dock').getBoundingClientRect();
+      return { left: panel.left, right: panel.right, dockLeft: dock.left };
+    });
+    assert.ok(landSliderStats.left >= 0 && landSliderStats.right <= landSliderStats.dockLeft + 1, `Landscape zoom slider overlaps dock: ${JSON.stringify(landSliderStats)}`);
+    await page.click('#btn-zoom-slider-close');
 
     // Tap near right edge of landscape viewfinder and verify EV slider flips left cleanly
     await page.mouse.click(landStats.vf.left + landStats.vf.width - 14, landStats.vf.top + landStats.vf.height * 0.5);
@@ -676,32 +728,8 @@ async function main() {
     }
     await context.close();
 
-    // 18. Permission prompt reload hint & denied recovery flow in isolated contexts
-    console.log('[e2e] checking permission reload hint banner and denied fallback UX');
-    const promptContext = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      permissions: ['camera'],
-    });
-    const promptPage = await promptContext.newPage();
-    await promptPage.addInitScript(() => {
-      localStorage.setItem('qcam_perm_granted_once', '1');
-      if (navigator.permissions) {
-        const origQuery = navigator.permissions.query.bind(navigator.permissions);
-        navigator.permissions.query = (desc) => {
-          if (desc && desc.name === 'camera') {
-            return Promise.resolve({ state: 'prompt' });
-          }
-          return origQuery(desc);
-        };
-      }
-    });
-    await promptPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
-    await promptPage.waitForSelector('#perm-hint-banner:not([hidden])', { timeout: 6000 });
-    await promptPage.click('#btn-perm-hint-dismiss');
-    assert.equal(await promptPage.locator('#perm-hint-banner').isVisible(), false);
-    assert.equal(await promptPage.evaluate(() => localStorage.getItem('qcam_perm_hint_dismissed')), '1');
-    await promptContext.close();
-
+    // 18. Camera denied recovery flow in isolated context
+    console.log('[e2e] checking camera denied fallback UX');
     const deniedContext = await browser.newContext({
       viewport: { width: 390, height: 844 },
     });
@@ -1002,29 +1030,51 @@ async function main() {
     }, { timeout: 6000 });
 
     assert.equal(await androidUwPage.locator('#btn-zoom-05').isVisible(), true);
-    assert.equal((await androidUwPage.textContent('#btn-zoom-05')).trim(), '0.5×');
+    assert.equal((await androidUwPage.textContent('#btn-zoom-05')).trim(), '0.5');
+    assert.equal((await androidUwPage.textContent('.zoom-preset[data-zoom="1"]')).trim(), '1×');
 
     const uwCompactOverflow = await androidUwPage.evaluate(() => {
       const zb = document.querySelector('.zoom-bar');
-      const sl = document.getElementById('zoom-slider').getBoundingClientRect();
       const zbr = zb.getBoundingClientRect();
       return {
         scrollW: zb.scrollWidth,
         clientW: zb.clientWidth,
-        sliderRight: sl.right,
+        barLeft: zbr.left,
         barRight: zbr.right,
       };
     });
     assert.ok(
-      uwCompactOverflow.scrollW <= uwCompactOverflow.clientW + 1,
+      uwCompactOverflow.scrollW <= uwCompactOverflow.clientW + 1 &&
+        uwCompactOverflow.barLeft >= 0 &&
+        uwCompactOverflow.barRight <= 360,
       `0.5x zoom bar overflowed 360px: ${JSON.stringify(uwCompactOverflow)}`
     );
+
+    await androidUwPage.click('#btn-zoom-slider-toggle');
+    const uwSliderOverflow = await androidUwPage.evaluate(() => {
+      const panel = document.getElementById('zoom-slider-panel');
+      const sl = document.getElementById('zoom-slider').getBoundingClientRect();
+      const pr = panel.getBoundingClientRect();
+      return {
+        scrollW: panel.scrollWidth,
+        clientW: panel.clientWidth,
+        sliderRight: sl.right,
+        panelRight: pr.right,
+      };
+    });
+    assert.ok(
+      uwSliderOverflow.scrollW <= uwSliderOverflow.clientW + 1 && uwSliderOverflow.panelRight <= 360,
+      `0.5x zoom slider overflowed 360px: ${JSON.stringify(uwSliderOverflow)}`
+    );
+    await androidUwPage.click('#btn-zoom-slider-close');
 
     await androidUwPage.click('#btn-zoom-05');
     await androidUwPage.waitForFunction(
       () => Math.abs(window.__QCAM__.camera.targetZoom - 0.5) < 0.01
     );
     assert.equal(await androidUwPage.textContent('#zoom-readout'), '0.5×');
+    assert.equal((await androidUwPage.textContent('#btn-zoom-05')).trim(), '0.5×');
+    assert.equal((await androidUwPage.textContent('.zoom-preset[data-zoom="1"]')).trim(), '1');
     const hwUwState = await androidUwPage.evaluate(() => ({
       softwareZoom: window.__QCAM__.camera.softwareZoom,
       hardwareZoom: window.__QCAM__.camera.hardwareZoom,
@@ -1362,10 +1412,10 @@ async function main() {
       () =>
         window.__QCAM__.streamInfo?.videoWidth === 2560 &&
         window.__QCAM__.streamInfo?.videoHeight === 1920 &&
-        window.__QCAM__.streamInfo?.photoMaxWidth === 4800,
+        window.__QCAM__.streamInfo?.photoMaxWidth === 4800 &&
+        document.getElementById('camera-video').videoWidth === 2560,
       { timeout: 10000 }
     );
-    assert.equal(await hiResPage.textContent('#resolution-badge'), '2560×1920');
     assert.ok(
       await hiResPage.evaluate(() =>
         window.__HIRES_APPLIED__.some((c) => c?.width?.ideal === 2560 && c?.height?.ideal === 1920)
@@ -1381,6 +1431,7 @@ async function main() {
     assert.ok(resChipTexts.some((t) => t.includes('FHD')), `Missing FHD option: ${resChipTexts}`);
     assert.ok(!resChipTexts.some((t) => t.includes('4K')), `4K option should not appear when sensor max is 2560x1920: ${resChipTexts}`);
     assert.equal(await hiResPage.getAttribute('#resolution-options [data-resolution-preset="max"]', 'aria-checked'), 'true');
+    assert.ok((await hiResPage.textContent('#diagnostics-list')).includes('2560×1920'));
 
     // AVIF caps >16MP sensor cleanly with clear note and allows full 17.3 MP in JPEG
     const avifMpTopText = await hiResPage.textContent('#megapixels-options [data-megapixels="max"]');
@@ -1394,7 +1445,7 @@ async function main() {
       () =>
         window.__QCAM__.streamInfo?.videoWidth === 1920 &&
         window.__QCAM__.streamInfo?.videoHeight === 1440 &&
-        document.getElementById('resolution-badge').textContent === '1920×1440',
+        document.getElementById('camera-video').videoWidth === 1920,
       { timeout: 6000 }
     );
     await hiResPage.click('#btn-info-close');
@@ -1404,14 +1455,15 @@ async function main() {
       () =>
         window.__QCAM__.settings.cameraResolution === 'fhd' &&
         window.__QCAM__.streamInfo?.videoWidth === 1920 &&
-        window.__QCAM__.streamInfo?.videoHeight === 1440,
+        window.__QCAM__.streamInfo?.videoHeight === 1440 &&
+        document.getElementById('camera-video').videoWidth === 1920,
       { timeout: 10000 }
     );
-    assert.equal(await hiResPage.textContent('#resolution-badge'), '1920×1440');
 
     // Capture in AVIF with '8 MP' selected -> uses Android takePhoto() + HDR and outputs 8MP AVIF
     await hiResPage.click('#btn-info');
     await hiResPage.waitForSelector('#info-modal:not([hidden])');
+    assert.ok((await hiResPage.textContent('#diagnostics-list')).includes('1920×1440'));
     await hiResPage.click('#megapixels-options [data-megapixels="8"]');
     assert.equal(await hiResPage.evaluate(() => window.__QCAM__.settings.outputMegapixels), 8);
     await hiResPage.click('#btn-info-close');
@@ -1914,7 +1966,7 @@ async function main() {
       `Expected crisper bar RMS contrast in stabilized output, got high=${stabCompare.highMetrics.rmsContrast.toFixed(1)} vs off=${stabCompare.offMetrics.rmsContrast.toFixed(1)}`
     );
 
-    // Part B: Full live shaky camera capture + diagnostics + shake warning HUD layout check
+    // Part B: Full live shaky camera capture + diagnostics check
     const liveStabDlPromise = stabPage.waitForEvent('download', { timeout: 12000 });
     await stabPage.click('#btn-shutter');
     const liveStabDl = await liveStabDlPromise;
@@ -1929,25 +1981,6 @@ async function main() {
     assert.ok(stabDiagText.includes('手ぶれ補正モード') && stabDiagText.includes('高品質 (強'));
     assert.ok(stabDiagText.includes('直近のブレ補正') && stabDiagText.includes('採用') && stabDiagText.includes('シフト補正'));
     await stabPage.click('#btn-info-close');
-
-    // Verify shake warning pill geometry fits inside viewfinder frame without overlapping dock or top HUD
-    const shakePillStats = await stabPage.evaluate(() => {
-      window.__QCAM__.ui.setShakeWarning(true);
-      const pill = document.getElementById('shake-warning-pill').getBoundingClientRect();
-      const vf = document.getElementById('viewfinder-frame').getBoundingClientRect();
-      const dock = document.querySelector('.bottom-dock').getBoundingClientRect();
-      const topHud = document.getElementById('top-hud').getBoundingClientRect();
-      return { pill, vf, dock, topHud };
-    });
-    assert.ok(
-      shakePillStats.pill.width > 80 &&
-        shakePillStats.pill.top >= shakePillStats.topHud.bottom &&
-        shakePillStats.pill.bottom <= shakePillStats.dock.top + 1 &&
-        shakePillStats.pill.left >= shakePillStats.vf.left &&
-        shakePillStats.pill.right <= shakePillStats.vf.right + 1,
-      `Shake warning pill layout overlap: ${JSON.stringify(shakePillStats)}`
-    );
-    await stabPage.evaluate(() => window.__QCAM__.ui.setShakeWarning(false));
 
     await stabContext.close();
 
