@@ -133,7 +133,7 @@ export class WebGLImageProcessor {
         gl.getUniformLocation(this.standardProgram, 'uMirrorX'),
         mirrorX ? 1.0 : 0.0
       );
-      gl.uniform1f(gl.getUniformLocation(this.standardProgram, 'uSharpen'), 0.55);
+      gl.uniform1f(gl.getUniformLocation(this.standardProgram, 'uSharpen'), 0.62);
       gl.uniform1f(gl.getUniformLocation(this.standardProgram, 'uContrast'), 0.14);
       gl.uniform1f(gl.getUniformLocation(this.standardProgram, 'uExposureEv'), exposureEv);
 
@@ -144,7 +144,19 @@ export class WebGLImageProcessor {
     }
   }
 
-  processHQ(frames, { outWidth, outHeight, cropNorm, mirrorX = false, exposureEv = 0 }) {
+  processHQ(
+    frames,
+    {
+      outWidth,
+      outHeight,
+      cropNorm,
+      mirrorX = false,
+      exposureEv = 0,
+      frameAlignments = null,
+      patchTol2 = 0.0018,
+      sharpen = 0.56,
+    }
+  ) {
     const gl = this.gl;
     this.canvas.width = outWidth;
     this.canvas.height = outHeight;
@@ -165,6 +177,62 @@ export class WebGLImageProcessor {
           Math.min(i, textures.length - 1)
         );
       }
+
+      const alignDefaults = {
+        uvMatrix: { mat: [1, 0, 0, 1], shift: [0, 0] },
+        weight: 1.0,
+        lumaGain: 1.0,
+      };
+      const entryFor = (idx) => {
+        if (idx >= limitedFrames.length) {
+          return { uvMatrix: { mat: [1, 0, 0, 1], shift: [0, 0] }, weight: 0.0, lumaGain: 1.0 };
+        }
+        return (Array.isArray(frameAlignments) && frameAlignments[idx]) || alignDefaults;
+      };
+      const e1 = entryFor(1);
+      const e2 = entryFor(2);
+      const e3 = entryFor(3);
+
+      gl.uniform4fv(
+        gl.getUniformLocation(this.hqProgram, 'uAlignMat1'),
+        e1.uvMatrix?.mat || [1, 0, 0, 1]
+      );
+      gl.uniform2fv(
+        gl.getUniformLocation(this.hqProgram, 'uAlignShift1'),
+        e1.uvMatrix?.shift || [0, 0]
+      );
+      gl.uniform4fv(
+        gl.getUniformLocation(this.hqProgram, 'uAlignMat2'),
+        e2.uvMatrix?.mat || [1, 0, 0, 1]
+      );
+      gl.uniform2fv(
+        gl.getUniformLocation(this.hqProgram, 'uAlignShift2'),
+        e2.uvMatrix?.shift || [0, 0]
+      );
+      gl.uniform4fv(
+        gl.getUniformLocation(this.hqProgram, 'uAlignMat3'),
+        e3.uvMatrix?.mat || [1, 0, 0, 1]
+      );
+      gl.uniform2fv(
+        gl.getUniformLocation(this.hqProgram, 'uAlignShift3'),
+        e3.uvMatrix?.shift || [0, 0]
+      );
+      gl.uniform3f(
+        gl.getUniformLocation(this.hqProgram, 'uFrameWeights'),
+        e1.weight ?? 1.0,
+        e2.weight ?? 1.0,
+        e3.weight ?? 1.0
+      );
+      gl.uniform3f(
+        gl.getUniformLocation(this.hqProgram, 'uFrameGains'),
+        e1.lumaGain ?? 1.0,
+        e2.lumaGain ?? 1.0,
+        e3.lumaGain ?? 1.0
+      );
+      gl.uniform1f(
+        gl.getUniformLocation(this.hqProgram, 'uPatchTol2'),
+        patchTol2
+      );
 
       gl.uniform1f(
         gl.getUniformLocation(this.hqProgram, 'uFrameCount'),
@@ -188,7 +256,7 @@ export class WebGLImageProcessor {
       );
       gl.uniform1f(gl.getUniformLocation(this.hqProgram, 'uShadowLift'), 0.78);
       gl.uniform1f(gl.getUniformLocation(this.hqProgram, 'uHighlightRoll'), 0.65);
-      gl.uniform1f(gl.getUniformLocation(this.hqProgram, 'uSharpen'), 0.42);
+      gl.uniform1f(gl.getUniformLocation(this.hqProgram, 'uSharpen'), sharpen);
       gl.uniform1f(gl.getUniformLocation(this.hqProgram, 'uExposureEv'), exposureEv);
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);

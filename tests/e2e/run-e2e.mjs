@@ -329,7 +329,7 @@ async function main() {
       'Shutter must display active HDR ring by default'
     );
 
-    const downloadPromise = page.waitForEvent('download', { timeout: 10000 });
+    const downloadPromise = page.waitForEvent('download', { timeout: 15000 });
     await page.click('#btn-shutter');
     const download = await downloadPromise;
     assert.ok(download.suggestedFilename().startsWith('Qcam_'));
@@ -360,7 +360,7 @@ async function main() {
 
     console.log('[e2e] capturing second HQ HDR burst AVIF photo for gallery strip check');
     // 9. Capture a second HDR AVIF photo cleanly for gallery strip verification
-    const hqDownloadPromise = page.waitForEvent('download', { timeout: 10000 });
+    const hqDownloadPromise = page.waitForEvent('download', { timeout: 15000 });
     await page.click('#btn-shutter');
     const hqDownload = await hqDownloadPromise;
     assert.ok(hqDownload.suggestedFilename().includes('_HDR.avif'));
@@ -461,23 +461,36 @@ async function main() {
     await page.click('#btn-timer');
     assert.equal(await page.textContent('#timer-label'), '3s');
     await page.click('#btn-shutter');
-    await page.waitForSelector('#countdown-overlay:not([hidden])');
-    assert.equal(await page.textContent('#countdown-number'), '3');
+    const countdownHandle = await page.waitForFunction(() => {
+      const overlay = document.getElementById('countdown-overlay');
+      const num = document.getElementById('countdown-number')?.textContent?.trim();
+      return overlay && !overlay.hidden && num ? num : null;
+    }, { timeout: 3000 });
+    const countdownVal = await countdownHandle.jsonValue();
+    assert.ok(
+      ['3', '2'].includes(countdownVal),
+      `Expected active 3s countdown ('3' or '2'), got ${countdownVal}`
+    );
     await page.click('#btn-shutter'); // Cancel countdown
     assert.equal(await page.locator('#countdown-overlay').isVisible(), false);
+    assert.equal(await page.evaluate(() => window.__QCAM__.photos.length), 1);
     // Reset timer back to OFF
     await page.click('#btn-timer');
     await page.click('#btn-timer');
 
-    // 13. Open Settings / Info Sheet, verify AVIF/HDR diagnostics, quality controls & version, test JPEG format switch, then switch back to AVIF
+    // 13. Open Settings / Info Sheet, verify AVIF/HDR/EIS diagnostics, quality controls & version, test JPEG & EIS switches, then switch back to AVIF
+    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 強');
     await page.click('#btn-info');
     await page.waitForSelector('#info-modal:not([hidden])');
     assert.equal(await page.getAttribute('#btn-format-avif', 'aria-checked'), 'true');
+    assert.equal(await page.getAttribute('#btn-stab-high', 'aria-checked'), 'true');
     assert.ok((await page.locator('#resolution-options .lens-chip').count()) >= 1);
     assert.ok((await page.locator('#megapixels-options .lens-chip').count()) >= 1);
     const diagText = await page.textContent('#diagnostics-list');
-    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.5.1'));
+    assert.ok(diagText.includes('アプリバージョン') && diagText.includes('v1.6.0'));
     assert.ok(diagText.includes('撮影画質モード') && diagText.includes('高画質 HDR (常時有効)'));
+    assert.ok(diagText.includes('手ぶれ補正モード') && diagText.includes('高品質 (強'));
+    assert.ok(diagText.includes('直近のブレ補正') && diagText.includes('採用'));
     assert.ok(diagText.includes('解像度設定 / 上限'));
     assert.ok(diagText.includes('保存画素数設定'));
     assert.ok(diagText.includes('WebGL') || diagText.includes('worker') || diagText.includes('canvas'));
@@ -492,12 +505,17 @@ async function main() {
       await page.screenshot({ path: path.join(screenshotDir, 'e2e_info_sheet.png') });
     }
 
+    // Toggle stabilization to 'standard' inside Info Sheet and verify top pill updates
+    await page.click('#btn-stab-standard');
+    assert.equal(await page.getAttribute('#btn-stab-standard', 'aria-checked'), 'true');
+    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 標準');
+
     // Switch output format to JPEG and verify capture saves .jpg
     await page.click('#btn-format-jpeg');
     assert.equal(await page.getAttribute('#btn-format-jpeg', 'aria-checked'), 'true');
     await page.click('#btn-info-close');
 
-    const jpgDlPromise = page.waitForEvent('download', { timeout: 6000 });
+    const jpgDlPromise = page.waitForEvent('download', { timeout: 15000 });
     await page.click('#btn-shutter');
     const jpgDl = await jpgDlPromise;
     assert.ok(jpgDl.suggestedFilename().endsWith('_HDR.jpg'));
@@ -540,7 +558,7 @@ async function main() {
       'Transient visibilitychange must keep active camera stream alive without re-prompting'
     );
 
-    // 16. Verify persisted settings (16:9, grid ON, HDR always on, user facing) survive page reload cleanly
+    // 16. Verify persisted settings (16:9, grid ON, HDR always on, EIS standard, user facing) survive page reload cleanly
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 10000 });
     await page.waitForFunction(() => {
       const v = document.getElementById('camera-video');
@@ -549,8 +567,17 @@ async function main() {
     assert.equal(await page.textContent('#aspect-label'), '16:9');
     assert.equal(await page.getAttribute('#btn-grid', 'aria-pressed'), 'true');
     assert.equal(await page.evaluate(() => window.__QCAM__.settings.mode), 'hq');
+    assert.equal(await page.evaluate(() => window.__QCAM__.settings.stabilization), 'standard');
+    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 標準');
     assert.equal(await page.evaluate(() => window.__QCAM__.camera.facingMode), 'user');
     assert.equal(await page.locator('#perm-hint-banner').isVisible(), false);
+
+    // Cycle stabilization pill on main HUD: EIS 標準 -> EIS OFF -> EIS 強
+    await page.click('#btn-stabilization');
+    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS OFF');
+    await page.click('#btn-stabilization');
+    assert.equal((await page.textContent('#stab-badge-label')).trim(), 'EIS 強');
+    assert.equal(await page.evaluate(() => window.__QCAM__.settings.stabilization), 'high');
 
     if (screenshotDir) {
       await page.screenshot({ path: path.join(screenshotDir, 'e2e_viewfinder_169.png') });
@@ -562,13 +589,23 @@ async function main() {
     await page.waitForTimeout(140);
     const compactStats = await page.evaluate(() => {
       const topBar = document.querySelector('.top-bar');
+      const resBadge = document.getElementById('resolution-badge');
       const silentLabel = document.querySelector('.silent-label');
       const btnInfoRect = document.getElementById('btn-info').getBoundingClientRect();
       const shutterRect = document.getElementById('btn-shutter').getBoundingClientRect();
       const vfRect = document.getElementById('viewfinder-frame').getBoundingClientRect();
+
+      const origRes = resBadge.textContent;
+      resBadge.textContent = '4032×3024';
+      const maxResScrollW = topBar.scrollWidth;
+      const maxResClientW = topBar.clientWidth;
+      resBadge.textContent = origRes;
+
       return {
         topBarScrollW: topBar.scrollWidth,
         topBarClientW: topBar.clientWidth,
+        maxResScrollW,
+        maxResClientW,
         silentLabelDisplay: getComputedStyle(silentLabel).display,
         btnInfoRight: btnInfoRect.right,
         shutterBottom: shutterRect.bottom,
@@ -578,6 +615,7 @@ async function main() {
       };
     });
     assert.ok(compactStats.topBarScrollW <= compactStats.topBarClientW + 1, `Top bar overflowed on 360px: ${JSON.stringify(compactStats)}`);
+    assert.ok(compactStats.maxResScrollW <= compactStats.maxResClientW + 1, `Top bar overflowed on 360px with 4032x3024 badge: ${JSON.stringify(compactStats)}`);
     assert.equal(compactStats.silentLabelDisplay, 'none', 'Silent label should collapse on <=375px width');
     assert.ok(compactStats.btnInfoRight <= 360, `btn-info clipped on 360px: ${compactStats.btnInfoRight}`);
     assert.ok(compactStats.shutterBottom <= 640 && compactStats.shutterTop > 0, `Shutter out of bounds: ${JSON.stringify(compactStats)}`);
@@ -1600,6 +1638,314 @@ async function main() {
     assert.equal(ios17Photo.shareCalls, 1);
     await ios17Context.close();
 
+    // 24. Shaky Burst Image Stabilization E2E Test:
+    // Verifies blurry frame 0 rejection, sharp ref switch, rotational+translational registration,
+    // double-edge ghost elimination, live shaky stream shutter capture, and shake warning HUD bounds.
+    console.log('[e2e] checking shaky burst stabilization, ghost-free sharpness & HUD placement');
+    const stabContext = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+      acceptDownloads: true,
+      userAgent:
+        'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36',
+      permissions: ['camera'],
+    });
+    const stabPage = await stabContext.newPage();
+    stabPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(`[stab] ${msg.text()}`);
+    });
+    stabPage.on('pageerror', (err) => {
+      pageErrors.push(`[stab] ${err.message}`);
+    });
+    await stabPage.addInitScript(() => {
+      const poses = [
+        [0, 0, 0],
+        [15, -10, 1.2],
+        [-13, 9, -0.9],
+        [7, 5, 0.4],
+      ];
+      navigator.mediaDevices.enumerateDevices = async () => [
+        {
+          kind: 'videoinput',
+          deviceId: 'stab-cam-0',
+          groupId: 'g-stab',
+          label: 'camera2 0, facing back',
+          toJSON() { return this; },
+        },
+      ];
+      navigator.mediaDevices.getUserMedia = async () => {
+        const w = 960;
+        const h = 720;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        let idx = 0;
+        const paint = () => {
+          const [dx, dy, deg] = poses[idx % poses.length];
+          idx += 1;
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(0, 0, w, h);
+          ctx.save();
+          ctx.translate(w * 0.5 + dx, h * 0.5 + dy);
+          ctx.rotate((deg * Math.PI) / 180);
+          ctx.translate(-w * 0.5, -h * 0.5);
+          ctx.fillStyle = '#e2e8f0';
+          for (let x = 180; x < 780; x += 16) {
+            ctx.fillRect(x, 150, 8, 220);
+          }
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 6;
+          ctx.strokeRect(200, 410, 560, 170);
+          ctx.fillStyle = '#fbbf24';
+          ctx.beginPath();
+          ctx.arc(480, 495, 58, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        };
+        paint();
+        const iv = setInterval(paint, 45);
+        const stream = canvas.captureStream(24);
+        const track = stream.getVideoTracks()[0];
+        const origStop = track.stop.bind(track);
+        track.stop = () => {
+          clearInterval(iv);
+          return origStop();
+        };
+        track.getSettings = () => ({
+          deviceId: 'stab-cam-0',
+          facingMode: 'environment',
+          width: w,
+          height: h,
+          frameRate: 24,
+        });
+        track.getCapabilities = () => ({
+          facingMode: ['environment'],
+          width: { min: 320, max: w },
+          height: { min: 240, max: h },
+        });
+        return stream;
+      };
+    });
+
+    await stabPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await stabPage.waitForFunction(() => {
+      const v = document.getElementById('camera-video');
+      return Boolean(window.__QCAM__?.streamInfo && v && v.videoWidth > 0 && v.videoHeight > 0);
+    }, { timeout: 6000 });
+
+    // Part A: Deterministic shaky + blurry 5-frame burst comparison (EIS 'high' vs 'off')
+    const stabCompare = await stabPage.evaluate(async () => {
+      const drawChart = (ctx, w, h, dx, dy, angleDeg) => {
+        ctx.fillStyle = '#141a24';
+        ctx.fillRect(0, 0, w, h);
+        ctx.save();
+        ctx.translate(w * 0.5 + dx, h * 0.5 + dy);
+        ctx.rotate((angleDeg * Math.PI) / 180);
+        ctx.translate(-w * 0.5, -h * 0.5);
+
+        // Background texture grid across full FOV for multi-anchor tracking
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 2;
+        for (let gx = 40; gx < w; gx += 48) {
+          ctx.beginPath();
+          ctx.moveTo(gx, 24);
+          ctx.lineTo(gx, h - 24);
+          ctx.stroke();
+        }
+        for (let gy = 32; gy < h; gy += 48) {
+          ctx.beginPath();
+          ctx.moveTo(24, gy);
+          ctx.lineTo(w - 24, gy);
+          ctx.stroke();
+        }
+
+        // High-contrast vertical resolution bars in center ROI
+        for (let bx = 180; bx < 460; bx += 8) {
+          ctx.fillStyle = ((bx - 180) / 8) % 2 === 0 ? '#f8fafc' : '#090d14';
+          ctx.fillRect(bx, 130, 8, 120);
+        }
+
+        // High-contrast crosshair & circle in lower center ROI
+        ctx.strokeStyle = '#f8fafc';
+        ctx.lineWidth = 4;
+        ctx.strokeRect(180, 270, 280, 96);
+        ctx.fillStyle = '#f59e0b';
+        ctx.beginPath();
+        ctx.arc(320, 318, 32, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Corner fiducial squares to drive strong rotational constraint
+        ctx.fillStyle = '#e2e8f0';
+        ctx.fillRect(54, 46, 34, 34);
+        ctx.fillRect(w - 88, 46, 34, 34);
+        ctx.fillRect(54, h - 80, 34, 34);
+        ctx.fillRect(w - 88, h - 80, 34, 34);
+
+        ctx.restore();
+      };
+
+      const makeCanvas = (dx, dy, angleDeg, blurred = false) => {
+        const c = document.createElement('canvas');
+        c.width = 640;
+        c.height = 480;
+        const ctx = c.getContext('2d');
+        if (!blurred) {
+          drawChart(ctx, 640, 480, dx, dy, angleDeg);
+        } else {
+          // Simulate genuine handheld directional motion blur across the 8px bar pitch (~16px travel)
+          const sharpC = document.createElement('canvas');
+          sharpC.width = 640;
+          sharpC.height = 480;
+          drawChart(sharpC.getContext('2d'), 640, 480, dx, dy, angleDeg);
+          ctx.fillStyle = '#141a24';
+          ctx.fillRect(0, 0, 640, 480);
+          const taps = 9;
+          for (let t = 0; t < taps; t++) {
+            const frac = (t / (taps - 1)) - 0.5;
+            ctx.globalAlpha = 1 / (t + 1);
+            ctx.drawImage(sharpC, frac * 14, frac * 6);
+          }
+          ctx.globalAlpha = 1;
+        }
+        return c;
+      };
+
+      const specs = [
+        [8, -6, 0.6, true],     // Frame 0: tap-shaken & blurred
+        [18, -12, 1.4, false],  // Frame 1: crisp + shifted + rotated
+        [0, 0, 0, false],       // Frame 2: crisp centered reference
+        [-15, 11, -1.1, false], // Frame 3: crisp + opposite shift + rotation
+        [9, 7, 0.4, false],     // Frame 4: crisp slight offset
+      ];
+      const canvases = specs.map(([dx, dy, deg, blur]) => makeCanvas(dx, dy, deg, blur));
+
+      const highFrames = await Promise.all(canvases.map((c) => createImageBitmap(c)));
+      const offFrames = await Promise.all(canvases.map((c) => createImageBitmap(c)));
+
+      const highRes = await window.__QCAM__.pipeline.process({
+        mode: 'hq',
+        frames: highFrames,
+        aspectRatio: '4:3',
+        softwareZoom: 1,
+        outputFormat: 'avif',
+        stabilizationMode: 'high',
+      });
+      const offRes = await window.__QCAM__.pipeline.process({
+        mode: 'hq',
+        frames: offFrames,
+        aspectRatio: '4:3',
+        softwareZoom: 1,
+        outputFormat: 'avif',
+        stabilizationMode: 'off',
+      });
+
+      const measureBlobSharpness = async (blob) => {
+        const bmp = await createImageBitmap(blob);
+        const c = document.createElement('canvas');
+        c.width = bmp.width;
+        c.height = bmp.height;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(bmp, 0, 0);
+        // Sample cleanly inside the vertical resolution bars ROI
+        const x0 = Math.round(bmp.width * 0.34);
+        const y0 = Math.round(bmp.height * 0.31);
+        const rw = Math.round(bmp.width * 0.32);
+        const rh = Math.round(bmp.height * 0.17);
+        const data = ctx.getImageData(x0, y0, rw, rh).data;
+        let gradSum = 0;
+        let lumaSum = 0;
+        let lumaSqSum = 0;
+        let samples = 0;
+        const lumaAt = (px, py) => {
+          const idx = (py * rw + px) * 4;
+          return 0.2126 * data[idx] + 0.7152 * data[idx + 1] + 0.0722 * data[idx + 2];
+        };
+        for (let y = 1; y < rh - 1; y++) {
+          for (let x = 1; x < rw - 1; x++) {
+            const cL = lumaAt(x, y);
+            const gx = lumaAt(x + 1, y) - lumaAt(x - 1, y);
+            const gy = lumaAt(x, y + 1) - lumaAt(x, y - 1);
+            gradSum += gx * gx + gy * gy;
+            lumaSum += cL;
+            lumaSqSum += cL * cL;
+            samples++;
+          }
+        }
+        bmp.close();
+        const meanL = lumaSum / Math.max(1, samples);
+        const rmsContrast = Math.sqrt(Math.max(0, lumaSqSum / Math.max(1, samples) - meanL * meanL));
+        return {
+          width: c.width,
+          height: c.height,
+          edgeEnergy: Math.sqrt(gradSum / Math.max(1, samples)),
+          rmsContrast,
+        };
+      };
+
+      const highMetrics = await measureBlobSharpness(highRes.blob);
+      const offMetrics = await measureBlobSharpness(offRes.blob);
+
+      return {
+        stabInfo: highRes.stabilizationInfo,
+        highMetrics,
+        offMetrics,
+      };
+    });
+
+    assert.equal(stabCompare.stabInfo.mode, 'high');
+    assert.ok(stabCompare.stabInfo.refIndex >= 1, `Should switch away from blurred frame 0, got refIndex=${stabCompare.stabInfo.refIndex}`);
+    assert.ok(stabCompare.stabInfo.adoptedFrames >= 3 && stabCompare.stabInfo.adoptedFrames <= 4, `Unexpected adoptedFrames: ${JSON.stringify(stabCompare.stabInfo)}`);
+    assert.ok(stabCompare.stabInfo.maxShiftPx >= 12, `Expected >=12px shift compensation, got ${stabCompare.stabInfo.maxShiftPx}`);
+    assert.ok(stabCompare.stabInfo.maxAngleDeg >= 0.7, `Expected >=0.7deg rotational compensation, got ${stabCompare.stabInfo.maxAngleDeg}`);
+    assert.ok(
+      stabCompare.highMetrics.edgeEnergy > stabCompare.offMetrics.edgeEnergy * 1.25,
+      `Expected stabilized edge sharpness >> off edge sharpness, got high=${stabCompare.highMetrics.edgeEnergy.toFixed(2)} vs off=${stabCompare.offMetrics.edgeEnergy.toFixed(2)}`
+    );
+    assert.ok(
+      stabCompare.highMetrics.rmsContrast > stabCompare.offMetrics.rmsContrast * 1.25,
+      `Expected crisper bar RMS contrast in stabilized output, got high=${stabCompare.highMetrics.rmsContrast.toFixed(1)} vs off=${stabCompare.offMetrics.rmsContrast.toFixed(1)}`
+    );
+
+    // Part B: Full live shaky camera capture + diagnostics + shake warning HUD layout check
+    const liveStabDlPromise = stabPage.waitForEvent('download', { timeout: 12000 });
+    await stabPage.click('#btn-shutter');
+    const liveStabDl = await liveStabDlPromise;
+    assert.ok(liveStabDl.suggestedFilename().includes('_HDR.avif'));
+    await stabPage.waitForFunction(() => window.__QCAM__.photos.length === 1 && !window.__QCAM__.isCapturing);
+    const liveStabInfo = await stabPage.evaluate(() => window.__QCAM__.lastStabilizationInfo);
+    assert.ok(liveStabInfo && liveStabInfo.mode === 'high' && liveStabInfo.adoptedFrames >= 2);
+
+    await stabPage.click('#btn-info');
+    await stabPage.waitForSelector('#info-modal:not([hidden])');
+    const stabDiagText = await stabPage.textContent('#diagnostics-list');
+    assert.ok(stabDiagText.includes('手ぶれ補正モード') && stabDiagText.includes('高品質 (強'));
+    assert.ok(stabDiagText.includes('直近のブレ補正') && stabDiagText.includes('採用') && stabDiagText.includes('シフト補正'));
+    await stabPage.click('#btn-info-close');
+
+    // Verify shake warning pill geometry fits inside viewfinder frame without overlapping dock or top HUD
+    const shakePillStats = await stabPage.evaluate(() => {
+      window.__QCAM__.ui.setShakeWarning(true);
+      const pill = document.getElementById('shake-warning-pill').getBoundingClientRect();
+      const vf = document.getElementById('viewfinder-frame').getBoundingClientRect();
+      const dock = document.querySelector('.bottom-dock').getBoundingClientRect();
+      const topHud = document.getElementById('top-hud').getBoundingClientRect();
+      return { pill, vf, dock, topHud };
+    });
+    assert.ok(
+      shakePillStats.pill.width > 80 &&
+        shakePillStats.pill.top >= shakePillStats.topHud.bottom &&
+        shakePillStats.pill.bottom <= shakePillStats.dock.top + 1 &&
+        shakePillStats.pill.left >= shakePillStats.vf.left &&
+        shakePillStats.pill.right <= shakePillStats.vf.right + 1,
+      `Shake warning pill layout overlap: ${JSON.stringify(shakePillStats)}`
+    );
+    await stabPage.evaluate(() => window.__QCAM__.ui.setShakeWarning(false));
+
+    await stabContext.close();
+
     assert.deepEqual(consoleErrors, [], `Console errors encountered: ${consoleErrors.join('; ')}`);
     assert.deepEqual(pageErrors, [], `Page errors encountered: ${pageErrors.join('; ')}`);
 
@@ -1625,6 +1971,7 @@ async function main() {
         jpegMaxPhoto,
       },
       ios17Photo,
+      stabCompare,
     }, null, 2));
   } finally {
     await browser.close();

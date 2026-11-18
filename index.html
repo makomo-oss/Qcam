@@ -33,6 +33,9 @@
             <span class="silent-label">無音</span>
           </span>
           <span id="resolution-badge" class="status-pill status-pill--mono" aria-live="polite">--×--</span>
+          <button id="btn-stabilization" type="button" class="icon-pill icon-pill--stab is-active" aria-label="手ぶれ補正モード切替" title="手ぶれ補正・位置合わせモード (高品質 / 標準 / オフ)">
+            <span id="stab-badge-label">EIS 強</span>
+          </button>
         </div>
 
         <div class="top-bar-actions">
@@ -119,6 +122,11 @@
             <span id="countdown-number" class="countdown-number">3</span>
           </div>
           <p class="countdown-hint">シャッターボタンでキャンセル</p>
+        </div>
+
+        <!-- Live Hand-Shake Warning Indicator -->
+        <div id="shake-warning-pill" class="shake-warning-pill" hidden role="status">
+          手ブレ注意 · 構えを安定させてください
         </div>
 
         <!-- Live Pinch Zoom HUD -->
@@ -237,9 +245,20 @@
         <div class="setting-row">
           <div class="setting-label">
             <strong>撮影画質エンジン</strong>
-            <small>高画質 HDR（マルチフレーム合成＋WebGL トーンマッピング）で常時撮影します</small>
+            <small>高画質 HDR（高精度位置合わせマルチフレーム合成＋WebGL トーンマッピング）で常時撮影します</small>
           </div>
           <span class="setting-badge">高画質 HDR</span>
+        </div>
+        <div class="setting-row setting-row--stacked">
+          <div class="setting-label">
+            <strong>手ぶれ補正 (EIS＋位置合わせ合成)</strong>
+            <small id="stabilization-setting-note">高品質 (強): 5連写ベスト選別・サブピクセル並進/回転補正・残像ゼロ合成・安全トリミング</small>
+          </div>
+          <div id="stabilization-options" class="lens-chip-list" role="radiogroup" aria-label="手ぶれ補正モード">
+            <button id="btn-stab-high" type="button" role="radio" aria-checked="true" class="lens-chip is-active" data-stabilization="high">高品質 (強)</button>
+            <button id="btn-stab-standard" type="button" role="radio" aria-checked="false" class="lens-chip" data-stabilization="standard">標準</button>
+            <button id="btn-stab-off" type="button" role="radio" aria-checked="false" class="lens-chip" data-stabilization="off">オフ (三脚)</button>
+          </div>
         </div>
         <div class="setting-row setting-row--stacked">
           <div class="setting-label">

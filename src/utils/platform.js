@@ -3,7 +3,7 @@
  * Pure functions allow deterministic unit testing with mocked environment objects.
  */
 
-export const APP_VERSION = '1.5.1';
+export const APP_VERSION = '1.6.0';
 
 export function detectPlatform(env = globalThis) {
   const nav = env.navigator || {};

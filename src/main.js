@@ -11,9 +11,19 @@ import {
   normalizeResolutionPreset,
   selectHqCapturePlan,
 } from './utils/resolution.js';
+import {
+  STABILIZATION_MODES,
+  normalizeStabilizationMode,
+  rgbaToLuma,
+} from './processing/frame-aligner.js';
 
 const MAX_SESSION_PHOTOS = 30;
 const TIMER_CYCLE = [0, 3, 10];
+const STABILIZATION_CYCLE = [
+  STABILIZATION_MODES.HIGH,
+  STABILIZATION_MODES.STANDARD,
+  STABILIZATION_MODES.OFF,
+];
 const SETTINGS_STORAGE_KEY = 'qcam_settings_v1';
 const PERM_GRANTED_KEY = 'qcam_perm_granted_once';
 const PERM_HINT_DISMISSED_KEY = 'qcam_perm_hint_dismissed';
@@ -66,6 +76,7 @@ class QcamApp {
       gridVisible: Boolean(saved.gridVisible),
       timerSeconds: 0,
       mode: 'hq',
+      stabilization: normalizeStabilizationMode(saved.stabilization),
       cameraResolution: normalizeResolutionPreset(saved.cameraResolution),
       outputMegapixels: normalizeMegapixelsSetting(saved.outputMegapixels),
       outputFormat: saved.outputFormat === 'jpeg' ? 'jpeg' : 'avif',
@@ -85,11 +96,22 @@ class QcamApp {
     this.lastProcessEngine = '--';
     this.lastCaptureSource = null;
     this.lastCaptureTimeMs = null;
+    this.lastStabilizationInfo = null;
     this.lastSavedInfo = null;
     this.lastPermissionState = 'unknown';
     this._swRegistration = null;
+    this._shakeCanvas = null;
+    this._shakeCtx = null;
+    this._prevLumaSample = null;
+    this._shakeHighCount = 0;
+    this._shakeMonitorTimer = null;
+    this._lastGyroRate = 0;
+    this._lastGyroTs = 0;
+    this._deviceMotionListener = null;
 
     this.ui = new CameraUI({
+      onCycleStabilization: () => this.cycleStabilization(),
+      onSelectStabilization: (mode) => this.selectStabilizationMode(mode),
       onToggleAspect: () => this.toggleAspectRatio(),
       onToggleGrid: () => this.toggleGrid(),
       onCycleTimer: () => this.cycleTimer(),
@@ -133,6 +155,7 @@ class QcamApp {
       aspectRatio: this.settings.aspectRatio,
       gridVisible: this.settings.gridVisible,
       mode: 'hq',
+      stabilization: this.settings.stabilization,
       cameraResolution: this.settings.cameraResolution,
       outputMegapixels: this.settings.outputMegapixels,
       outputFormat: this.settings.outputFormat,
@@ -186,6 +209,7 @@ class QcamApp {
     this.ui.setAspectRatio(this.settings.aspectRatio);
     this.ui.setGridVisible(this.settings.gridVisible);
     this.ui.setTimerSeconds(this.settings.timerSeconds);
+    this.ui.setStabilizationMode(this.settings.stabilization);
     this.ui.setOutputFormat(this.settings.outputFormat);
     this.ui.els.toggleAutoSave.checked = this.settings.autoSave;
     this.ui.els.toggleMirrorFront.checked = this.settings.mirrorFrontSave;
@@ -193,6 +217,7 @@ class QcamApp {
     this._refreshQualityControls();
 
     await this.startCamera({ fromInit: true });
+    this._startShakeMonitor();
     this._registerServiceWorker();
     this._setupLifecycleHandlers();
     setTimeout(() => this.pipeline.warmup(), 120);
@@ -229,6 +254,7 @@ class QcamApp {
       this._refreshQualityControls();
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
+      this._resetShakeState();
 
       writeStringStorage(PERM_GRANTED_KEY, '1');
       const permAfter = await this.camera.checkPermissionState();
@@ -270,6 +296,7 @@ class QcamApp {
   async switchCamera() {
     if (this.isCapturing || this.countdownRemaining > 0 || this.isSwitchingCamera) return;
     this.isSwitchingCamera = true;
+    this._resetShakeState();
     this.ui.animateSwitchCamera();
     try {
       const info = await this.camera.switchCamera();
@@ -281,6 +308,7 @@ class QcamApp {
       this._refreshQualityControls();
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
+      this._resetShakeState();
     } catch (err) {
       this.ui.showToast('カメラの切り替えに失敗しました');
     } finally {
@@ -291,6 +319,7 @@ class QcamApp {
   async selectBackLens(deviceId) {
     if (this.isCapturing || this.countdownRemaining > 0 || this.isSwitchingCamera) return;
     this.isSwitchingCamera = true;
+    this._resetShakeState();
     try {
       const info = await this.camera.selectBackLens(deviceId);
       this.streamInfo = info;
@@ -299,6 +328,7 @@ class QcamApp {
       this._refreshQualityControls();
       this.ui.setExposureDisplay(0);
       this._syncPreviewTransform();
+      this._resetShakeState();
     } catch {
       const refreshed = this.camera.getStreamInfo();
       this.streamInfo = refreshed;
@@ -320,6 +350,7 @@ class QcamApp {
     this._refreshQualityControls();
 
     this.isSwitchingCamera = true;
+    this._resetShakeState();
     try {
       const info = await this.camera.setResolutionPreset(next, {
         aspectRatio: this.settings.aspectRatio,
@@ -330,6 +361,7 @@ class QcamApp {
       this.ui.updateLensControls(info);
       this._syncPreviewTransform();
       this._refreshQualityControls();
+      this._resetShakeState();
       if (info?.videoWidth && info?.videoHeight) {
         this.ui.showToast(`解像度を設定しました (${info.videoWidth}×${info.videoHeight})`);
       }
@@ -357,6 +389,7 @@ class QcamApp {
     this.settings.aspectRatio = next;
     this._persistSettings();
     this.ui.setAspectRatio(next);
+    this._resetShakeState();
     if (this.camera.track && this.camera.track.readyState === 'live') {
       this.camera
         .setResolutionPreset(this.settings.cameraResolution, {
@@ -385,6 +418,31 @@ class QcamApp {
     const next = TIMER_CYCLE[(idx + 1) % TIMER_CYCLE.length];
     this.settings.timerSeconds = next;
     this.ui.setTimerSeconds(next);
+  }
+
+  selectStabilizationMode(mode, { silent = false } = {}) {
+    const next = normalizeStabilizationMode(mode);
+    this.settings.stabilization = next;
+    this._persistSettings();
+    this.ui.setStabilizationMode(next);
+    if (next === STABILIZATION_MODES.OFF) {
+      this._resetShakeState();
+    }
+    if (!silent) {
+      const label =
+        next === STABILIZATION_MODES.HIGH
+          ? '手ぶれ補正: 高品質 (強 · 5連写位置合わせ＋残像ゼロ)'
+          : next === STABILIZATION_MODES.STANDARD
+          ? '手ぶれ補正: 標準 (位置合わせ＋残像除去)'
+          : '手ぶれ補正: オフ (三脚固定向け)';
+      this.ui.showToast(label, { durationMs: 2200 });
+    }
+  }
+
+  cycleStabilization() {
+    const idx = STABILIZATION_CYCLE.indexOf(this.settings.stabilization);
+    const next = STABILIZATION_CYCLE[(idx + 1) % STABILIZATION_CYCLE.length];
+    this.selectStabilizationMode(next);
   }
 
   async applyZoom(zoom) {
@@ -512,6 +570,7 @@ class QcamApp {
         supportsNativeAvif: caps.supportsNativeAvif,
       });
 
+      const stabilizationMode = normalizeStabilizationMode(this.settings.stabilization);
       let frames = [];
       let captureSource = 'burstStream';
       if (plan.captureMethod === 'takePhoto') {
@@ -522,7 +581,7 @@ class QcamApp {
         }
       }
       if (!frames.length) {
-        const burst = await this.camera.captureBurstFrames(4, 200);
+        const burst = await this.camera.captureBurstFrames(4, 200, { stabilizationMode });
         frames = burst.frames;
         captureSource = burst.sourceType;
       }
@@ -538,11 +597,13 @@ class QcamApp {
         outputFormat: format,
         outputMegapixels: this.settings.outputMegapixels,
         maxDimension: plan.maxDimension,
+        stabilizationMode,
       });
 
       const totalTimeMs = Math.round(performance.now() - totalStart);
       this.lastProcessEngine = processed.engine;
       this.lastCaptureTimeMs = totalTimeMs;
+      this.lastStabilizationInfo = processed.stabilizationInfo || null;
 
       const actualFormat = processed.format || format;
       const mimeType =
@@ -651,18 +712,31 @@ class QcamApp {
             }
           );
         }
-      } else if (this.settings.autoSave) {
-        triggerAnchorDownload(photo.url, photo.filename);
-        this.lastSavedInfo.method = 'auto-download';
-        this.ui.showToast(`${formatLabel} で保存しました (${totalTimeMs}ms)`, { durationMs: 2400 });
       } else {
-        this.ui.showToast(`${formatLabel} 撮影完了 (${totalTimeMs}ms)`, { durationMs: 2400 });
+        const stabSuffix =
+          this.lastStabilizationInfo &&
+          this.lastStabilizationInfo.mode !== STABILIZATION_MODES.OFF &&
+          this.lastStabilizationInfo.maxShiftPx >= 1.5
+            ? ` · ブレ補正 ${this.lastStabilizationInfo.maxShiftPx}px`
+            : '';
+        if (this.settings.autoSave) {
+          triggerAnchorDownload(photo.url, photo.filename);
+          this.lastSavedInfo.method = 'auto-download';
+          this.ui.showToast(`${formatLabel} で保存しました (${totalTimeMs}ms${stabSuffix})`, {
+            durationMs: 2400,
+          });
+        } else {
+          this.ui.showToast(`${formatLabel} 撮影完了 (${totalTimeMs}ms${stabSuffix})`, {
+            durationMs: 2400,
+          });
+        }
       }
     } catch (err) {
       this.ui.showToast(`撮影エラー: ${err?.message || '再試行してください'}`);
     } finally {
       this.isCapturing = false;
       this.ui.setCapturing(false);
+      this._resetShakeState();
     }
   }
 
@@ -827,14 +901,18 @@ class QcamApp {
       megapixelData.isAspectCropped && megapixelData.uncropped43Mp
         ? `${mpBaseLabel} · 16:9切抜（4:3で最大 ${formatMegapixelsLabel(megapixelData.uncropped43Mp)}）`
         : mpBaseLabel;
+    const isHighStab = this.settings.stabilization === STABILIZATION_MODES.HIGH;
+    const burstDesc = isHighStab
+      ? '5連写ベスト選別＋位置合わせ HDR'
+      : '4連写位置合わせ + 高画質 HDR';
     const captureMethodLabel =
       this.lastCaptureSource === 'takePhoto'
         ? 'ImageCapture.takePhoto() + 高画質 HDR'
         : info.supportsTakePhoto
-        ? 'ImageCapture.takePhoto() / 4連写 + 高画質 HDR'
+        ? `ImageCapture.takePhoto() / ${burstDesc}`
         : this.platform.isIOS
-        ? '4連写ストリーム + 高画質 HDR（無音仕様）'
-        : '4連写マルチフレーム + 高画質 HDR';
+        ? `${burstDesc}（無音仕様）`
+        : burstDesc;
     const takePhotoApiLabel = this.platform.isIOS
       ? info.photoMaxWidth && info.photoMaxHeight
         ? `無音維持のため無効 (${info.photoMaxWidth}×${info.photoMaxHeight} · ストリーム最高画素を使用)`
@@ -843,12 +921,31 @@ class QcamApp {
       ? `${info.photoMaxWidth}×${info.photoMaxHeight}`
       : 'ストリーム解像度';
 
+    const stabilizationModeLabel =
+      this.settings.stabilization === STABILIZATION_MODES.HIGH
+        ? '高品質 (強 · 5連写ベスト選別＋回転/並進＋残像ゼロ)'
+        : this.settings.stabilization === STABILIZATION_MODES.STANDARD
+        ? '標準 (4連写位置合わせ＋残像除去)'
+        : 'オフ (位置補正なし)';
+    let lastStabLabel = '未撮影';
+    if (this.lastCaptureSource === 'takePhoto') {
+      lastStabLabel = '単写センサー静止画 (OIS/光学基準)';
+    } else if (this.lastStabilizationInfo) {
+      const st = this.lastStabilizationInfo;
+      lastStabLabel =
+        st.mode === STABILIZATION_MODES.OFF
+          ? 'OFF (位置補正なし・直接合成)'
+          : `採用 ${st.adoptedFrames}/${st.totalFrames}枚 · 基準#${(st.refIndex ?? 0) + 1} · シフト補正 ${st.maxShiftPx}px / 傾き ${st.maxAngleDeg}°`;
+    }
+
     const entries = [
       ['アプリバージョン', `v${APP_VERSION}`],
       ['プラットフォーム', `${this.platform.osLabel} (${this.platform.browserLabel})`],
       ['PWA モード', this.platform.isStandalonePWA ? 'スタンドアロン (全画面)' : 'ブラウザ表示'],
       ['カメラ権限状態', permLabelMap[this.lastPermissionState] || this.lastPermissionState],
       ['撮影画質モード', '高画質 HDR (常時有効)'],
+      ['手ぶれ補正モード', stabilizationModeLabel],
+      ['直近のブレ補正', lastStabLabel],
       ['解像度設定 / 上限', `${resPresetLabel} / ブラウザ取得上限 ${capLabel}`],
       ['保存画素数設定', mpLabel],
       ['超広角 (0.5×) カメラ', ultraWideLabel],
@@ -879,6 +976,138 @@ class QcamApp {
       ['保存フロー', saveFlowLabel],
     ];
     this.ui.renderDiagnostics(entries);
+  }
+
+  _resetShakeState() {
+    this._prevLumaSample = null;
+    this._shakeHighCount = 0;
+    this.ui.setShakeWarning(false);
+  }
+
+  _startShakeMonitor() {
+    this._stopShakeMonitor();
+
+    // Never call DeviceMotionEvent.requestPermission() so iOS never shows unsolicited dialogs.
+    if (
+      typeof window.DeviceMotionEvent === 'function' &&
+      typeof window.DeviceMotionEvent.requestPermission !== 'function'
+    ) {
+      this._deviceMotionListener = (ev) => {
+        const rr = ev?.rotationRate;
+        if (!rr) return;
+        const rate = Math.hypot(rr.alpha || 0, rr.beta || 0, rr.gamma || 0);
+        if (Number.isFinite(rate)) {
+          this._lastGyroRate = rate;
+          this._lastGyroTs = performance.now();
+        }
+      };
+      window.addEventListener('devicemotion', this._deviceMotionListener, { passive: true });
+    }
+
+    this._shakeMonitorTimer = setInterval(() => this._samplePreviewShake(), 220);
+  }
+
+  _stopShakeMonitor() {
+    if (this._shakeMonitorTimer !== null) {
+      clearInterval(this._shakeMonitorTimer);
+      this._shakeMonitorTimer = null;
+    }
+    if (this._deviceMotionListener) {
+      window.removeEventListener('devicemotion', this._deviceMotionListener);
+      this._deviceMotionListener = null;
+    }
+    if (this._shakeCanvas) {
+      this._shakeCanvas.width = 1;
+      this._shakeCanvas.height = 1;
+      this._shakeCanvas = null;
+      this._shakeCtx = null;
+    }
+    this._lastGyroRate = 0;
+    this._lastGyroTs = 0;
+    this._resetShakeState();
+  }
+
+  _samplePreviewShake() {
+    if (
+      document.hidden ||
+      this.isCapturing ||
+      this.isSwitchingCamera ||
+      this.settings.stabilization === STABILIZATION_MODES.OFF ||
+      !this.ui.els.infoModal.hidden ||
+      !this.ui.els.previewModal.hidden ||
+      !this.ui.els.cameraOverlay.hidden
+    ) {
+      if (this._shakeHighCount > 0 || !this.ui.els.shakeWarningPill?.hidden) {
+        this._resetShakeState();
+      }
+      return;
+    }
+
+    const video = this.ui.els.video;
+    if (!video || video.readyState < 2 || video.videoWidth < 16 || video.videoHeight < 16) {
+      return;
+    }
+
+    const w = 48;
+    const h = 36;
+    if (!this._shakeCtx) {
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      this._shakeCanvas = c;
+      this._shakeCtx = c.getContext('2d', { willReadFrequently: true });
+      if (!this._shakeCtx) return;
+    }
+    if (this._shakeCanvas.width !== w || this._shakeCanvas.height !== h) {
+      this._shakeCanvas.width = w;
+      this._shakeCanvas.height = h;
+    }
+
+    try {
+      this._shakeCtx.drawImage(video, 0, 0, w, h);
+      const rgba = this._shakeCtx.getImageData(0, 0, w, h).data;
+      const curLuma = rgbaToLuma(rgba, w, h);
+
+      let shaky = false;
+      const recentGyro =
+        performance.now() - this._lastGyroTs < 450 && this._lastGyroRate > 55;
+
+      if (this._prevLumaSample && this._prevLumaSample.length === curLuma.length) {
+        let diffSum = 0;
+        let changedCount = 0;
+        let samples = 0;
+        for (let y = 4; y < h - 4; y++) {
+          const row = y * w;
+          for (let x = 4; x < w - 4; x++) {
+            const d = Math.abs(curLuma[row + x] - this._prevLumaSample[row + x]);
+            diffSum += d;
+            if (d > 16) changedCount++;
+            samples++;
+          }
+        }
+        const mad = samples > 0 ? diffSum / samples : 0;
+        const changedFrac = samples > 0 ? changedCount / samples : 0;
+        if ((changedFrac > 0.32 && mad > 12) || recentGyro) {
+          shaky = true;
+        }
+      } else if (recentGyro) {
+        shaky = true;
+      }
+
+      this._prevLumaSample = curLuma;
+
+      if (shaky) {
+        this._shakeHighCount = Math.min(4, this._shakeHighCount + 1);
+        if (this._shakeHighCount >= 2) {
+          this.ui.setShakeWarning(true);
+        }
+      } else {
+        this._shakeHighCount = 0;
+        this.ui.setShakeWarning(false);
+      }
+    } catch {
+      // Ignore transient drawImage errors while stream reconfigures
+    }
   }
 
   _registerServiceWorker() {
@@ -935,6 +1164,7 @@ class QcamApp {
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
         this._cancelCountdown();
+        this._resetShakeState();
       } else {
         this._swRegistration?.update?.().catch(() => {});
         if (this.ui.els.cameraOverlay.hidden) {
@@ -952,6 +1182,7 @@ class QcamApp {
     // Release hardware cleanly when leaving or reloading so next page load acquires immediately
     window.addEventListener('pagehide', () => {
       this._cancelCountdown();
+      this._stopShakeMonitor();
       this.camera.stop();
     });
   }

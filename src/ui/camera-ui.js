@@ -15,6 +15,8 @@ export class CameraUI {
       zoomBar: document.querySelector('.zoom-bar'),
       silentBadge: document.getElementById('silent-badge'),
       resolutionBadge: document.getElementById('resolution-badge'),
+      btnStabilization: document.getElementById('btn-stabilization'),
+      stabBadgeLabel: document.getElementById('stab-badge-label'),
       btnAspect: document.getElementById('btn-aspect'),
       aspectLabel: document.getElementById('aspect-label'),
       btnGrid: document.getElementById('btn-grid'),
@@ -36,6 +38,7 @@ export class CameraUI {
       shutterBlackout: document.getElementById('shutter-blackout'),
       countdownOverlay: document.getElementById('countdown-overlay'),
       countdownNumber: document.getElementById('countdown-number'),
+      shakeWarningPill: document.getElementById('shake-warning-pill'),
       zoomHudPill: document.getElementById('zoom-hud-pill'),
 
       cameraOverlay: document.getElementById('camera-overlay'),
@@ -74,6 +77,8 @@ export class CameraUI {
 
       infoModal: document.getElementById('info-modal'),
       btnInfoClose: document.getElementById('btn-info-close'),
+      stabilizationSettingNote: document.getElementById('stabilization-setting-note'),
+      stabilizationButtons: Array.from(document.querySelectorAll('[data-stabilization]')),
       resolutionSettingNote: document.getElementById('resolution-setting-note'),
       resolutionOptions: document.getElementById('resolution-options'),
       megapixelsSettingNote: document.getElementById('megapixels-setting-note'),
@@ -93,6 +98,7 @@ export class CameraUI {
       aspectRatio: '4:3',
       gridVisible: false,
       timerSeconds: 0,
+      stabilization: 'high',
       outputFormat: 'avif',
       mirroredPreview: false,
       softwareZoom: 1,
@@ -120,6 +126,14 @@ export class CameraUI {
   }
 
   _bindEvents() {
+    this.els.btnStabilization?.addEventListener('click', () =>
+      this.handlers.onCycleStabilization?.()
+    );
+    for (const btn of this.els.stabilizationButtons) {
+      btn.addEventListener('click', () => {
+        this.handlers.onSelectStabilization?.(btn.dataset.stabilization);
+      });
+    }
     this.els.btnAspect.addEventListener('click', () => this.handlers.onToggleAspect());
     this.els.btnGrid.addEventListener('click', () => this.handlers.onToggleGrid());
     this.els.btnTimer.addEventListener('click', () => this.handlers.onCycleTimer());
@@ -413,6 +427,50 @@ export class CameraUI {
       const active = btn.dataset.format === safeFormat;
       btn.classList.toggle('is-active', active);
       btn.setAttribute('aria-checked', String(active));
+    }
+  }
+
+  setStabilizationMode(mode) {
+    const safeMode = mode === 'standard' || mode === 'off' ? mode : 'high';
+    this.state.stabilization = safeMode;
+
+    if (this.els.btnStabilization) {
+      this.els.btnStabilization.classList.toggle('is-active', safeMode === 'high');
+      this.els.btnStabilization.classList.toggle('is-standard', safeMode === 'standard');
+      this.els.btnStabilization.setAttribute(
+        'aria-label',
+        safeMode === 'high'
+          ? '手ぶれ補正: 高品質 (強)'
+          : safeMode === 'standard'
+          ? '手ぶれ補正: 標準'
+          : '手ぶれ補正: オフ'
+      );
+    }
+    if (this.els.stabBadgeLabel) {
+      this.els.stabBadgeLabel.textContent =
+        safeMode === 'high' ? 'EIS 強' : safeMode === 'standard' ? 'EIS 標準' : 'EIS OFF';
+    }
+    for (const btn of this.els.stabilizationButtons) {
+      const active = btn.dataset.stabilization === safeMode;
+      btn.classList.toggle('is-active', active);
+      btn.setAttribute('aria-checked', String(active));
+    }
+    if (this.els.stabilizationSettingNote) {
+      this.els.stabilizationSettingNote.textContent =
+        safeMode === 'high'
+          ? '高品質 (強): 5連写ベスト選別・サブピクセル並進/回転補正・残像ゼロ合成・安全トリミング'
+          : safeMode === 'standard'
+          ? '標準: 4連写位置合わせ合成・残像除去＋ブレフレーム除外'
+          : 'オフ (三脚): 位置補正なしで 4 フレームを直接合成（三脚固定撮影向け）';
+    }
+    if (safeMode === 'off') {
+      this.setShakeWarning(false);
+    }
+  }
+
+  setShakeWarning(active) {
+    if (this.els.shakeWarningPill) {
+      this.els.shakeWarningPill.hidden = !active;
     }
   }
 

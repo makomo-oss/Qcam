@@ -10,6 +10,12 @@ import {
   normalizeResolutionPreset,
   shouldApplyResolutionUpgrade,
 } from '../utils/resolution.js';
+import {
+  STABILIZATION_MODES,
+  analyzeFrameMetrics,
+  normalizeStabilizationMode,
+  rgbaToLuma,
+} from '../processing/frame-aligner.js';
 
 /**
  * Manages MediaDevices.getUserMedia, ImageCapture API, camera switching,
@@ -72,6 +78,9 @@ export class CameraController {
     this.blockedDeviceIds = new Set();
     this._lensSwitchPromise = null;
     this._initializingStream = false;
+    this._sharpnessCanvas = null;
+    this._sharpnessCtx = null;
+    this._lastVideoFrameMeta = null;
 
     this.video?.addEventListener?.('resize', () => {
       if (
@@ -272,6 +281,7 @@ export class CameraController {
       await Promise.all([
         this._awaitPhotoCapabilities(80),
         this._refreshLensCapabilities({ preserveStandardId: false }),
+        this._applyCameraStabilizationHints(),
       ]);
 
       if (
@@ -446,6 +456,37 @@ export class CameraController {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  async _applyCameraStabilizationHints() {
+    if (
+      !this.track ||
+      typeof this.track.applyConstraints !== 'function' ||
+      !this.capabilities
+    ) {
+      return;
+    }
+    const caps = this.capabilities;
+    const advanced = [];
+    if (caps.opticalImageStabilization === true || Array.isArray(caps.opticalImageStabilization)) {
+      advanced.push({ opticalImageStabilization: true });
+    }
+    if (Array.isArray(caps.imageStabilizationMode)) {
+      if (caps.imageStabilizationMode.includes('optical')) {
+        advanced.push({ imageStabilizationMode: 'optical' });
+      } else if (caps.imageStabilizationMode.includes('on')) {
+        advanced.push({ imageStabilizationMode: 'on' });
+      }
+    }
+    if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
+      advanced.push({ focusMode: 'continuous' });
+    }
+    if (!advanced.length) return;
+    try {
+      await this.track.applyConstraints({ advanced });
+    } catch {
+      // Ignore if HAL rejects optional stabilization or focus hints
     }
   }
 
@@ -821,6 +862,7 @@ export class CameraController {
       await Promise.all([
         this._awaitPhotoCapabilities(80),
         this._refreshLensCapabilities({ preserveStandardId: true }),
+        this._applyCameraStabilizationHints(),
       ]);
       if (
         !this.standardBackDeviceId &&
@@ -1081,53 +1123,125 @@ export class CameraController {
     };
   }
 
-  /**
-   * Capture N frames consecutively across ~0.2s for multi-frame noise reduction.
-   * Uses requestVideoFrameCallback when available with timer guard so it never stalls.
-   */
-  async captureBurstFrames(frameCount = 4, targetDurationMs = 200) {
-    const frames = [];
-    const intervalMs = Math.max(40, Math.floor(targetDurationMs / Math.max(1, frameCount)));
+  _scoreBitmapSharpness(bitmap) {
+    try {
+      if (!bitmap || bitmap.width < 16 || bitmap.height < 16) return 0;
+      const w = 160;
+      const h = 120;
+      if (!this._sharpnessCtx && typeof document !== 'undefined') {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        this._sharpnessCanvas = c;
+        this._sharpnessCtx = c.getContext('2d', { willReadFrequently: true });
+      }
+      if (!this._sharpnessCtx) return 1;
+      this._sharpnessCtx.clearRect(0, 0, w, h);
+      this._sharpnessCtx.drawImage(bitmap, 0, 0, w, h);
+      const img = this._sharpnessCtx.getImageData(0, 0, w, h);
+      const luma = rgbaToLuma(img.data, w, h);
+      return analyzeFrameMetrics(luma, w, h).sharpness;
+    } catch {
+      return 1;
+    }
+  }
 
-    for (let i = 0; i < frameCount; i++) {
-      const frameStart = performance.now();
+  /**
+   * Capture N frames consecutively across ~0.2s for multi-frame stabilization and HDR stacking.
+   * In 'high' stabilization mode, samples 5 frames rapidly and sheds the weakest/tap-shaken frame
+   * immediately so <= 4 crisp frames advance to the GPU/Worker pipeline.
+   */
+  async captureBurstFrames(
+    frameCount = 4,
+    targetDurationMs = 200,
+    { stabilizationMode = STABILIZATION_MODES.HIGH } = {}
+  ) {
+    const mode = normalizeStabilizationMode(stabilizationMode);
+    const keepCount = Math.max(1, frameCount);
+    const captureCount =
+      mode === STABILIZATION_MODES.HIGH && keepCount === 4 ? 5 : keepCount;
+    const intervalMs = Math.max(32, Math.floor(targetDurationMs / captureCount));
+    const minWaitMs = mode === STABILIZATION_MODES.HIGH ? 22 : 28;
+    const candidates = [];
+
+    this._lastVideoFrameMeta = null;
+
+    for (let i = 0; i < captureCount; i++) {
       if (i > 0) {
-        await this._waitNextFrameOrInterval(intervalMs);
+        await this._waitNextFrameOrInterval(intervalMs, minWaitMs);
       }
       const bitmap = await this._grabStreamBitmap();
-      frames.push(bitmap);
-      const elapsed = performance.now() - frameStart;
-      if (i < frameCount - 1 && elapsed < 35) {
-        await new Promise((r) => setTimeout(r, 35 - elapsed));
+      const score = captureCount > keepCount ? this._scoreBitmapSharpness(bitmap) : 1;
+      candidates.push({ bitmap, score, index: i });
+    }
+
+    // Drop lowest-sharpness candidate(s) immediately so peak live bitmaps stay <= keepCount
+    while (candidates.length > keepCount) {
+      let worstPos = 0;
+      let worstWeightedScore = candidates[0].score * (candidates[0].index === 0 ? 0.985 : 1.0);
+      for (let k = 1; k < candidates.length; k++) {
+        const s = candidates[k].score * (candidates[k].index === 0 ? 0.985 : 1.0);
+        if (s < worstWeightedScore) {
+          worstWeightedScore = s;
+          worstPos = k;
+        }
+      }
+      const [dropped] = candidates.splice(worstPos, 1);
+      try {
+        dropped?.bitmap?.close?.();
+      } catch {
+        // ignore
       }
     }
+
+    const frames = candidates.map((c) => c.bitmap);
 
     return {
       sourceType: 'burstStream',
       frames,
       width: frames[0]?.width || this.video.videoWidth,
       height: frames[0]?.height || this.video.videoHeight,
+      capturedCount: captureCount,
     };
   }
 
-  async _waitNextFrameOrInterval(maxWaitMs) {
+  async _waitNextFrameOrInterval(maxWaitMs, minWaitMs = 22) {
     if (typeof this.video.requestVideoFrameCallback === 'function') {
+      const waitStart = performance.now();
       await new Promise((resolve) => {
         let settled = false;
-        const timer = setTimeout(() => {
-          if (!settled) {
-            settled = true;
-            resolve();
+        const finish = (meta = null) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (meta) {
+            this._lastVideoFrameMeta = {
+              presentedFrames: meta.presentedFrames,
+              mediaTime: meta.mediaTime,
+            };
           }
-        }, maxWaitMs);
+          resolve();
+        };
 
-        this.video.requestVideoFrameCallback(() => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            resolve();
+        const timer = setTimeout(() => finish(null), maxWaitMs);
+
+        const onFrame = (_now, metadata) => {
+          if (settled) return;
+          const waited = performance.now() - waitStart;
+          const isDuplicate =
+            Boolean(this._lastVideoFrameMeta) &&
+            Boolean(metadata) &&
+            metadata.presentedFrames === this._lastVideoFrameMeta.presentedFrames &&
+            metadata.mediaTime === this._lastVideoFrameMeta.mediaTime;
+
+          if ((!isDuplicate && waited >= minWaitMs) || waited >= maxWaitMs - 4) {
+            finish(metadata);
+          } else {
+            this.video.requestVideoFrameCallback(onFrame);
           }
-        });
+        };
+
+        this.video.requestVideoFrameCallback(onFrame);
       });
       return;
     }
@@ -1184,6 +1298,13 @@ export class CameraController {
     this.activeDeviceId = null;
     this.activeDeviceLabel = '';
     this.baseLensScale = 1.0;
+    this._lastVideoFrameMeta = null;
+    if (this._sharpnessCanvas) {
+      this._sharpnessCanvas.width = 1;
+      this._sharpnessCanvas.height = 1;
+      this._sharpnessCanvas = null;
+      this._sharpnessCtx = null;
+    }
     if (clearLensCache) {
       this._resetLensState(this.facingMode === 'user' ? 'front' : 'wide');
     }

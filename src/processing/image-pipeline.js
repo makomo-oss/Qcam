@@ -5,6 +5,14 @@ import {
 } from '../utils/resolution.js';
 import { WebGLImageProcessor } from './webgl-processor.js';
 import {
+  STABILIZATION_MODES,
+  alignBitmapBurst,
+  applyStabilizedInsetToCrop,
+  drawAlignedFrameToCanvas,
+  normalizeStabilizationMode,
+  summarizeAlignmentPlan,
+} from './frame-aligner.js';
+import {
   AVIF_DEFAULT_OPTIONS,
   AVIF_MIME_TYPE,
   JPEG_MIME_TYPE,
@@ -243,11 +251,13 @@ export class ImagePipeline {
     outputFormat = 'avif',
     outputMegapixels = 'max',
     maxDimension = null,
+    stabilizationMode = STABILIZATION_MODES.HIGH,
     jpegQuality = JPEG_QUALITY,
     avifQuality = AVIF_DEFAULT_OPTIONS.quality,
   }) {
     const startTs = performance.now();
     const format = resolveOutputFormat(outputFormat);
+    const safeStabMode = normalizeStabilizationMode(stabilizationMode);
 
     if (!frames.length) {
       throw new Error('処理するフレームがありません。');
@@ -274,6 +284,7 @@ export class ImagePipeline {
               outputFormat: format,
               outputMegapixels,
               maxDimension,
+              stabilizationMode: safeStabMode,
               jpegQuality,
               avifQuality,
             },
@@ -289,6 +300,7 @@ export class ImagePipeline {
             format: result.format || format,
             mimeType: result.mimeType || (format === 'jpeg' ? JPEG_MIME_TYPE : AVIF_MIME_TYPE),
             engine: result.engine,
+            stabilizationInfo: result.stabilizationInfo || null,
             processTimeMs: Math.round(performance.now() - startTs),
           };
         }
@@ -299,12 +311,13 @@ export class ImagePipeline {
               mode: 'hq',
               frames: [result.averagedBitmap],
               aspectRatio,
-              softwareZoom: 1, // Already cropped & mirrored in Worker
+              softwareZoom: 1, // Already cropped, aligned & mirrored in Worker
               mirrorX: false,
               exposureEv,
               outputFormat: format,
               outputMegapixels,
               maxDimension,
+              stabilizationMode: safeStabMode,
               jpegQuality,
               avifQuality,
               preCropped: true,
@@ -312,6 +325,7 @@ export class ImagePipeline {
             });
             return {
               ...out,
+              stabilizationInfo: result.stabilizationInfo || out.stabilizationInfo || null,
               processTimeMs: Math.round(performance.now() - startTs),
             };
           } finally {
@@ -337,6 +351,7 @@ export class ImagePipeline {
         outputFormat: format,
         outputMegapixels,
         maxDimension,
+        stabilizationMode: safeStabMode,
         jpegQuality,
         avifQuality,
         preCropped: false,
@@ -366,11 +381,13 @@ export class ImagePipeline {
     outputFormat = 'avif',
     outputMegapixels = 'max',
     maxDimension = null,
+    stabilizationMode = STABILIZATION_MODES.HIGH,
     jpegQuality = JPEG_QUALITY,
     avifQuality = AVIF_DEFAULT_OPTIONS.quality,
     preCropped,
     enginePrefix,
   }) {
+    const safeStabMode = normalizeStabilizationMode(stabilizationMode);
     const srcW = frames[0].width;
     const srcH = frames[0].height;
     const format = resolveOutputFormat(outputFormat);
@@ -396,8 +413,38 @@ export class ImagePipeline {
         ? Math.max(320, Math.min(encoderMax, Math.round(maxDimension)))
         : mpDim;
 
+    let workingFrames = frames;
+    let alignmentPlan = null;
+    let stabilizationInfo = null;
+
+    if (!preCropped && mode === 'hq' && frames.length > 1) {
+      alignmentPlan = alignBitmapBurst({
+        frames,
+        stabilizationMode: safeStabMode,
+        createCanvas: (w, h) => {
+          const c = document.createElement('canvas');
+          c.width = w;
+          c.height = h;
+          return c;
+        },
+        maxFrames: 4,
+      });
+      workingFrames = alignmentPlan.selectedIndices.map((idx) => frames[idx]);
+      const adoptedSet = new Set(alignmentPlan.selectedIndices);
+      for (let i = 0; i < frames.length; i++) {
+        if (!adoptedSet.has(i)) {
+          try {
+            frames[i]?.close?.();
+          } catch {
+            // ignore
+          }
+        }
+      }
+      stabilizationInfo = summarizeAlignmentPlan(alignmentPlan, frames.length, safeStabMode);
+    }
+
     if (webgl) {
-      const crop = preCropped
+      const baseCrop = preCropped
         ? {
             sx: 0,
             sy: 0,
@@ -413,8 +460,11 @@ export class ImagePipeline {
             softwareZoom,
             maxDim
           );
+      const crop = preCropped
+        ? baseCrop
+        : applyStabilizedInsetToCrop(baseCrop, alignmentPlan?.safeCrop);
 
-      let gpuSources = frames;
+      let gpuSources = workingFrames;
       let cropNorm = {
         x: crop.sx / srcW,
         y: crop.sy / srcH,
@@ -422,26 +472,21 @@ export class ImagePipeline {
         h: crop.sh / srcH,
       };
       let applyMirrorInShader = mirrorX;
+      let frameAlignments = alignmentPlan?.entries || null;
       const tempCanvases = [];
 
       if (srcW > webgl.maxTextureSize || srcH > webgl.maxTextureSize) {
-        gpuSources = frames.map((frame) => {
+        gpuSources = workingFrames.map((frame, idx) => {
           const c = document.createElement('canvas');
           c.width = crop.outWidth;
           c.height = crop.outHeight;
           const ctx = c.getContext('2d');
-          if (mirrorX) {
-            ctx.translate(crop.outWidth, 0);
-            ctx.scale(-1, 1);
-          }
-          ctx.drawImage(
+          drawAlignedFrameToCanvas(
+            ctx,
             frame,
-            crop.sx,
-            crop.sy,
-            crop.sw,
-            crop.sh,
-            0,
-            0,
+            crop,
+            mirrorX,
+            alignmentPlan?.entries?.[idx] || null,
             crop.outWidth,
             crop.outHeight
           );
@@ -450,6 +495,12 @@ export class ImagePipeline {
         });
         cropNorm = { x: 0, y: 0, w: 1, h: 1 };
         applyMirrorInShader = false;
+        if (frameAlignments) {
+          frameAlignments = frameAlignments.map((entry) => ({
+            ...entry,
+            uvMatrix: { mat: [1, 0, 0, 1], shift: [0, 0] },
+          }));
+        }
       }
 
       if (mode === 'hq') {
@@ -459,6 +510,9 @@ export class ImagePipeline {
           cropNorm,
           mirrorX: applyMirrorInShader,
           exposureEv,
+          frameAlignments,
+          patchTol2: safeStabMode === STABILIZATION_MODES.OFF ? 0.0085 : 0.0018,
+          sharpen: safeStabMode === STABILIZATION_MODES.HIGH ? 0.62 : 0.54,
         });
       } else {
         webgl.processStandard(gpuSources[0], {
@@ -493,11 +547,15 @@ export class ImagePipeline {
         engineBase: enginePrefix || 'main-webgl',
       });
 
-      return encoded;
+      return {
+        ...encoded,
+        stabilizationInfo,
+      };
     }
 
     // Ultimate Canvas2D fallback if WebGL is completely unavailable
     const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
+    const refBmp = workingFrames[0] || frames[0];
     const canvas = document.createElement('canvas');
     canvas.width = crop.outWidth;
     canvas.height = crop.outHeight;
@@ -511,7 +569,7 @@ export class ImagePipeline {
         ? 'contrast(1.06) saturate(1.06) brightness(1.04)'
         : 'contrast(1.05)';
     ctx.drawImage(
-      frames[0],
+      refBmp,
       crop.sx,
       crop.sy,
       crop.sw,
@@ -528,7 +586,7 @@ export class ImagePipeline {
         // ignore
       }
     }
-    return this._encodeMainCanvas({
+    const encoded = await this._encodeMainCanvas({
       format,
       canvas,
       ctx2d: ctx,
@@ -538,6 +596,10 @@ export class ImagePipeline {
       jpegQuality,
       engineBase: 'canvas2d-fallback',
     });
+    return {
+      ...encoded,
+      stabilizationInfo,
+    };
   }
 
   dispose() {

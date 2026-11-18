@@ -5,6 +5,14 @@ import {
 } from '../utils/resolution.js';
 import { WebGLImageProcessor } from '../processing/webgl-processor.js';
 import {
+  STABILIZATION_MODES,
+  alignBitmapBurst,
+  applyStabilizedInsetToCrop,
+  drawAlignedFrameToCanvas,
+  normalizeStabilizationMode,
+  summarizeAlignmentPlan,
+} from '../processing/frame-aligner.js';
+import {
   AVIF_DEFAULT_OPTIONS,
   AVIF_MIME_TYPE,
   JPEG_MIME_TYPE,
@@ -57,21 +65,15 @@ function getWebGLProcessor() {
   }
 }
 
-function cropFrameToCanvas(bitmap, crop, mirrorX) {
+function cropFrameToCanvas(bitmap, crop, mirrorX, alignEntry = null) {
   const canvas = new OffscreenCanvas(crop.outWidth, crop.outHeight);
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (mirrorX) {
-    ctx.translate(crop.outWidth, 0);
-    ctx.scale(-1, 1);
-  }
-  ctx.drawImage(
+  drawAlignedFrameToCanvas(
+    ctx,
     bitmap,
-    crop.sx,
-    crop.sy,
-    crop.sw,
-    crop.sh,
-    0,
-    0,
+    crop,
+    mirrorX,
+    alignEntry,
     crop.outWidth,
     crop.outHeight
   );
@@ -79,9 +81,10 @@ function cropFrameToCanvas(bitmap, crop, mirrorX) {
 }
 
 /**
- * Motion-aware integer pixel averaging across up to 4 frames for low-light noise reduction.
+ * Stabilized motion-aware pixel averaging across up to 4 aligned frames
+ * (used when OffscreenCanvas lacks WebGL, e.g., older Safari builds).
  */
-function averageFramesCPU(frames, crop, mirrorX) {
+function averageFramesCPU(frames, crop, mirrorX, alignEntries = null) {
   const width = crop.outWidth;
   const height = crop.outHeight;
   const buffers = [];
@@ -89,25 +92,18 @@ function averageFramesCPU(frames, crop, mirrorX) {
   let workCtx = null;
 
   for (let i = 0; i < frames.length; i++) {
+    const alignEntry = Array.isArray(alignEntries) ? alignEntries[i] : null;
     if (!workCanvas) {
-      const res = cropFrameToCanvas(frames[i], crop, mirrorX);
+      const res = cropFrameToCanvas(frames[i], crop, mirrorX, alignEntry);
       workCanvas = res.canvas;
       workCtx = res.ctx;
     } else {
-      workCtx.setTransform(1, 0, 0, 1, 0, 0);
-      if (mirrorX) {
-        workCtx.translate(width, 0);
-        workCtx.scale(-1, 1);
-      }
-      workCtx.clearRect(0, 0, width, height);
-      workCtx.drawImage(
+      drawAlignedFrameToCanvas(
+        workCtx,
         frames[i],
-        crop.sx,
-        crop.sy,
-        crop.sw,
-        crop.sh,
-        0,
-        0,
+        crop,
+        mirrorX,
+        alignEntry,
         width,
         height
       );
@@ -137,18 +133,23 @@ function averageFramesCPU(frames, crop, mirrorX) {
     let totalW = 4;
 
     for (let f = 1; f < frameCount; f++) {
+      const entry = Array.isArray(alignEntries) ? alignEntries[f] : null;
+      const conf = entry?.weight ?? 1;
+      if (conf <= 0.01) continue;
+      const gain = entry?.lumaGain ?? 1;
+
       const buf = buffers[f];
-      const rf = buf[i];
-      const gf = buf[i + 1];
-      const bf = buf[i + 2];
-      const diff =
-        Math.abs(rf - r0) + Math.abs(gf - g0) + Math.abs(bf - b0);
+      if (buf[i + 3] < 200) continue;
+      const rf = Math.min(255, buf[i] * gain);
+      const gf = Math.min(255, buf[i + 1] * gain);
+      const bf = Math.min(255, buf[i + 2] * gain);
+      const diff = Math.abs(rf - r0) + Math.abs(gf - g0) + Math.abs(bf - b0);
 
       let w = 0;
-      if (diff < 54) {
-        w = 4;
-      } else if (diff < 108) {
-        w = 2;
+      if (diff < 24) {
+        w = 4 * conf;
+      } else if (diff < 46) {
+        w = 2 * conf * ((46 - diff) / 22);
       }
       if (w > 0) {
         sumR += rf * w;
@@ -311,6 +312,7 @@ self.addEventListener('message', async (event) => {
     avifQuality = AVIF_DEFAULT_OPTIONS.quality,
   } = msg;
   const outputFormat = resolveOutputFormat(msg.outputFormat);
+  const stabilizationMode = normalizeStabilizationMode(msg.stabilizationMode);
 
   const intermediates = [];
 
@@ -346,16 +348,42 @@ self.addEventListener('message', async (event) => {
         : mpDim;
     fallbackMaxDim = maxDim;
 
+    let workingFrames = frames;
+    let alignmentPlan = null;
+    let stabilizationInfo = null;
+
+    if (typeof OffscreenCanvas === 'function' && mode === 'hq' && frames.length > 1) {
+      alignmentPlan = alignBitmapBurst({
+        frames,
+        stabilizationMode,
+        createCanvas: (w, h) => new OffscreenCanvas(w, h),
+        maxFrames: 4,
+      });
+      workingFrames = alignmentPlan.selectedIndices.map((idx) => frames[idx]);
+      const adoptedSet = new Set(alignmentPlan.selectedIndices);
+      for (let i = 0; i < frames.length; i++) {
+        if (!adoptedSet.has(i)) {
+          try {
+            frames[i]?.close?.();
+          } catch {
+            // already closed
+          }
+        }
+      }
+      stabilizationInfo = summarizeAlignmentPlan(alignmentPlan, frames.length, stabilizationMode);
+    }
+
     if (webgl) {
-      const crop = computeAspectCrop(
+      const baseCrop = computeAspectCrop(
         srcW,
         srcH,
         aspectRatio,
         softwareZoom,
         maxDim
       );
+      const crop = applyStabilizedInsetToCrop(baseCrop, alignmentPlan?.safeCrop);
 
-      let gpuSources = frames;
+      let gpuSources = workingFrames;
       let cropNorm = {
         x: crop.sx / srcW,
         y: crop.sy / srcH,
@@ -363,16 +391,28 @@ self.addEventListener('message', async (event) => {
         h: crop.sh / srcH,
       };
       let applyMirrorInShader = mirrorX;
+      let frameAlignments = alignmentPlan?.entries || null;
 
-      // Downscale pre-cropped inputs only if raw sensor size exceeds WebGL MAX_TEXTURE_SIZE
+      // Downscale & pre-align pre-cropped inputs only if raw sensor size exceeds WebGL MAX_TEXTURE_SIZE
       if (srcW > webgl.maxTextureSize || srcH > webgl.maxTextureSize) {
-        gpuSources = frames.map((frame) => {
-          const { canvas } = cropFrameToCanvas(frame, crop, mirrorX);
+        gpuSources = workingFrames.map((frame, idx) => {
+          const { canvas } = cropFrameToCanvas(
+            frame,
+            crop,
+            mirrorX,
+            alignmentPlan?.entries?.[idx] || null
+          );
           intermediates.push(canvas);
           return canvas;
         });
         cropNorm = { x: 0, y: 0, w: 1, h: 1 };
         applyMirrorInShader = false;
+        if (frameAlignments) {
+          frameAlignments = frameAlignments.map((entry) => ({
+            ...entry,
+            uvMatrix: { mat: [1, 0, 0, 1], shift: [0, 0] },
+          }));
+        }
       }
 
       if (mode === 'hq') {
@@ -382,6 +422,9 @@ self.addEventListener('message', async (event) => {
           cropNorm,
           mirrorX: applyMirrorInShader,
           exposureEv,
+          frameAlignments,
+          patchTol2: stabilizationMode === STABILIZATION_MODES.OFF ? 0.0085 : 0.0018,
+          sharpen: stabilizationMode === STABILIZATION_MODES.HIGH ? 0.62 : 0.54,
         });
       } else {
         webgl.processStandard(gpuSources[0], {
@@ -416,15 +459,22 @@ self.addEventListener('message', async (event) => {
         format: encoded.format,
         mimeType: encoded.mimeType,
         engine: encoded.engine,
+        stabilizationInfo,
       });
       return;
     }
 
     // Fallback when Worker OffscreenCanvas lacks WebGL (e.g. iOS 16.4-16.6 Safari):
-    // Still offload heavy multi-frame pixel averaging to the Worker!
-    if (typeof OffscreenCanvas === 'function' && mode === 'hq' && frames.length > 1) {
-      const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
-      const averagedCanvas = averageFramesCPU(frames, crop, mirrorX);
+    // Still perform full frame selection, alignment, and low-ghost averaging inside Worker!
+    if (typeof OffscreenCanvas === 'function' && mode === 'hq' && workingFrames.length > 1) {
+      const baseCrop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
+      const crop = applyStabilizedInsetToCrop(baseCrop, alignmentPlan?.safeCrop);
+      const averagedCanvas = averageFramesCPU(
+        workingFrames,
+        crop,
+        mirrorX,
+        alignmentPlan?.entries || null
+      );
       releaseFrames(frames);
       const averagedBitmap = averagedCanvas.transferToImageBitmap();
       self.postMessage(
@@ -436,6 +486,7 @@ self.addEventListener('message', async (event) => {
           width: crop.outWidth,
           height: crop.outHeight,
           engine: 'worker-cpu-avg+main-webgl',
+          stabilizationInfo,
         },
         [averagedBitmap]
       );
@@ -445,7 +496,8 @@ self.addEventListener('message', async (event) => {
     // Ultimate Canvas2D fallback inside Worker so transferred bitmaps are never lost
     if (typeof OffscreenCanvas === 'function') {
       const crop = computeAspectCrop(srcW, srcH, aspectRatio, softwareZoom, maxDim);
-      const { canvas, ctx } = cropFrameToCanvas(frames[0], crop, mirrorX);
+      const refBmp = workingFrames[0] || frames[0];
+      const { canvas, ctx } = cropFrameToCanvas(refBmp, crop, mirrorX);
       releaseFrames(frames);
       const encoded = await encodeWorkerOutput({
         format: outputFormat,
@@ -464,6 +516,7 @@ self.addEventListener('message', async (event) => {
         format: encoded.format,
         mimeType: encoded.mimeType,
         engine: encoded.engine,
+        stabilizationInfo,
       });
       return;
     }
@@ -477,15 +530,16 @@ self.addEventListener('message', async (event) => {
   } catch (err) {
     // Attempt single-frame 2D rescue before reporting failure
     try {
-      if (typeof OffscreenCanvas === 'function' && frames.length && frames[0].width > 0) {
+      const rescueFrame = frames.find((f) => f && f.width > 0);
+      if (typeof OffscreenCanvas === 'function' && rescueFrame) {
         const crop = computeAspectCrop(
-          frames[0].width,
-          frames[0].height,
+          rescueFrame.width,
+          rescueFrame.height,
           aspectRatio,
           softwareZoom,
           fallbackMaxDim
         );
-        const { canvas, ctx } = cropFrameToCanvas(frames[0], crop, mirrorX);
+        const { canvas, ctx } = cropFrameToCanvas(rescueFrame, crop, mirrorX);
         releaseFrames(frames);
         const encoded = await encodeWorkerOutput({
           format: outputFormat,
