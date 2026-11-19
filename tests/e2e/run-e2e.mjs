@@ -53,18 +53,49 @@ function startStaticServer() {
   });
 }
 
+function hasPlaywrightChromiumInstalled() {
+  const fullChromiumPath = chromium.executablePath();
+  if (!fullChromiumPath) return false;
+  if (existsSync(fullChromiumPath)) return true;
+
+  const match = fullChromiumPath.match(/^(.*?[\\/])chromium-(\d+)[\\/]/);
+  if (!match) return false;
+  const headlessShellDir = path.join(match[1], `chromium_headless_shell-${match[2]}`);
+  return (
+    existsSync(path.join(headlessShellDir, 'INSTALLATION_COMPLETE')) ||
+    existsSync(headlessShellDir)
+  );
+}
+
+function resolveChromiumExecutablePath() {
+  if (process.env.CHROME_PATH) {
+    return process.env.CHROME_PATH;
+  }
+  if (process.env.CI || hasPlaywrightChromiumInstalled()) {
+    return undefined;
+  }
+  for (const candidate of [
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+  ]) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
 async function main() {
   const { server, url } = await startStaticServer();
-  const executablePath =
-    process.env.CHROME_PATH ||
-    (existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined);
+  const executablePath = resolveChromiumExecutablePath();
   const screenshotDir = process.env.QCAM_SCREENSHOT_DIR || null;
 
   console.log('[e2e] launching chromium:', executablePath || 'playwright-bundled');
   const browser = await chromium.launch({
     ...(executablePath ? { executablePath } : {}),
     headless: true,
-    timeout: 30000,
+    timeout: 60000,
     args: [
       '--no-sandbox',
       '--disable-dev-shm-usage',
