@@ -54,6 +54,8 @@ export class CameraUI {
       thumbImg: document.getElementById('thumb-img'),
       thumbPlaceholder: document.getElementById('thumb-placeholder'),
       thumbCount: document.getElementById('thumb-count'),
+      thumbProcessing: document.getElementById('thumb-processing'),
+      thumbProcessingCount: document.getElementById('thumb-processing-count'),
       btnShutter: document.getElementById('btn-shutter'),
       btnSwitchCamera: document.getElementById('btn-switch-camera'),
 
@@ -731,6 +733,15 @@ export class CameraUI {
       this.els.thumbCount.hidden = false;
     } else {
       this.els.thumbCount.hidden = true;
+    }
+  }
+
+  setProcessingCount(count) {
+    if (!this.els.thumbProcessing) return;
+    const active = Number(count) > 0;
+    this.els.thumbProcessing.hidden = !active;
+    if (this.els.thumbProcessingCount) {
+      this.els.thumbProcessingCount.textContent = count > 1 ? String(count) : '';
     }
   }
 

@@ -68,6 +68,10 @@ class QcamApp {
     this.photos = [];
     this.currentGalleryIndex = 0;
     this.isCapturing = false;
+    this._bgQueue = [];
+    this._isDrainingQueue = false;
+    this.pendingProcessCount = 0;
+    this.maxPendingJobs = this.platform.isIOS ? 2 : 4;
     this.isSwitchingCamera = false;
     this.countdownTimerId = null;
     this.countdownRemaining = 0;
@@ -410,12 +414,59 @@ class QcamApp {
     });
   }
 
+  _isShutterLocked() {
+    return this.isCapturing || this.pendingProcessCount >= this.maxPendingJobs;
+  }
+
+  _syncShutterState() {
+    this.ui.setCapturing(this._isShutterLocked());
+    this.ui.setProcessingCount(this.pendingProcessCount);
+  }
+
+  _dedupeFilename(baseFilename) {
+    if (!this.photos.some((p) => p.filename === baseFilename)) {
+      return baseFilename;
+    }
+    const hdrIdx = baseFilename.lastIndexOf('_HDR.');
+    const dotIdx = baseFilename.lastIndexOf('.');
+    const splitIdx = hdrIdx > 0 ? hdrIdx : dotIdx > 0 ? dotIdx : baseFilename.length;
+    const prefix = baseFilename.slice(0, splitIdx);
+    const suffix = baseFilename.slice(splitIdx);
+    let seq = 2;
+    let candidate = `${prefix}-${seq}${suffix}`;
+    while (this.photos.some((p) => p.filename === candidate)) {
+      seq += 1;
+      candidate = `${prefix}-${seq}${suffix}`;
+    }
+    return candidate;
+  }
+
+  _releaseQueuedJobs() {
+    while (this._bgQueue.length > 0) {
+      const job = this._bgQueue.shift();
+      for (const frame of job?.frames || []) {
+        try {
+          frame?.close?.();
+        } catch {
+          // ignore
+        }
+      }
+      this.pendingProcessCount = Math.max(0, this.pendingProcessCount - 1);
+    }
+    this._syncShutterState();
+  }
+
   handleShutter() {
     if (this.isCapturing) return;
 
     // Cancel active countdown if shutter clicked again
     if (this.countdownRemaining > 0) {
       this._cancelCountdown();
+      return;
+    }
+
+    if (this.pendingProcessCount >= this.maxPendingJobs) {
+      this.ui.showToast('前の写真を保存中です · まもなく撮影できます', { durationMs: 1400 });
       return;
     }
 
@@ -452,7 +503,7 @@ class QcamApp {
   }
 
   async _captureNow({ fromTimer = false } = {}) {
-    if (this.isCapturing) return;
+    if (this.isCapturing || this.pendingProcessCount >= this.maxPendingJobs) return;
     if (!this.camera.stream) {
       this.ui.showToast('カメラが準備できていません');
       return;
@@ -462,15 +513,22 @@ class QcamApp {
     this.ui.setCapturing(true);
     this.ui.triggerSilentBlackout();
 
+    const capturedAt = new Date();
     const totalStart = performance.now();
     const mode = 'hq';
     const format = this.settings.outputFormat === 'jpeg' ? 'jpeg' : 'avif';
+    const aspectRatio = this.settings.aspectRatio;
+    const softwareZoom = this.camera.softwareZoom;
+    const outputMegapixels = this.settings.outputMegapixels;
+    const colorProfile = this.settings.colorProfile;
     const isFront = this.camera.facingMode === 'user';
     const mirrorOutput = isFront && this.settings.mirrorFrontSave;
     const softwareEv = this.streamInfo?.supportsHardwareExposure
       ? 0
       : this.camera.exposureCompensation;
+    const stabilizationMode = normalizeStabilizationMode(this.settings.stabilization);
 
+    let queuedJob = null;
     try {
       const caps = this.pipeline.getCapabilities();
       const info = this.streamInfo || this.camera.getStreamInfo();
@@ -483,15 +541,14 @@ class QcamApp {
         streamHeight: info?.videoHeight || this.camera.video.videoHeight || 0,
         photoMaxWidth: info?.photoMaxWidth || null,
         photoMaxHeight: info?.photoMaxHeight || null,
-        aspectRatio: this.settings.aspectRatio,
-        softwareZoom: this.camera.softwareZoom,
-        outputMegapixels: this.settings.outputMegapixels,
+        aspectRatio,
+        softwareZoom,
+        outputMegapixels,
         outputFormat: format,
         maxTextureSize: caps.maxTextureSize,
         supportsNativeAvif: caps.supportsNativeAvif,
       });
 
-      const stabilizationMode = normalizeStabilizationMode(this.settings.stabilization);
       let frames = [];
       let captureSource = 'burstStream';
       if (plan.captureMethod === 'takePhoto') {
@@ -506,146 +563,254 @@ class QcamApp {
         frames = burst.frames;
         captureSource = burst.sourceType;
       }
-      this.lastCaptureSource = captureSource;
 
-      const processed = await this.pipeline.process({
+      this.lastCaptureSource = captureSource;
+      queuedJob = {
         mode,
         frames,
-        aspectRatio: this.settings.aspectRatio,
-        softwareZoom: this.camera.softwareZoom,
+        aspectRatio,
+        softwareZoom,
         mirrorX: mirrorOutput,
         exposureEv: softwareEv,
         outputFormat: format,
-        outputMegapixels: this.settings.outputMegapixels,
+        outputMegapixels,
         maxDimension: plan.maxDimension,
         stabilizationMode,
-        colorProfile: this.settings.colorProfile,
-      });
-
-      const totalTimeMs = Math.round(performance.now() - totalStart);
-      this.lastProcessEngine = processed.engine;
-      this.lastCaptureTimeMs = totalTimeMs;
-      this.lastStabilizationInfo = processed.stabilizationInfo || null;
-
-      const actualFormat = processed.format || format;
-      const mimeType =
-        processed.mimeType || (actualFormat === 'jpeg' ? 'image/jpeg' : 'image/avif');
-      const formatLabel = actualFormat.toUpperCase();
-      const filename = buildPhotoFilename(new Date(), mode, actualFormat);
-      const url = URL.createObjectURL(processed.blob);
-      const photo = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        blob: processed.blob,
-        url,
-        filename,
-        format: actualFormat,
-        mimeType,
-        width: processed.width,
-        height: processed.height,
-        mode,
-        engine: processed.engine,
-        processTimeMs: processed.processTimeMs,
-        totalTimeMs,
+        colorProfile,
+        fromTimer,
+        capturedAt,
+        totalStart,
+        captureSource,
       };
+      this._bgQueue.push(queuedJob);
+      this.pendingProcessCount += 1;
+    } catch (err) {
+      this.ui.showToast(`撮影エラー: ${err?.message || '再試行してください'}`);
+    } finally {
+      // Unlock shutter immediately after frame acquisition so continuous shooting never waits on encode
+      this.isCapturing = false;
+      this._syncShutterState();
+    }
 
-      this.lastSavedInfo = {
-        filename,
-        mimeType,
-        format: actualFormat,
-        sizeBytes: processed.blob.size,
-        method: 'pending',
-      };
+    if (queuedJob) {
+      this._drainProcessingQueue();
+    }
+  }
 
-      this._addSessionPhoto(photo);
+  async _drainProcessingQueue() {
+    if (this._isDrainingQueue) return;
+    this._isDrainingQueue = true;
+    try {
+      while (this._bgQueue.length > 0) {
+        const job = this._bgQueue.shift();
+        try {
+          await this._processQueuedJob(job);
+        } catch (err) {
+          for (const frame of job?.frames || []) {
+            try {
+              frame?.close?.();
+            } catch {
+              // ignore
+            }
+          }
+          this.ui.showToast(`撮影エラー: ${err?.message || '再試行してください'}`);
+        } finally {
+          this.pendingProcessCount = Math.max(0, this.pendingProcessCount - 1);
+          this._syncShutterState();
+        }
+      }
+    } finally {
+      this._isDrainingQueue = false;
+      if (this._bgQueue.length > 0) {
+        this._drainProcessingQueue();
+      }
+    }
+  }
 
-      if (this.platform.isIOS) {
-        if (this.settings.autoSave && !fromTimer) {
+  async _processQueuedJob(job) {
+    const processed = await this.pipeline.process({
+      mode: job.mode,
+      frames: job.frames,
+      aspectRatio: job.aspectRatio,
+      softwareZoom: job.softwareZoom,
+      mirrorX: job.mirrorX,
+      exposureEv: job.exposureEv,
+      outputFormat: job.outputFormat,
+      outputMegapixels: job.outputMegapixels,
+      maxDimension: job.maxDimension,
+      stabilizationMode: job.stabilizationMode,
+      colorProfile: job.colorProfile,
+    });
+
+    const totalTimeMs = Math.round(performance.now() - job.totalStart);
+    this.lastProcessEngine = processed.engine;
+    this.lastCaptureTimeMs = totalTimeMs;
+    this.lastStabilizationInfo = processed.stabilizationInfo || null;
+    this.lastCaptureSource = job.captureSource;
+
+    const actualFormat = processed.format || job.outputFormat;
+    const mimeType =
+      processed.mimeType || (actualFormat === 'jpeg' ? 'image/jpeg' : 'image/avif');
+    const formatLabel = actualFormat.toUpperCase();
+    const filename = this._dedupeFilename(
+      buildPhotoFilename(job.capturedAt || new Date(), job.mode, actualFormat)
+    );
+    const url = URL.createObjectURL(processed.blob);
+    const photo = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      blob: processed.blob,
+      url,
+      filename,
+      format: actualFormat,
+      mimeType,
+      width: processed.width,
+      height: processed.height,
+      mode: job.mode,
+      engine: processed.engine,
+      processTimeMs: processed.processTimeMs,
+      totalTimeMs,
+    };
+
+    this.lastSavedInfo = {
+      filename,
+      mimeType,
+      format: actualFormat,
+      sizeBytes: processed.blob.size,
+      method: 'pending',
+    };
+
+    this._addSessionPhoto(photo);
+
+    // Invoke save/share immediately (synchronously up to first await) without blocking the next queued job
+    void this._handleAutoSaveAfterProcess(photo, {
+      fromTimer: job.fromTimer,
+      totalTimeMs,
+      actualFormat,
+      formatLabel,
+      isRapidFire: this.isCapturing || this._bgQueue.length > 0,
+    });
+  }
+
+  async _handleAutoSaveAfterProcess(
+    photo,
+    { fromTimer = false, totalTimeMs = 0, actualFormat = 'avif', formatLabel = 'AVIF', isRapidFire = false }
+  ) {
+    if (this.platform.isIOS) {
+      if (isRapidFire) {
+        this.ui.showToast(
+          actualFormat === 'avif'
+            ? `AVIF 完了 (${totalTimeMs}ms) · タップで保存`
+            : `${formatLabel} 完了 (${totalTimeMs}ms) · タップで保存`,
+          {
+            durationMs: 4200,
+            onClick: () => this._invokeIOSShareOrModal(photo),
+          }
+        );
+        return;
+      }
+
+      if (this.settings.autoSave && !fromTimer) {
+        if (actualFormat === 'avif') {
+          this.ui.showToast(
+            'AVIF (.avif) 完了 · .avif 維持は「“ファイル”に保存」（「画像を保存」は JPEG 変換）',
+            { durationMs: 4200 }
+          );
+        }
+        // Attempt direct Web Share Sheet while shutter tap's transient user activation is still active.
+        const shareRes = await shareOrSavePhoto(photo, this.platform, { preferShare: true });
+        if (shareRes.method === 'web-share' && shareRes.completed) {
+          if (this.lastSavedInfo && this.lastSavedInfo.filename === photo.filename) {
+            this.lastSavedInfo.method = 'web-share';
+          }
           if (actualFormat === 'avif') {
             this.ui.showToast(
-              'AVIF (.avif) 完了 · .avif 維持は「“ファイル”に保存」（「画像を保存」は JPEG 変換）',
+              `AVIF (${totalTimeMs}ms) · 「“ファイル”に保存」で .avif 維持（写真アプリは JPEG 変換）`,
               { durationMs: 4200 }
             );
+          } else {
+            this.ui.showToast(`共有 /「写真」へ保存しました (${formatLabel} · ${totalTimeMs}ms)`, {
+              durationMs: 2800,
+            });
           }
-          // Attempt direct Web Share Sheet while shutter tap's transient user activation is still active.
-          const shareRes = await shareOrSavePhoto(photo, this.platform, { preferShare: true });
-          if (shareRes.method === 'web-share' && shareRes.completed) {
-            this.lastSavedInfo.method = 'web-share';
-            if (actualFormat === 'avif') {
-              this.ui.showToast(
-                `AVIF (${totalTimeMs}ms) · 「“ファイル”に保存」で .avif 維持（写真アプリは JPEG 変換）`,
-                { durationMs: 4200 }
-              );
-            } else {
-              this.ui.showToast(`共有 /「写真」へ保存しました (${formatLabel} · ${totalTimeMs}ms)`, {
-                durationMs: 2800,
-              });
-            }
-          } else if (shareRes.cancelled) {
+        } else if (shareRes.cancelled) {
+          if (this.lastSavedInfo && this.lastSavedInfo.filename === photo.filename) {
             this.lastSavedInfo.method = 'share-cancelled';
-            this.ui.showToast(
-              actualFormat === 'avif'
-                ? `AVIF 撮影完了 (${totalTimeMs}ms) · タップで「ファイル保存 / 直接DL」`
-                : `${formatLabel} 撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`,
-              {
-                durationMs: 5500,
-                onClick: () => this._invokeIOSShareOrModal(photo),
-              }
-            );
-          } else if (!shareRes.busy) {
-            this.lastSavedInfo.method = shareRes.reason || shareRes.method;
-            // If transient user activation expired (e.g., slow HQ burst / encode) or Share Sheet unavailable,
-            // open the Preview Modal so 1-tap Share Sheet or Safari direct download works immediately.
-            const idx = this.photos.findIndex((p) => p.id === photo.id);
-            this.currentGalleryIndex = idx >= 0 ? idx : 0;
-            this.ui.openPreviewModal(this.photos, this.currentGalleryIndex, this.platform);
-            if (actualFormat === 'avif') {
-              this.ui.showToast(
-                shareRes.gestureExpired
-                  ? '下の「共有で保存 (.avif)」→「“ファイル”に保存」で .avif 維持（長押しは JPEG 変換）'
-                  : '下のボタンで共有→「“ファイル”に保存」すると .avif のまま保存できます',
-                { durationMs: 5500 }
-              );
-            } else {
-              this.ui.showToast(
-                shareRes.gestureExpired
-                  ? '下のボタンで「画像を保存」または写真を長押ししてください'
-                  : '写真を長押しして「“写真”に保存」を選択してください',
-                { durationMs: 5000 }
-              );
-            }
           }
-        } else if (this.settings.autoSave && fromTimer) {
-          // Countdown timer runs after activation expires; open Preview Modal with 1-tap save CTA.
-          this.ui.openPreviewModal(this.photos, this.currentGalleryIndex, this.platform);
           this.ui.showToast(
             actualFormat === 'avif'
-              ? 'タイマー撮影完了 · 下のボタンから .avif 保存できます（写真保存は JPEG 変換）'
-              : 'タイマー撮影完了 · 下のボタンから「写真」へ保存できます',
-            { durationMs: 4800 }
-          );
-        } else {
-          this.ui.showToast(
-            actualFormat === 'avif'
-              ? `AVIF 撮影完了 (${totalTimeMs}ms) · タップで「ファイルに保存 / プレビュー」`
+              ? `AVIF 撮影完了 (${totalTimeMs}ms) · タップで「ファイル保存 / 直接DL」`
               : `${formatLabel} 撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`,
             {
               durationMs: 5500,
               onClick: () => this._invokeIOSShareOrModal(photo),
             }
           );
+        } else if (!shareRes.busy) {
+          if (this.lastSavedInfo && this.lastSavedInfo.filename === photo.filename) {
+            this.lastSavedInfo.method = shareRes.reason || shareRes.method;
+          }
+          // If user already started another shot while waiting on share rejection, avoid interrupting viewfinder
+          if (this.isCapturing || this._bgQueue.length > 0) {
+            this.ui.showToast(
+              actualFormat === 'avif'
+                ? `AVIF 撮影完了 (${totalTimeMs}ms) · タップで「ファイルに保存 / プレビュー」`
+                : `${formatLabel} 撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`,
+              {
+                durationMs: 5000,
+                onClick: () => this._invokeIOSShareOrModal(photo),
+              }
+            );
+            return;
+          }
+          // If transient user activation expired (e.g., slow HQ burst / encode) or Share Sheet unavailable,
+          // open the Preview Modal so 1-tap Share Sheet or Safari direct download works immediately.
+          const idx = this.photos.findIndex((p) => p.id === photo.id);
+          this.currentGalleryIndex = idx >= 0 ? idx : 0;
+          this.ui.openPreviewModal(this.photos, this.currentGalleryIndex, this.platform);
+          if (actualFormat === 'avif') {
+            this.ui.showToast(
+              shareRes.gestureExpired
+                ? '下の「共有で保存 (.avif)」→「“ファイル”に保存」で .avif 維持（長押しは JPEG 変換）'
+                : '下のボタンで共有→「“ファイル”に保存」すると .avif のまま保存できます',
+              { durationMs: 5500 }
+            );
+          } else {
+            this.ui.showToast(
+              shareRes.gestureExpired
+                ? '下のボタンで「画像を保存」または写真を長押ししてください'
+                : '写真を長押しして「“写真”に保存」を選択してください',
+              { durationMs: 5000 }
+            );
+          }
         }
-      } else if (this.settings.autoSave) {
-        triggerAnchorDownload(photo.url, photo.filename);
-        this.lastSavedInfo.method = 'auto-download';
-        this.ui.showToast(`${formatLabel} を保存しました`, {
-          durationMs: 1800,
-        });
+      } else if (this.settings.autoSave && fromTimer) {
+        // Countdown timer runs after activation expires; open Preview Modal with 1-tap save CTA.
+        this.ui.openPreviewModal(this.photos, this.currentGalleryIndex, this.platform);
+        this.ui.showToast(
+          actualFormat === 'avif'
+            ? 'タイマー撮影完了 · 下のボタンから .avif 保存できます（写真保存は JPEG 変換）'
+            : 'タイマー撮影完了 · 下のボタンから「写真」へ保存できます',
+          { durationMs: 4800 }
+        );
+      } else {
+        this.ui.showToast(
+          actualFormat === 'avif'
+            ? `AVIF 撮影完了 (${totalTimeMs}ms) · タップで「ファイルに保存 / プレビュー」`
+            : `${formatLabel} 撮影完了 (${totalTimeMs}ms) · タップで「写真」へ保存`,
+          {
+            durationMs: 5500,
+            onClick: () => this._invokeIOSShareOrModal(photo),
+          }
+        );
       }
-    } catch (err) {
-      this.ui.showToast(`撮影エラー: ${err?.message || '再試行してください'}`);
-    } finally {
-      this.isCapturing = false;
-      this.ui.setCapturing(false);
+    } else if (this.settings.autoSave) {
+      triggerAnchorDownload(photo.url, photo.filename);
+      if (this.lastSavedInfo && this.lastSavedInfo.filename === photo.filename) {
+        this.lastSavedInfo.method = 'auto-download';
+      }
+      this.ui.showToast(`${formatLabel} を保存しました`, {
+        durationMs: 1800,
+      });
     }
   }
 
@@ -909,7 +1074,7 @@ class QcamApp {
         // ignore
       }
 
-      if (!this.isCapturing && this.photos.length === 0) {
+      if (!this.isCapturing && this.pendingProcessCount === 0 && this.photos.length === 0) {
         reloadTriggered = true;
         try {
           sessionStorage.setItem(reloadKey, '1');
@@ -966,6 +1131,7 @@ class QcamApp {
     // Release hardware cleanly when leaving or reloading so next page load acquires immediately
     window.addEventListener('pagehide', () => {
       this._cancelCountdown();
+      this._releaseQueuedJobs();
       this.camera.stop();
     });
   }

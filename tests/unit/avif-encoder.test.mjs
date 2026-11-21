@@ -11,7 +11,9 @@ import {
 } from '../../src/processing/avif-encoder.js';
 import {
   extractAvifGridTiles,
+  muxAv1ObuToAvif,
   muxAvifGrid,
+  parseAv1SequenceHeaderInfo,
   parseSingleTileAvif,
   planAvifGrid,
 } from '../../src/processing/avif-grid-muxer.js';
@@ -222,4 +224,86 @@ test('muxAvifGrid produces valid ISOBMFF Grid AVIF from real vendored WASM tile 
     }),
     null
   );
+});
+
+test('planAvifGrid scales up to 6 tiles (3x2 / 2x3) on high-MP images with 6+ workers', () => {
+  const g6Landscape = planAvifGrid(4032, 3024, 6);
+  assert.equal(g6Landscape.cols, 3);
+  assert.equal(g6Landscape.rows, 2);
+  assert.equal(g6Landscape.tileWidth % 64, 0);
+  assert.equal(g6Landscape.tileHeight % 64, 0);
+  assert.ok(g6Landscape.tileWidth * 3 >= 4032 && g6Landscape.tileWidth * 2 < 4032);
+  assert.ok(g6Landscape.tileHeight * 2 >= 3024 && g6Landscape.tileHeight < 3024);
+
+  const g6Portrait = planAvifGrid(3024, 4032, 6);
+  assert.equal(g6Portrait.cols, 2);
+  assert.equal(g6Portrait.rows, 3);
+  assert.equal(g6Portrait.tileWidth % 64, 0);
+  assert.equal(g6Portrait.tileHeight % 64, 0);
+
+  // Medium resolution (< 3.5MP) stays at 2x2 even with 6 workers to avoid tile overhead
+  const gMedium = planAvifGrid(1920, 1440, 6);
+  assert.equal(gMedium.cols, 2);
+  assert.equal(gMedium.rows, 2);
+});
+
+test('parseAv1SequenceHeaderInfo & muxAv1ObuToAvif wrap raw AV1 OBU into a valid AVIF container', async () => {
+  const wasmPath = path.resolve(
+    import.meta.dirname,
+    '..',
+    '..',
+    'src',
+    'vendor',
+    'avif',
+    'avif_enc.wasm'
+  );
+  const wasmBinary = fs.readFileSync(wasmPath);
+  const mod = await avifEncoderFactory({ noInitialRun: true, wasmBinary });
+
+  const w = 128;
+  const h = 96;
+  const rgba = new Uint8Array(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    rgba[i * 4] = (i * 3) & 255;
+    rgba[i * 4 + 1] = (i * 7) & 255;
+    rgba[i * 4 + 2] = 180;
+    rgba[i * 4 + 3] = 255;
+  }
+  const encodedTile = new Uint8Array(
+    mod.encode(rgba, w, h, resolveAdaptiveAvifOptions(w, h, { quality: 86 }))
+  );
+  const parsed = parseSingleTileAvif(encodedTile);
+  assert.ok(parsed && parsed.obu.byteLength > 0);
+
+  const seqInfo = parseAv1SequenceHeaderInfo(parsed.obu);
+  assert.ok(seqInfo, 'Should parse Sequence Header OBU from real AV1 bitstream');
+  assert.equal(seqInfo.seqProfile, 0);
+  assert.equal(typeof seqInfo.seqLevelIdx0, 'number');
+
+  const remuxed = muxAv1ObuToAvif({
+    obuBytes: parsed.obu,
+    width: w,
+    height: h,
+    profile: seqInfo.seqProfile,
+    levelIdx: seqInfo.seqLevelIdx0,
+    chromaSubsampling: '420',
+    colorSpace: {
+      primaries: 'bt709',
+      transfer: 'iec61966-2-1',
+      matrix: 'bt709',
+      fullRange: true,
+    },
+  });
+  assert.ok(remuxed instanceof Uint8Array);
+  assert.equal(isValidAvifBytes(remuxed), true);
+  assert.equal(String.fromCharCode(...remuxed.slice(4, 12)), 'ftypavif');
+
+  // Round-trip verify with parseSingleTileAvif
+  const reparsed = parseSingleTileAvif(remuxed);
+  assert.ok(reparsed, 'Remuxed single-item AVIF should parse cleanly');
+  assert.equal(reparsed.obu.byteLength, parsed.obu.byteLength);
+
+  // Reject invalid arguments safely
+  assert.equal(muxAv1ObuToAvif({ obuBytes: new Uint8Array(0), width: 100, height: 100 }), null);
+  assert.equal(muxAv1ObuToAvif({ obuBytes: parsed.obu, width: 0, height: 100 }), null);
 });

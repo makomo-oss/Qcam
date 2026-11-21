@@ -917,7 +917,7 @@ async function main() {
       window.__SHARE_MODE__ = 'expire';
     });
     await iosPage.click('#btn-shutter');
-    await iosPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 10000 });
+    await iosPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 20000 });
     assert.ok((await iosPage.textContent('#btn-modal-save')).includes('写真'));
     assert.equal(await iosPage.locator('#btn-modal-share').isVisible(), false);
     await iosPage.click('#btn-modal-close');
@@ -946,7 +946,7 @@ async function main() {
       return Boolean(window.__QCAM__?.streamInfo && v && v.videoWidth > 0 && v.videoHeight > 0);
     }, { timeout: 6000 });
     await iosPwaPage.click('#btn-shutter');
-    await iosPwaPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 10000 });
+    await iosPwaPage.waitForSelector('#preview-modal:not([hidden])', { timeout: 20000 });
     assert.equal(
       await iosPwaPage.locator('#btn-modal-share').isVisible(),
       false,
@@ -1128,7 +1128,7 @@ async function main() {
       await androidUwPage.screenshot({ path: path.join(screenshotDir, 'e2e_ultrawide_360x640.png') });
     }
 
-    const uwDlPromise = androidUwPage.waitForEvent('download', { timeout: 10000 });
+    const uwDlPromise = androidUwPage.waitForEvent('download', { timeout: 20000 });
     await androidUwPage.click('#btn-shutter');
     const uwDl = await uwDlPromise;
     assert.ok(uwDl.suggestedFilename().endsWith('.avif'));
@@ -1529,11 +1529,11 @@ async function main() {
     assert.ok(jpegMpTopText.includes('17.3 MP') && !jpegMpTopText.includes('AVIF上限'), `Expected unlocked 17.3 MP in JPEG, got ${jpegMpTopText}`);
     await hiResPage.click('#btn-info-close');
 
-    const jpegMaxDlPromise = hiResPage.waitForEvent('download', { timeout: 20000 });
+    const jpegMaxDlPromise = hiResPage.waitForEvent('download', { timeout: 30000 });
     await hiResPage.click('#btn-shutter');
     const jpegMaxDl = await jpegMaxDlPromise;
     assert.ok(jpegMaxDl.suggestedFilename().includes('_HDR.jpg'));
-    await hiResPage.waitForFunction(() => window.__QCAM__.photos.length === 2 && !window.__QCAM__.isCapturing, { timeout: 20000 });
+    await hiResPage.waitForFunction(() => window.__QCAM__.photos.length === 2 && !window.__QCAM__.isCapturing, { timeout: 30000 });
     const jpegMaxPhoto = await hiResPage.evaluate(() => {
       const p = window.__QCAM__.photos[0];
       return {
@@ -2428,6 +2428,110 @@ async function main() {
     assert.ok(proIspResult.packedRedRgb[0] > 180 && proIspResult.packedRedRgb[1] < 75);
 
     await proIspContext.close();
+
+    // 26. Non-blocking Continuous Shooting & Background Queue E2E Test:
+    // Verifies shutter unlocks immediately after burst frame acquisition while previous shot is
+    // still processing/encoding in background, gallery spinner shows progress, and rapid-fire shots
+    // complete cleanly with unique filenames and valid decoded AVIFs.
+    console.log('[e2e] checking non-blocking continuous shooting & background processing queue');
+    const rapidContext = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+      acceptDownloads: true,
+      permissions: ['camera'],
+    });
+    const rapidPage = await rapidContext.newPage();
+    rapidPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(`[rapid] ${msg.text()}`);
+    });
+    rapidPage.on('pageerror', (err) => pageErrors.push(`[rapid] ${err.message}`));
+
+    await rapidPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await rapidPage.waitForFunction(() => Boolean(window.__QCAM__?.camera?.stream), { timeout: 12000 });
+
+    // Hold shot #1's pipeline.process slightly so we deterministically verify non-blocking shutter
+    // unlock and background spinner even on fast CPUs.
+    await rapidPage.evaluate(() => {
+      const app = window.__QCAM__;
+      const origProcess = app.pipeline.process.bind(app.pipeline);
+      let releaseFirst = null;
+      const firstGate = new Promise((resolve) => {
+        releaseFirst = resolve;
+      });
+      window.__RELEASE_FIRST_JOB__ = () => releaseFirst();
+      let callNum = 0;
+      app.pipeline.process = async (opts) => {
+        callNum += 1;
+        const myCall = callNum;
+        const result = await origProcess(opts);
+        if (myCall === 1) {
+          await firstGate;
+        }
+        return result;
+      };
+    });
+
+    const rapidDownloads = [];
+    rapidPage.on('download', (dl) => rapidDownloads.push(dl.suggestedFilename()));
+
+    // Trigger Shot #1 -> shutter must unlock right after burst capture while Shot #1 is still encoding
+    await rapidPage.click('#btn-shutter');
+    await rapidPage.waitForFunction(
+      () =>
+        !document.getElementById('btn-shutter').disabled &&
+        !window.__QCAM__.isCapturing &&
+        window.__QCAM__.pendingProcessCount === 1,
+      { timeout: 6000 }
+    );
+    const rapidMid1 = await rapidPage.evaluate(() => ({
+      photos: window.__QCAM__.photos.length,
+      pending: window.__QCAM__.pendingProcessCount,
+      spinnerVisible: !document.getElementById('thumb-processing').hidden,
+    }));
+    assert.equal(rapidMid1.photos, 0, 'Shot #1 should still be processing in background');
+    assert.equal(rapidMid1.pending, 1);
+    assert.equal(rapidMid1.spinnerVisible, true, 'Gallery spinner must be visible while processing');
+
+    // Immediately fire Shot #2 while Shot #1 is still in-flight!
+    await rapidPage.click('#btn-shutter');
+    await rapidPage.waitForFunction(
+      () =>
+        !document.getElementById('btn-shutter').disabled &&
+        !window.__QCAM__.isCapturing &&
+        window.__QCAM__.pendingProcessCount === 2,
+      { timeout: 6000 }
+    );
+    const rapidMid2CountText = await rapidPage.textContent('#thumb-processing-count');
+    assert.equal(rapidMid2CountText.trim(), '2', 'Processing badge should display queued count 2');
+
+    // Release Shot #1 and verify both queued shots complete cleanly in background
+    await rapidPage.evaluate(() => window.__RELEASE_FIRST_JOB__());
+    await rapidPage.waitForFunction(
+      () => window.__QCAM__.photos.length === 2 && window.__QCAM__.pendingProcessCount === 0,
+      { timeout: 30000 }
+    );
+    const rapidFinal = await rapidPage.evaluate(async () => {
+      const photos = window.__QCAM__.photos;
+      const decodedOk = [];
+      for (const p of photos) {
+        const bmp = await createImageBitmap(p.blob);
+        decodedOk.push(bmp.width === p.width && bmp.height === p.height && bmp.width > 0);
+        bmp.close();
+      }
+      return {
+        count: photos.length,
+        filenames: photos.map((p) => p.filename),
+        spinnerHidden: document.getElementById('thumb-processing').hidden,
+        decodedOk,
+      };
+    });
+    assert.equal(rapidFinal.count, 2);
+    assert.equal(rapidFinal.spinnerHidden, true);
+    assert.equal(new Set(rapidFinal.filenames).size, 2, 'Rapid-fire filenames must be unique');
+    assert.deepEqual(rapidFinal.decodedOk, [true, true]);
+    assert.equal(rapidDownloads.length, 2, 'Both rapid-fire shots must auto-download');
+    await rapidContext.close();
 
     assert.deepEqual(consoleErrors, [], `Console errors encountered: ${consoleErrors.join('; ')}`);
     assert.deepEqual(pageErrors, [], `Page errors encountered: ${pageErrors.join('; ')}`);

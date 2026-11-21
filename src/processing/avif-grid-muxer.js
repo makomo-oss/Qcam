@@ -92,7 +92,7 @@ function concatUint8Arrays(parts) {
 export function planAvifGrid(width, height, workerCount = 1) {
   const safeW = Math.round(Number(width) || 0);
   const safeH = Math.round(Number(height) || 0);
-  const workers = Math.max(1, Math.min(4, Math.floor(Number(workerCount) || 1)));
+  const workers = Math.max(1, Math.min(6, Math.floor(Number(workerCount) || 1)));
 
   // Small images finish quickly on a single worker; avoid tiling overhead.
   if (
@@ -108,7 +108,15 @@ export function planAvifGrid(width, height, workerCount = 1) {
 
   let cols = 1;
   let rows = 1;
-  if (workers >= 4 && safeW >= 768 && safeH >= 768) {
+  if (workers >= 6 && safeW * safeH >= 3_500_000 && safeW >= 1200 && safeH >= 1200) {
+    if (safeW >= safeH) {
+      cols = 3;
+      rows = 2;
+    } else {
+      cols = 2;
+      rows = 3;
+    }
+  } else if (workers >= 4 && safeW >= 768 && safeH >= 768) {
     cols = 2;
     rows = 2;
   } else if (safeW >= safeH) {
@@ -595,6 +603,219 @@ export function muxAvifGrid({
   const iloc = buildIloc(mdatPayloadStart);
   const meta = makeBox('meta', [new Uint8Array(4), hdlr, pitm, iloc, iinf, iref, iprp]);
   const mdat = makeBox('mdat', [gridPayload, ...parsed.map((p) => p.obu)]);
+
+  return concatUint8Arrays([ftyp, meta, mdat]);
+}
+
+/**
+ * Parse seq_profile and seq_level_idx_0 from the Sequence Header OBU (obu_type === 1)
+ * inside a raw AV1 keyframe bitstream produced by WebCodecs VideoEncoder.
+ */
+export function parseAv1SequenceHeaderInfo(obuBytes) {
+  const bytes =
+    obuBytes instanceof Uint8Array
+      ? obuBytes
+      : obuBytes instanceof ArrayBuffer
+      ? new Uint8Array(obuBytes)
+      : ArrayBuffer.isView(obuBytes)
+      ? new Uint8Array(obuBytes.buffer, obuBytes.byteOffset, obuBytes.byteLength)
+      : null;
+  if (!bytes || bytes.byteLength < 6) return null;
+
+  let pos = 0;
+  while (pos < bytes.byteLength) {
+    const header = bytes[pos++];
+    if (header & 0x80) return null; // obu_forbidden_bit must be 0
+    const obuType = (header >> 3) & 0x0f;
+    const hasExtension = (header & 0x04) !== 0;
+    const hasSizeField = (header & 0x02) !== 0;
+    if (hasExtension) {
+      if (pos >= bytes.byteLength) return null;
+      pos++;
+    }
+    let payloadSize = bytes.byteLength - pos;
+    if (hasSizeField) {
+      let val = 0;
+      let shift = 0;
+      while (pos < bytes.byteLength && shift < 35) {
+        const b = bytes[pos++];
+        val |= (b & 0x7f) << shift;
+        if ((b & 0x80) === 0) break;
+        shift += 7;
+      }
+      payloadSize = val;
+    }
+    if (pos + payloadSize > bytes.byteLength) return null;
+
+    if (obuType === 1 && payloadSize >= 4) {
+      // Bit-level read of Sequence Header OBU:
+      // seq_profile (3), still_picture (1), reduced_still_picture_header (1)
+      const b0 = bytes[pos];
+      const seqProfile = (b0 >> 5) & 0x07;
+      const reducedHeader = (b0 >> 3) & 0x01;
+      if (reducedHeader) {
+        // Next 5 bits across b0[2..0] and b1[7..6]
+        const seqLevelIdx0 = ((b0 & 0x07) << 2) | ((bytes[pos + 1] >> 6) & 0x03);
+        return { seqProfile, seqLevelIdx0, seqTier0: 0 };
+      }
+      // Full sequence header: skip timing/decoder_model/initial_display flags when absent
+      // Bits 5..7 of b0: timing_info_present_flag (bit 2), initial_display_delay_present_flag (bit 1),
+      // operating_points_cnt_minus_1 (5 bits starting at bit 0 of b0 -> b1[7..4])
+      const timingPresent = (b0 >> 2) & 0x01;
+      if (!timingPresent) {
+        // b0 bit 1 = initial_display_delay_present_flag, bit 0 + b1[7..4] = operating_points_cnt_minus_1
+        // Followed by operating_point_idc[0] (12 bits) then seq_level_idx[0] (5 bits)
+        // Bit offset from start of payload: 3+1+1+1+1+5+12 = 24 bits -> starts cleanly at bytes[pos + 3] MSB!
+        const seqLevelIdx0 = (bytes[pos + 3] >> 3) & 0x1f;
+        const seqTier0 = seqLevelIdx0 > 7 ? (bytes[pos + 3] >> 2) & 0x01 : 0;
+        return { seqProfile, seqLevelIdx0, seqTier0 };
+      }
+      return { seqProfile, seqLevelIdx0: null, seqTier0: 0 };
+    }
+    pos += payloadSize;
+  }
+  return null;
+}
+
+/**
+ * Wrap a single raw AV1 keyframe OBU (e.g., from WebCodecs VideoEncoder) into a strictly
+ * spec-compliant ISO/IEC 23008-12 & AVIF v1.1.0 image container.
+ */
+export function muxAv1ObuToAvif({
+  obuBytes,
+  width,
+  height,
+  profile = 1,
+  levelIdx = 8,
+  chromaSubsampling = '444',
+  colorSpace = null,
+}) {
+  const obu =
+    obuBytes instanceof Uint8Array
+      ? obuBytes
+      : obuBytes instanceof ArrayBuffer
+      ? new Uint8Array(obuBytes)
+      : ArrayBuffer.isView(obuBytes)
+      ? new Uint8Array(obuBytes.buffer, obuBytes.byteOffset, obuBytes.byteLength)
+      : null;
+  if (!obu || obu.byteLength < 8 || width < 2 || height < 2) return null;
+
+  const parsedSeq = parseAv1SequenceHeaderInfo(obu);
+  const seqProfile = parsedSeq?.seqProfile ?? profile;
+  const seqLevelIdx = parsedSeq?.seqLevelIdx0 ?? levelIdx;
+  const seqTier = parsedSeq?.seqTier0 ?? 0;
+  const is444 = seqProfile === 1 || chromaSubsampling === '444';
+
+  const strBytes = (s) => {
+    const out = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+    return out;
+  };
+  const makeFullBox = (type, version, flags, parts) => {
+    const hdr = new Uint8Array(4);
+    hdr[0] = version & 0xff;
+    hdr[1] = (flags >> 16) & 0xff;
+    hdr[2] = (flags >> 8) & 0xff;
+    hdr[3] = flags & 0xff;
+    return makeBox(type, [hdr, ...parts]);
+  };
+
+  // ftyp box
+  const ftyp = makeBox('ftyp', [
+    strBytes('avif'),
+    new Uint8Array(4),
+    strBytes('avif'),
+    strBytes('mif1'),
+    strBytes('miaf'),
+    strBytes(is444 ? 'MA1H' : 'MA1B'),
+  ]);
+
+  // hdlr box (pict)
+  const hdlrPayload = new Uint8Array(21);
+  hdlrPayload.set(strBytes('pict'), 4);
+  const hdlr = makeFullBox('hdlr', 0, 0, [hdlrPayload]);
+
+  // pitm box (primary item = 1)
+  const pitmPayload = new Uint8Array(2);
+  writeU16BE(pitmPayload, 0, 1);
+  const pitm = makeFullBox('pitm', 0, 0, [pitmPayload]);
+
+  // iinf box with 1 infe ('av01')
+  const infePayload = new Uint8Array(9);
+  writeU16BE(infePayload, 0, 1);
+  writeU16BE(infePayload, 2, 0);
+  infePayload.set(strBytes('av01'), 4);
+  infePayload[8] = 0;
+  const infe = makeFullBox('infe', 2, 0, [infePayload]);
+  const iinfCount = new Uint8Array(2);
+  writeU16BE(iinfCount, 0, 1);
+  const iinf = makeFullBox('iinf', 0, 0, [iinfCount, infe]);
+
+  // ipco properties: 1=ispe, 2=pixi, 3=av1C (essential), 4=colr
+  const ispePayload = new Uint8Array(8);
+  writeU32BE(ispePayload, 0, Math.round(width));
+  writeU32BE(ispePayload, 4, Math.round(height));
+  const ispe = makeFullBox('ispe', 0, 0, [ispePayload]);
+
+  const pixi = makeFullBox('pixi', 0, 0, [new Uint8Array([3, 8, 8, 8])]);
+
+  // av1C (4-byte AV1CodecConfigurationRecord)
+  const av1cFlags = ((seqTier & 1) << 7) | (is444 ? 0x00 : 0x0c);
+  const av1C = makeBox('av1C', [
+    new Uint8Array([0x81, ((seqProfile & 0x07) << 5) | (seqLevelIdx & 0x1f), av1cFlags, 0x00]),
+  ]);
+
+  // colr (nclx): preserve encoder color space (BT.709 primaries, sRGB transfer, matching matrix & range)
+  const primMap = { bt709: 1, bt470bg: 5, smpte170m: 6 };
+  const xferMap = { bt709: 1, smpte170m: 6, linear: 8, 'iec61966-2-1': 13 };
+  const matMap = { rgb: 0, bt709: 1, bt470bg: 5, smpte170m: 6 };
+  const primaries = primMap[colorSpace?.primaries] ?? 1;
+  const transfer = xferMap[colorSpace?.transfer] ?? 13;
+  const matrix = matMap[colorSpace?.matrix] ?? 1;
+  const fullRangeByte = colorSpace?.fullRange === false ? 0x00 : 0x80;
+  const colrPayload = new Uint8Array(11);
+  colrPayload.set(strBytes('nclx'), 0);
+  writeU16BE(colrPayload, 4, primaries);
+  writeU16BE(colrPayload, 6, transfer);
+  writeU16BE(colrPayload, 8, matrix);
+  colrPayload[10] = fullRangeByte;
+  const colr = makeBox('colr', [colrPayload]);
+
+  const ipco = makeBox('ipco', [ispe, pixi, av1C, colr]);
+
+  // ipma: 1 item (id=1) referencing properties 1, 2, 3 (essential), 4
+  const ipmaPayload = new Uint8Array(11);
+  writeU32BE(ipmaPayload, 0, 1);
+  writeU16BE(ipmaPayload, 4, 1);
+  ipmaPayload[6] = 4;
+  ipmaPayload[7] = 0x01;
+  ipmaPayload[8] = 0x02;
+  ipmaPayload[9] = 0x83; // essential av1C
+  ipmaPayload[10] = 0x04;
+  const ipma = makeFullBox('ipma', 0, 0, [ipmaPayload]);
+  const iprp = makeBox('iprp', [ipco, ipma]);
+
+  // iloc: 1 item, offset_size=4, length_size=4
+  const buildIloc = (dataOffset) => {
+    const buf = new Uint8Array(18);
+    buf[0] = 0x44;
+    buf[1] = 0x00;
+    writeU16BE(buf, 2, 1);
+    writeU16BE(buf, 4, 1);
+    writeU16BE(buf, 6, 0);
+    writeU16BE(buf, 8, 1);
+    writeU32BE(buf, 10, dataOffset);
+    writeU32BE(buf, 14, obu.byteLength);
+    return makeFullBox('iloc', 0, 0, [buf]);
+  };
+
+  const ilocSize = 8 + 4 + 18;
+  const metaSize = 8 + 4 + hdlr.byteLength + pitm.byteLength + ilocSize + iinf.byteLength + iprp.byteLength;
+  const mdatPayloadStart = ftyp.byteLength + metaSize + 8;
+
+  const iloc = buildIloc(mdatPayloadStart);
+  const meta = makeFullBox('meta', 0, 0, [hdlr, pitm, iloc, iinf, iprp]);
+  const mdat = makeBox('mdat', [obu]);
 
   return concatUint8Arrays([ftyp, meta, mdat]);
 }

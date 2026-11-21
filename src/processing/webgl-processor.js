@@ -623,9 +623,10 @@ export class WebGLImageProcessor {
       preUploadedTextures = null,
     }
   ) {
+    this._warmedUp = true;
     const gl = this.gl;
-    this.canvas.width = outWidth;
-    this.canvas.height = outHeight;
+    if (this.canvas.width !== outWidth) this.canvas.width = outWidth;
+    if (this.canvas.height !== outHeight) this.canvas.height = outHeight;
     this._lastOutputFlippedY = Boolean(flipOutputY);
 
     const usePreUploaded = Array.isArray(preUploadedTextures) && preUploadedTextures.length > 0;

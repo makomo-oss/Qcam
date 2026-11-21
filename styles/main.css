@@ -839,6 +839,44 @@ input:focus-visible {
   color: var(--text-primary);
 }
 
+.thumb-processing {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.44);
+  pointer-events: none;
+}
+
+.thumb-processing[hidden] {
+  display: none;
+}
+
+.thumb-processing-ring {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.22);
+  border-top-color: var(--accent-gold);
+  animation: qcam-spin 0.72s linear infinite;
+}
+
+.thumb-processing-count {
+  position: absolute;
+  font-size: 9px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+@keyframes qcam-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Crisp Optical Monochrome Shutter */
 .shutter-btn {
   position: relative;

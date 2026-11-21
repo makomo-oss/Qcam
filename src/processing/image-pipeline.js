@@ -21,9 +21,11 @@ import {
   JPEG_MIME_TYPE,
   canvasToEncodedBlob,
   encodeAvifFromRgba,
+  encodeAvifWithWebCodecs,
   isValidAvifBytes,
   resolveOutputFormat,
   supportsNativeCanvasAvif,
+  supportsWebCodecsAv1,
   warmupAvifEncoder,
 } from './avif-encoder.js';
 
@@ -42,6 +44,7 @@ export class ImagePipeline {
     this.nextJobId = 1;
     this.maxTextureSize = 4096;
     this.supportsNativeAvif = false;
+    this.supportsWebCodecsAv1 = false;
     this.onCapabilitiesChange = null;
     this._initWorker();
   }
@@ -63,7 +66,8 @@ export class ImagePipeline {
       typeof navigator !== 'undefined' && Number.isFinite(navigator.hardwareConcurrency)
         ? navigator.hardwareConcurrency
         : 2;
-    const extraCount = Math.max(0, Math.min(4, Math.floor(hwCores)) - 1);
+    const maxWorkers = this.platform.isIOS ? 4 : 6;
+    const extraCount = Math.max(0, Math.min(maxWorkers, Math.floor(hwCores)) - 1);
     for (let i = 0; i < extraCount; i++) {
       try {
         const portId = i + 1;
@@ -112,8 +116,9 @@ export class ImagePipeline {
             this.maxTextureSize = data.maxTextureSize;
           }
           this.supportsNativeAvif = Boolean(data.supportsNativeAvif);
-          if (this.supportsNativeAvif) {
-            // Native AVIF encoder available -> auxiliary WASM tile workers are unnecessary
+          this.supportsWebCodecsAv1 = Boolean(data.supportsWebCodecsAv1);
+          if (this.supportsNativeAvif || this.supportsWebCodecsAv1) {
+            // Native Canvas AVIF or WebCodecs AV1 available -> auxiliary WASM tile workers are unnecessary
             this._terminateAvifWorkers();
           }
           if (typeof this.onCapabilitiesChange === 'function') {
@@ -157,6 +162,7 @@ export class ImagePipeline {
     return {
       maxTextureSize: this.maxTextureSize,
       supportsNativeAvif: this.supportsNativeAvif,
+      supportsWebCodecsAv1: this.supportsWebCodecsAv1,
     };
   }
 
@@ -164,21 +170,32 @@ export class ImagePipeline {
     if (this.worker) {
       this.worker.postMessage({ type: 'warmup' });
     } else {
-      warmupAvifEncoder().catch(() => {});
+      Promise.all([
+        supportsNativeCanvasAvif().catch(() => false),
+        supportsWebCodecsAv1().catch(() => false),
+      ]).then(([nativeAvif, webCodecsAv1]) => {
+        this.supportsNativeAvif = Boolean(nativeAvif);
+        this.supportsWebCodecsAv1 = Boolean(webCodecsAv1);
+        if (!nativeAvif && !webCodecsAv1) {
+          warmupAvifEncoder().catch(() => {});
+        }
+      });
     }
     if (!this.worker || !this.platform.supportsOffscreenWebGL) {
       const webgl = this._getMainWebGL();
       if (webgl && webgl.maxTextureSize) {
         this.maxTextureSize = webgl.maxTextureSize;
       }
-      supportsNativeCanvasAvif()
-        .catch(() => false)
-        .then((native) => {
-          this.supportsNativeAvif = Boolean(native);
-          if (typeof this.onCapabilitiesChange === 'function') {
-            this.onCapabilitiesChange(this.getCapabilities());
-          }
-        });
+      Promise.all([
+        supportsNativeCanvasAvif().catch(() => false),
+        supportsWebCodecsAv1().catch(() => false),
+      ]).then(([native, webCodecs]) => {
+        this.supportsNativeAvif = Boolean(native);
+        this.supportsWebCodecsAv1 = Boolean(webCodecs);
+        if (typeof this.onCapabilitiesChange === 'function') {
+          this.onCapabilitiesChange(this.getCapabilities());
+        }
+      });
     }
   }
 
@@ -238,13 +255,14 @@ export class ImagePipeline {
     avifQuality,
     jpegQuality,
     engineBase,
+    nativeAvif = null,
+    webCodecsAv1 = null,
   }) {
     if (format === 'jpeg') {
       const blob = await canvasToEncodedBlob(canvas, JPEG_MIME_TYPE, jpegQuality);
       if (webgl) {
         webgl.releaseWorkingBuffers();
-      }
-      if (canvas) {
+      } else if (canvas) {
         canvas.width = 1;
         canvas.height = 1;
       }
@@ -258,15 +276,16 @@ export class ImagePipeline {
       };
     }
 
-    if (await supportsNativeCanvasAvif()) {
+    const canNative =
+      nativeAvif !== null ? Boolean(nativeAvif) : await supportsNativeCanvasAvif().catch(() => false);
+    if (canNative) {
       const blob = await canvasToEncodedBlob(canvas, AVIF_MIME_TYPE, avifQuality / 100);
       if (blob && blob.type === AVIF_MIME_TYPE && blob.size >= 16) {
         const header = await blob.slice(0, 64).arrayBuffer();
         if (isValidAvifBytes(header)) {
           if (webgl) {
             webgl.releaseWorkingBuffers();
-          }
-          if (canvas) {
+          } else if (canvas) {
             canvas.width = 1;
             canvas.height = 1;
           }
@@ -279,6 +298,28 @@ export class ImagePipeline {
             engine: `${engineBase}+native-avif`,
           };
         }
+      }
+    }
+
+    const canWebCodecs =
+      webCodecsAv1 !== null ? Boolean(webCodecsAv1) : await supportsWebCodecsAv1().catch(() => false);
+    if (canWebCodecs && canvas && (!webgl || !webgl._lastOutputFlippedY)) {
+      const blob = await encodeAvifWithWebCodecs(canvas, width, height, { quality: avifQuality });
+      if (blob && blob.size >= 32) {
+        if (webgl) {
+          webgl.releaseWorkingBuffers();
+        } else {
+          canvas.width = 1;
+          canvas.height = 1;
+        }
+        return {
+          blob,
+          width,
+          height,
+          format: 'avif',
+          mimeType: AVIF_MIME_TYPE,
+          engine: `${engineBase}+webcodecs-av1`,
+        };
       }
     }
 
@@ -474,8 +515,13 @@ export class ImagePipeline {
     const srcH = frames[0].height;
     const format = resolveOutputFormat(outputFormat);
     const webgl = this._getMainWebGL();
-    const nativeAvif =
-      format === 'avif' ? await supportsNativeCanvasAvif().catch(() => false) : false;
+    const [nativeAvif, webCodecsAv1] =
+      format === 'avif'
+        ? await Promise.all([
+            supportsNativeCanvasAvif().catch(() => false),
+            supportsWebCodecsAv1().catch(() => false),
+          ])
+        : [false, false];
     const texLimit = webgl ? webgl.maxTextureSize : 4096;
     const encoderMax = getEncoderMaxDimension({
       outputFormat: format,
@@ -620,7 +666,7 @@ export class ImagePipeline {
           }
         }
 
-        const flipOutputY = format === 'avif' && !nativeAvif;
+        const flipOutputY = format === 'avif' && !nativeAvif && !webCodecsAv1;
         if (mode === 'hq') {
           webgl.processHQ(gpuSources, {
             outWidth: crop.outWidth,
@@ -668,6 +714,8 @@ export class ImagePipeline {
           avifQuality,
           jpegQuality,
           engineBase: enginePrefix || 'main-WebGL-pro',
+          nativeAvif,
+          webCodecsAv1,
         });
 
         return {
@@ -721,6 +769,8 @@ export class ImagePipeline {
       avifQuality,
       jpegQuality,
       engineBase: 'canvas2d-fallback',
+      nativeAvif,
+      webCodecsAv1,
     });
     return {
       ...encoded,

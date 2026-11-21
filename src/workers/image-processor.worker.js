@@ -22,12 +22,14 @@ import {
   canvasToEncodedBlob,
   encodeAvifBytesFromRgba,
   encodeAvifFromRgba,
+  encodeAvifWithWebCodecs,
   getCompiledWasmModule,
   isValidAvifBytes,
   primeCompiledWasmModule,
   resolveAdaptiveAvifOptions,
   resolveOutputFormat,
   supportsNativeCanvasAvif,
+  supportsWebCodecsAv1,
   warmupAvifEncoder,
 } from '../processing/avif-encoder.js';
 import {
@@ -360,13 +362,13 @@ async function encodeWorkerOutput({
   jpegQuality = DEFAULT_JPEG_QUALITY,
   engineBase,
   nativeAvif = null,
+  webCodecsAv1 = null,
 }) {
   if (format === 'jpeg') {
     const blob = await canvasToEncodedBlob(canvas, JPEG_MIME_TYPE, jpegQuality);
     if (webgl) {
       webgl.releaseWorkingBuffers();
-    }
-    if (canvas) {
+    } else if (canvas) {
       canvas.width = 1;
       canvas.height = 1;
     }
@@ -387,8 +389,7 @@ async function encodeWorkerOutput({
       if (isValidAvifBytes(header)) {
         if (webgl) {
           webgl.releaseWorkingBuffers();
-        }
-        if (canvas) {
+        } else if (canvas) {
           canvas.width = 1;
           canvas.height = 1;
         }
@@ -399,6 +400,28 @@ async function encodeWorkerOutput({
           engine: `${engineBase}+native-avif`,
         };
       }
+    }
+  }
+
+  const canUseWebCodecsAv1 =
+    webCodecsAv1 !== null ? Boolean(webCodecsAv1) : await supportsWebCodecsAv1();
+  if (canUseWebCodecsAv1 && canvas && (!webgl || !webgl._lastOutputFlippedY)) {
+    const wcBlob = await encodeAvifWithWebCodecs(canvas, canvas.width, canvas.height, {
+      quality: avifQuality,
+    });
+    if (wcBlob) {
+      if (webgl) {
+        webgl.releaseWorkingBuffers();
+      } else {
+        canvas.width = 1;
+        canvas.height = 1;
+      }
+      return {
+        blob: wcBlob,
+        mimeType: AVIF_MIME_TYPE,
+        format: 'avif',
+        engine: `${engineBase}+webcodecs-av1`,
+      };
     }
   }
 
@@ -442,6 +465,9 @@ async function encodeWorkerOutput({
   };
 }
 
+let webglWarmupTimerId = null;
+let hasStartedProcessJob = false;
+
 self.addEventListener('message', async (event) => {
   const msg = event.data;
   if (!msg) return;
@@ -462,28 +488,36 @@ self.addEventListener('message', async (event) => {
       sharedCompiledWasm = msg.wasmModule;
       primeCompiledWasmModule(msg.wasmModule);
     }
-    supportsNativeCanvasAvif()
-      .catch(() => false)
-      .then((nativeAvif) => {
-        self.postMessage({
-          type: 'capabilities',
-          maxTextureSize: webgl ? webgl.maxTextureSize : 4096,
-          supportsWebGL: Boolean(webgl),
-          supportsNativeAvif: Boolean(nativeAvif),
-        });
-        if (webgl) {
-          setTimeout(() => webgl.warmup(), 250);
-        }
-        if (!nativeAvif) {
-          getCompiledWasmModule()
-            .then((mod) => {
-              sharedCompiledWasm = mod;
-              broadcastWasmWarmupToTilePorts(mod);
-              return warmupAvifEncoder({ forceWasm: true, wasmModule: mod });
-            })
-            .catch(() => {});
-        }
+    Promise.all([
+      supportsNativeCanvasAvif().catch(() => false),
+      supportsWebCodecsAv1().catch(() => false),
+    ]).then(([nativeAvif, webCodecsAv1]) => {
+      self.postMessage({
+        type: 'capabilities',
+        maxTextureSize: webgl ? webgl.maxTextureSize : 4096,
+        supportsWebGL: Boolean(webgl),
+        supportsNativeAvif: Boolean(nativeAvif),
+        supportsWebCodecsAv1: Boolean(webCodecsAv1),
       });
+      if (webgl && !hasStartedProcessJob && !webgl._warmedUp) {
+        if (webglWarmupTimerId !== null) clearTimeout(webglWarmupTimerId);
+        webglWarmupTimerId = setTimeout(() => {
+          webglWarmupTimerId = null;
+          if (!hasStartedProcessJob && !webgl._warmedUp) {
+            webgl.warmup();
+          }
+        }, 250);
+      }
+      if (!nativeAvif && !webCodecsAv1) {
+        getCompiledWasmModule()
+          .then((mod) => {
+            sharedCompiledWasm = mod;
+            broadcastWasmWarmupToTilePorts(mod);
+            return warmupAvifEncoder({ forceWasm: true, wasmModule: mod });
+          })
+          .catch(() => {});
+      }
+    });
     return;
   }
 
@@ -524,6 +558,11 @@ self.addEventListener('message', async (event) => {
   }
 
   if (msg.type !== 'process') return;
+  hasStartedProcessJob = true;
+  if (webglWarmupTimerId !== null) {
+    clearTimeout(webglWarmupTimerId);
+    webglWarmupTimerId = null;
+  }
 
   const {
     id,
@@ -556,6 +595,10 @@ self.addEventListener('message', async (event) => {
     const webgl = getWebGLProcessor();
     const nativeAvif =
       outputFormat === 'avif' ? await supportsNativeCanvasAvif().catch(() => false) : false;
+    const webCodecsAv1 =
+      outputFormat === 'avif' && !nativeAvif
+        ? await supportsWebCodecsAv1().catch(() => false)
+        : false;
     const texLimit = webgl ? webgl.maxTextureSize : 4096;
     const encoderMax = getEncoderMaxDimension({
       outputFormat,
@@ -675,8 +718,9 @@ self.addEventListener('message', async (event) => {
         }
       }
 
-      // Render Y-flipped directly when feeding gl.readPixels -> WASM AVIF so CPU row reversal is skipped
-      const flipOutputY = outputFormat === 'avif' && !nativeAvif;
+      // Render Y-flipped directly only when feeding gl.readPixels -> WASM AVIF so CPU row reversal is skipped;
+      // keep right-side-up for JPEG, native Canvas AVIF, and WebCodecs VideoFrame(webgl.canvas).
+      const flipOutputY = outputFormat === 'avif' && !nativeAvif && !webCodecsAv1;
       if (mode === 'hq') {
         webgl.processHQ(gpuSources, {
           outWidth: crop.outWidth,
@@ -715,6 +759,7 @@ self.addEventListener('message', async (event) => {
         jpegQuality,
         engineBase: 'worker-webgl-pro',
         nativeAvif,
+        webCodecsAv1,
       });
 
       self.postMessage({
@@ -778,6 +823,7 @@ self.addEventListener('message', async (event) => {
         jpegQuality,
         engineBase: 'worker-canvas2d',
         nativeAvif,
+        webCodecsAv1,
       });
       self.postMessage({
         id,
