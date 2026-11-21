@@ -36,6 +36,7 @@ export class ImagePipeline {
   constructor(platform) {
     this.platform = platform;
     this.worker = null;
+    this.avifWorkers = [];
     this.mainWebGL = null;
     this.pending = new Map();
     this.nextJobId = 1;
@@ -43,6 +44,58 @@ export class ImagePipeline {
     this.supportsNativeAvif = false;
     this.onCapabilitiesChange = null;
     this._initWorker();
+  }
+
+  _terminateAvifWorkers() {
+    for (const w of this.avifWorkers) {
+      try {
+        w.terminate();
+      } catch {
+        // ignore
+      }
+    }
+    this.avifWorkers = [];
+  }
+
+  _initAvifTileWorkers() {
+    if (!this.worker || typeof MessageChannel !== 'function') return;
+    const hwCores =
+      typeof navigator !== 'undefined' && Number.isFinite(navigator.hardwareConcurrency)
+        ? navigator.hardwareConcurrency
+        : 2;
+    const extraCount = Math.max(0, Math.min(4, Math.floor(hwCores)) - 1);
+    for (let i = 0; i < extraCount; i++) {
+      try {
+        const portId = i + 1;
+        const tileWorker = new Worker(
+          new URL('../workers/avif-tile.worker.js', import.meta.url),
+          { type: 'module' }
+        );
+        const channel = new MessageChannel();
+        tileWorker.addEventListener('error', () => {
+          try {
+            this.worker?.postMessage({ type: 'detach-tile-port', portId });
+          } catch {
+            // ignore
+          }
+          try {
+            tileWorker.terminate();
+          } catch {
+            // ignore
+          }
+          this.avifWorkers = this.avifWorkers.filter((w) => w !== tileWorker);
+        });
+        tileWorker.postMessage({ type: 'attach-port', port: channel.port2 }, [channel.port2]);
+        this.worker.postMessage(
+          { type: 'attach-tile-port', portId, port: channel.port1 },
+          [channel.port1]
+        );
+        this.avifWorkers.push(tileWorker);
+      } catch {
+        // Non-fatal: remaining workers or single-worker encoder still work seamlessly
+        break;
+      }
+    }
   }
 
   _initWorker() {
@@ -59,6 +112,10 @@ export class ImagePipeline {
             this.maxTextureSize = data.maxTextureSize;
           }
           this.supportsNativeAvif = Boolean(data.supportsNativeAvif);
+          if (this.supportsNativeAvif) {
+            // Native AVIF encoder available -> auxiliary WASM tile workers are unnecessary
+            this._terminateAvifWorkers();
+          }
           if (typeof this.onCapabilitiesChange === 'function') {
             this.onCapabilitiesChange(this.getCapabilities());
           }
@@ -75,9 +132,12 @@ export class ImagePipeline {
           entry.resolve({ ok: false, fallbackToMain: true });
         }
         this.pending.clear();
+        this._terminateAvifWorkers();
         this.worker = null;
       });
+      this._initAvifTileWorkers();
     } catch {
+      this._terminateAvifWorkers();
       this.worker = null;
     }
   }
@@ -438,156 +498,185 @@ export class ImagePipeline {
     let workingFrames = frames;
     let alignmentPlan = null;
     let stabilizationInfo = null;
+    let gpuSession = null;
 
-    if (!preCropped) {
-      alignmentPlan = alignBitmapBurst({
-        frames,
-        stabilizationMode: safeStabMode,
-        colorProfile: safeColorProfile,
-        createCanvas: (w, h) => {
-          const c = document.createElement('canvas');
-          c.width = w;
-          c.height = h;
-          return c;
-        },
-        maxFrames: mode === 'hq' ? 4 : 1,
-      });
-      workingFrames = alignmentPlan.selectedIndices.map((idx) => frames[idx]);
-      const adoptedSet = new Set(alignmentPlan.selectedIndices);
-      for (let i = 0; i < frames.length; i++) {
-        if (!adoptedSet.has(i)) {
+    try {
+      if (!preCropped && webgl && srcW <= webgl.maxTextureSize && srcH <= webgl.maxTextureSize) {
+        try {
+          const sessionFrames = mode === 'hq' ? frames : [frames[0]];
+          gpuSession = webgl.createFrameTextureSession(sessionFrames);
+        } catch {
+          gpuSession = null;
+        }
+      }
+
+      if (!preCropped) {
+        alignmentPlan = alignBitmapBurst({
+          frames,
+          stabilizationMode: safeStabMode,
+          colorProfile: safeColorProfile,
+          createCanvas: (w, h) => {
+            const c = document.createElement('canvas');
+            c.width = w;
+            c.height = h;
+            return c;
+          },
+          maxFrames: mode === 'hq' ? 4 : 1,
+          gpuSession,
+        });
+        workingFrames = alignmentPlan.selectedIndices.map((idx) => frames[idx]);
+        const adoptedSet = new Set(alignmentPlan.selectedIndices);
+        for (let i = 0; i < frames.length; i++) {
+          if (!adoptedSet.has(i)) {
+            try {
+              frames[i]?.close?.();
+            } catch {
+              // ignore
+            }
+          }
+        }
+        if (mode === 'hq' && frames.length > 1) {
+          stabilizationInfo = summarizeAlignmentPlan(alignmentPlan, frames.length, safeStabMode);
+        }
+      }
+
+      const mergedEstimate =
+        preMergedCoverage > 0.15 ? Math.max(2, Math.round(1 + preMergedCoverage * 3)) : workingFrames.length;
+      const developProfile =
+        alignmentPlan?.developProfile ||
+        computeProDevelopProfile(alignmentPlan?.sceneStats || sceneStats || null, {
+          frameCount: preMergedCoverage > 0 ? 4 : workingFrames.length,
+          mergedCount: mergedEstimate,
+          stabilizationMode: safeStabMode,
+          colorProfile: safeColorProfile,
+        });
+
+      if (webgl) {
+        const baseCrop = preCropped
+          ? {
+              sx: 0,
+              sy: 0,
+              sw: srcW,
+              sh: srcH,
+              outWidth: srcW,
+              outHeight: srcH,
+            }
+          : computeAspectCrop(
+              srcW,
+              srcH,
+              aspectRatio,
+              softwareZoom,
+              maxDim
+            );
+        const crop = preCropped
+          ? baseCrop
+          : applyStabilizedInsetToCrop(baseCrop, alignmentPlan?.safeCrop);
+
+        let gpuSources = workingFrames;
+        let cropNorm = {
+          x: crop.sx / srcW,
+          y: crop.sy / srcH,
+          w: crop.sw / srcW,
+          h: crop.sh / srcH,
+        };
+        let applyMirrorInShader = mirrorX;
+        let frameAlignments = alignmentPlan?.entries || null;
+        let preUploadedTextures = null;
+        const tempCanvases = [];
+
+        if (srcW > webgl.maxTextureSize || srcH > webgl.maxTextureSize) {
+          gpuSession?.dispose?.();
+          gpuSession = null;
+          gpuSources = workingFrames.map((frame, idx) => {
+            const c = document.createElement('canvas');
+            c.width = crop.outWidth;
+            c.height = crop.outHeight;
+            const ctx = c.getContext('2d');
+            drawAlignedFrameToCanvas(
+              ctx,
+              frame,
+              crop,
+              mirrorX,
+              alignmentPlan?.entries?.[idx] || null,
+              crop.outWidth,
+              crop.outHeight
+            );
+            tempCanvases.push(c);
+            return c;
+          });
+          cropNorm = { x: 0, y: 0, w: 1, h: 1 };
+          applyMirrorInShader = false;
+          if (frameAlignments) {
+            frameAlignments = frameAlignments.map((entry) => ({
+              ...entry,
+              uvMatrix: { mat: [1, 0, 0, 1], shift: [0, 0] },
+            }));
+          }
+        } else if (gpuSession) {
+          const selected = alignmentPlan ? alignmentPlan.selectedIndices : [0];
+          const taken = gpuSession.takeSelectedTextures(selected);
+          if (taken.length === gpuSources.length) {
+            preUploadedTextures = taken;
+          }
+        }
+
+        const flipOutputY = format === 'avif' && !nativeAvif;
+        if (mode === 'hq') {
+          webgl.processHQ(gpuSources, {
+            outWidth: crop.outWidth,
+            outHeight: crop.outHeight,
+            cropNorm,
+            mirrorX: applyMirrorInShader,
+            exposureEv,
+            frameAlignments,
+            developProfile,
+            preMergedCoverage,
+            flipOutputY,
+            preUploadedTextures,
+          });
+        } else {
+          webgl.processStandard(gpuSources[0], {
+            outWidth: crop.outWidth,
+            outHeight: crop.outHeight,
+            cropNorm,
+            mirrorX: applyMirrorInShader,
+            exposureEv,
+            developProfile,
+            flipOutputY,
+            preUploadedTextures,
+          });
+        }
+
+        for (const frame of frames) {
           try {
-            frames[i]?.close?.();
+            frame?.close?.();
           } catch {
             // ignore
           }
         }
-      }
-      if (mode === 'hq' && frames.length > 1) {
-        stabilizationInfo = summarizeAlignmentPlan(alignmentPlan, frames.length, safeStabMode);
-      }
-    }
-
-    const mergedEstimate =
-      preMergedCoverage > 0.15 ? Math.max(2, Math.round(1 + preMergedCoverage * 3)) : workingFrames.length;
-    const developProfile =
-      alignmentPlan?.developProfile ||
-      computeProDevelopProfile(alignmentPlan?.sceneStats || sceneStats || null, {
-        frameCount: preMergedCoverage > 0 ? 4 : workingFrames.length,
-        mergedCount: mergedEstimate,
-        stabilizationMode: safeStabMode,
-        colorProfile: safeColorProfile,
-      });
-
-    if (webgl) {
-      const baseCrop = preCropped
-        ? {
-            sx: 0,
-            sy: 0,
-            sw: srcW,
-            sh: srcH,
-            outWidth: srcW,
-            outHeight: srcH,
-          }
-        : computeAspectCrop(
-            srcW,
-            srcH,
-            aspectRatio,
-            softwareZoom,
-            maxDim
-          );
-      const crop = preCropped
-        ? baseCrop
-        : applyStabilizedInsetToCrop(baseCrop, alignmentPlan?.safeCrop);
-
-      let gpuSources = workingFrames;
-      let cropNorm = {
-        x: crop.sx / srcW,
-        y: crop.sy / srcH,
-        w: crop.sw / srcW,
-        h: crop.sh / srcH,
-      };
-      let applyMirrorInShader = mirrorX;
-      let frameAlignments = alignmentPlan?.entries || null;
-      const tempCanvases = [];
-
-      if (srcW > webgl.maxTextureSize || srcH > webgl.maxTextureSize) {
-        gpuSources = workingFrames.map((frame, idx) => {
-          const c = document.createElement('canvas');
-          c.width = crop.outWidth;
-          c.height = crop.outHeight;
-          const ctx = c.getContext('2d');
-          drawAlignedFrameToCanvas(
-            ctx,
-            frame,
-            crop,
-            mirrorX,
-            alignmentPlan?.entries?.[idx] || null,
-            crop.outWidth,
-            crop.outHeight
-          );
-          tempCanvases.push(c);
-          return c;
-        });
-        cropNorm = { x: 0, y: 0, w: 1, h: 1 };
-        applyMirrorInShader = false;
-        if (frameAlignments) {
-          frameAlignments = frameAlignments.map((entry) => ({
-            ...entry,
-            uvMatrix: { mat: [1, 0, 0, 1], shift: [0, 0] },
-          }));
+        for (const tc of tempCanvases) {
+          tc.width = 1;
+          tc.height = 1;
         }
-      }
 
-      if (mode === 'hq') {
-        webgl.processHQ(gpuSources, {
-          outWidth: crop.outWidth,
-          outHeight: crop.outHeight,
-          cropNorm,
-          mirrorX: applyMirrorInShader,
-          exposureEv,
-          frameAlignments,
-          developProfile,
-          preMergedCoverage,
+        const encoded = await this._encodeMainCanvas({
+          format,
+          webgl,
+          canvas: webgl.canvas,
+          width: crop.outWidth,
+          height: crop.outHeight,
+          avifQuality,
+          jpegQuality,
+          engineBase: enginePrefix || 'main-WebGL-pro',
         });
-      } else {
-        webgl.processStandard(gpuSources[0], {
-          outWidth: crop.outWidth,
-          outHeight: crop.outHeight,
-          cropNorm,
-          mirrorX: applyMirrorInShader,
-          exposureEv,
-          developProfile,
-        });
-      }
 
-      for (const frame of frames) {
-        try {
-          frame?.close?.();
-        } catch {
-          // ignore
-        }
+        return {
+          ...encoded,
+          stabilizationInfo,
+        };
       }
-      for (const tc of tempCanvases) {
-        tc.width = 1;
-        tc.height = 1;
-      }
-
-      const encoded = await this._encodeMainCanvas({
-        format,
-        webgl,
-        canvas: webgl.canvas,
-        width: crop.outWidth,
-        height: crop.outHeight,
-        avifQuality,
-        jpegQuality,
-        engineBase: enginePrefix || 'main-WebGL-pro',
-      });
-
-      return {
-        ...encoded,
-        stabilizationInfo,
-      };
+    } finally {
+      gpuSession?.dispose?.();
     }
 
     // Ultimate Canvas2D fallback if WebGL is completely unavailable
@@ -640,6 +729,7 @@ export class ImagePipeline {
   }
 
   dispose() {
+    this._terminateAvifWorkers();
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;

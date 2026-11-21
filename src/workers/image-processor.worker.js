@@ -20,12 +20,21 @@ import {
   AVIF_MIME_TYPE,
   JPEG_MIME_TYPE,
   canvasToEncodedBlob,
+  encodeAvifBytesFromRgba,
   encodeAvifFromRgba,
+  getCompiledWasmModule,
   isValidAvifBytes,
+  primeCompiledWasmModule,
+  resolveAdaptiveAvifOptions,
   resolveOutputFormat,
   supportsNativeCanvasAvif,
   warmupAvifEncoder,
 } from '../processing/avif-encoder.js';
+import {
+  extractAvifGridTiles,
+  muxAvifGrid,
+  planAvifGrid,
+} from '../processing/avif-grid-muxer.js';
 
 const DEFAULT_JPEG_QUALITY = 0.96;
 
@@ -70,9 +79,161 @@ function getWebGLProcessor() {
   }
 }
 
+const tilePorts = [];
+const pendingTileJobs = new Map();
+let nextTileJobId = 1;
+let sharedCompiledWasm = null;
+
+function broadcastWasmWarmupToTilePorts(wasmModule) {
+  for (const entry of tilePorts) {
+    const port = entry.port;
+    try {
+      port.postMessage(wasmModule ? { type: 'warmup', wasmModule } : { type: 'warmup' });
+    } catch {
+      try {
+        port.postMessage({ type: 'warmup' });
+      } catch {
+        // ignore detached port
+      }
+    }
+  }
+}
+
+function detachTilePort(portId) {
+  for (let i = tilePorts.length - 1; i >= 0; i--) {
+    if (tilePorts[i].id === portId) {
+      try {
+        tilePorts[i].port.close();
+      } catch {
+        // ignore
+      }
+      tilePorts.splice(i, 1);
+    }
+  }
+  for (const [jobId, job] of pendingTileJobs.entries()) {
+    if (job.portId === portId) {
+      pendingTileJobs.delete(jobId);
+      job.reject(new Error('Tile worker detached'));
+    }
+  }
+}
+
+function attachTilePort(port, portId = tilePorts.length + 1) {
+  if (!port) return;
+  port.addEventListener('message', (event) => {
+    const data = event.data;
+    if (!data || data.type !== 'tile-result') return;
+    const entry = pendingTileJobs.get(data.jobId);
+    if (!entry) return;
+    pendingTileJobs.delete(data.jobId);
+    if (data.ok && data.avifBuffer) {
+      entry.resolve(new Uint8Array(data.avifBuffer));
+    } else {
+      entry.reject(new Error(data.error || 'Tile AVIF encode failed'));
+    }
+  });
+  port.addEventListener('messageerror', () => {
+    detachTilePort(portId);
+  });
+  port.start();
+  tilePorts.push({ id: portId, port });
+  if (sharedCompiledWasm) {
+    try {
+      port.postMessage({ type: 'warmup', wasmModule: sharedCompiledWasm });
+    } catch {
+      try {
+        port.postMessage({ type: 'warmup' });
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+function dispatchTileEncode(portEntry, tile, options) {
+  const jobId = nextTileJobId++;
+  return new Promise((resolve, reject) => {
+    pendingTileJobs.set(jobId, { resolve, reject, portId: portEntry.id });
+    try {
+      portEntry.port.postMessage(
+        {
+          type: 'encode-tile',
+          jobId,
+          tileIndex: tile.index,
+          rgbaBuffer: tile.rgba.buffer,
+          width: tile.width,
+          height: tile.height,
+          options,
+        },
+        [tile.rgba.buffer]
+      );
+    } catch (err) {
+      pendingTileJobs.delete(jobId);
+      reject(err);
+    }
+  });
+}
+
+async function encodeAvifParallelOrSingle(rgbaInput, width, height, avifQuality) {
+  const totalWorkers = 1 + tilePorts.length;
+  const grid = planAvifGrid(width, height, totalWorkers);
+
+  if (grid.cols * grid.rows > 1 && tilePorts.length >= 1) {
+    try {
+      const rgbaView =
+        rgbaInput instanceof Uint8Array
+          ? rgbaInput
+          : rgbaInput instanceof ArrayBuffer
+          ? new Uint8Array(rgbaInput)
+          : new Uint8Array(rgbaInput.buffer, rgbaInput.byteOffset, rgbaInput.byteLength);
+
+      // Resolve adaptive quality/speed/SharpYUV once against full image dimensions
+      const fullOpts = resolveAdaptiveAvifOptions(width, height, { quality: avifQuality });
+      const tiles = extractAvifGridTiles(rgbaView, width, height, grid);
+
+      // Dispatch tiles 1..N-1 to auxiliary workers over direct MessageChannel ports
+      // while encoding tile 0 concurrently in this worker.
+      const tilePromises = new Array(tiles.length);
+      for (let i = 1; i < tiles.length; i++) {
+        const portEntry = tilePorts[(i - 1) % tilePorts.length];
+        tilePromises[i] = dispatchTileEncode(portEntry, tiles[i], fullOpts);
+      }
+      tilePromises[0] = encodeAvifBytesFromRgba(
+        tiles[0].rgba,
+        tiles[0].width,
+        tiles[0].height,
+        fullOpts
+      );
+
+      const tileAvifs = await Promise.all(tilePromises);
+      const muxed = muxAvifGrid({
+        outputWidth: width,
+        outputHeight: height,
+        tileWidth: grid.tileWidth,
+        tileHeight: grid.tileHeight,
+        cols: grid.cols,
+        rows: grid.rows,
+        tileAvifs,
+      });
+
+      if (muxed && isValidAvifBytes(muxed)) {
+        return {
+          blob: new Blob([muxed], { type: AVIF_MIME_TYPE }),
+          parallelTiles: tiles.length,
+        };
+      }
+    } catch {
+      // Fall back cleanly to single-worker AVIF encoding
+    }
+  }
+
+  const blob = await encodeAvifFromRgba(rgbaInput, width, height, { quality: avifQuality });
+  return { blob, parallelTiles: 1 };
+}
+
 function cropFrameToCanvas(bitmap, crop, mirrorX, alignEntry = null) {
   const canvas = new OffscreenCanvas(crop.outWidth, crop.outHeight);
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const ctx = canvas.getContext('2d');
   drawAlignedFrameToCanvas(
     ctx,
     bitmap,
@@ -198,6 +359,7 @@ async function encodeWorkerOutput({
   avifQuality = AVIF_DEFAULT_OPTIONS.quality,
   jpegQuality = DEFAULT_JPEG_QUALITY,
   engineBase,
+  nativeAvif = null,
 }) {
   if (format === 'jpeg') {
     const blob = await canvasToEncodedBlob(canvas, JPEG_MIME_TYPE, jpegQuality);
@@ -216,7 +378,9 @@ async function encodeWorkerOutput({
     };
   }
 
-  if (await supportsNativeCanvasAvif()) {
+  const canUseNativeAvif =
+    nativeAvif !== null ? Boolean(nativeAvif) : await supportsNativeCanvasAvif();
+  if (canUseNativeAvif) {
     const blob = await canvasToEncodedBlob(canvas, AVIF_MIME_TYPE, avifQuality / 100);
     if (blob && blob.type === AVIF_MIME_TYPE && blob.size >= 16) {
       const header = await blob.slice(0, 64).arrayBuffer();
@@ -261,12 +425,20 @@ async function encodeWorkerOutput({
     canvas.height = 1;
   }
 
-  const blob = await encodeAvifFromRgba(rgbaPixels, width, height, { quality: avifQuality });
+  const { blob, parallelTiles } = await encodeAvifParallelOrSingle(
+    rgbaPixels,
+    width,
+    height,
+    avifQuality
+  );
   return {
     blob,
     mimeType: AVIF_MIME_TYPE,
     format: 'avif',
-    engine: `${engineBase}+wasm-avif`,
+    engine:
+      parallelTiles > 1
+        ? `${engineBase}+wasm-avif-grid${parallelTiles}`
+        : `${engineBase}+wasm-avif`,
   };
 }
 
@@ -274,9 +446,22 @@ self.addEventListener('message', async (event) => {
   const msg = event.data;
   if (!msg) return;
 
+  if (msg.type === 'attach-tile-port' && msg.port) {
+    attachTilePort(msg.port, msg.portId);
+    return;
+  }
+
+  if (msg.type === 'detach-tile-port') {
+    detachTilePort(msg.portId);
+    return;
+  }
+
   if (msg.type === 'warmup') {
     const webgl = getWebGLProcessor();
-    warmupAvifEncoder().catch(() => {});
+    if (msg.wasmModule) {
+      sharedCompiledWasm = msg.wasmModule;
+      primeCompiledWasmModule(msg.wasmModule);
+    }
     supportsNativeCanvasAvif()
       .catch(() => false)
       .then((nativeAvif) => {
@@ -286,6 +471,18 @@ self.addEventListener('message', async (event) => {
           supportsWebGL: Boolean(webgl),
           supportsNativeAvif: Boolean(nativeAvif),
         });
+        if (webgl) {
+          setTimeout(() => webgl.warmup(), 250);
+        }
+        if (!nativeAvif) {
+          getCompiledWasmModule()
+            .then((mod) => {
+              sharedCompiledWasm = mod;
+              broadcastWasmWarmupToTilePorts(mod);
+              return warmupAvifEncoder({ forceWasm: true, wasmModule: mod });
+            })
+            .catch(() => {});
+        }
       });
     return;
   }
@@ -300,7 +497,12 @@ self.addEventListener('message', async (event) => {
       engine = 'main-webgl-pro+worker-avif',
     } = msg;
     try {
-      const blob = await encodeAvifFromRgba(rgbaBuffer, width, height, { quality: avifQuality });
+      const { blob, parallelTiles } = await encodeAvifParallelOrSingle(
+        rgbaBuffer,
+        width,
+        height,
+        avifQuality
+      );
       self.postMessage({
         id,
         ok: true,
@@ -309,7 +511,7 @@ self.addEventListener('message', async (event) => {
         height,
         format: 'avif',
         mimeType: AVIF_MIME_TYPE,
-        engine,
+        engine: parallelTiles > 1 ? `${engine}-grid${parallelTiles}` : engine,
       });
     } catch (err) {
       self.postMessage({
@@ -342,6 +544,7 @@ self.addEventListener('message', async (event) => {
 
   const intermediates = [];
   let fallbackMaxDim = 4096;
+  let gpuSession = null;
 
   try {
     if (!frames.length) {
@@ -377,13 +580,24 @@ self.addEventListener('message', async (event) => {
     let alignmentPlan = null;
     let stabilizationInfo = null;
 
-    if (typeof OffscreenCanvas === 'function') {
+    if (webgl && srcW <= webgl.maxTextureSize && srcH <= webgl.maxTextureSize) {
+      try {
+        const sessionFrames = mode === 'hq' ? frames : [frames[0]];
+        gpuSession = webgl.createFrameTextureSession(sessionFrames);
+      } catch {
+        gpuSession = null;
+      }
+    }
+
+    if (typeof OffscreenCanvas === 'function' || gpuSession) {
       alignmentPlan = alignBitmapBurst({
         frames,
         stabilizationMode,
         colorProfile,
-        createCanvas: (w, h) => new OffscreenCanvas(w, h),
+        createCanvas:
+          typeof OffscreenCanvas === 'function' ? (w, h) => new OffscreenCanvas(w, h) : null,
         maxFrames: mode === 'hq' ? 4 : 1,
+        gpuSession,
       });
       workingFrames = alignmentPlan.selectedIndices.map((idx) => frames[idx]);
       const adoptedSet = new Set(alignmentPlan.selectedIndices);
@@ -429,9 +643,12 @@ self.addEventListener('message', async (event) => {
       };
       let applyMirrorInShader = mirrorX;
       let frameAlignments = alignmentPlan?.entries || null;
+      let preUploadedTextures = null;
 
       // Downscale & pre-align pre-cropped inputs only if raw sensor size exceeds WebGL MAX_TEXTURE_SIZE
       if (srcW > webgl.maxTextureSize || srcH > webgl.maxTextureSize) {
+        gpuSession?.dispose?.();
+        gpuSession = null;
         gpuSources = workingFrames.map((frame, idx) => {
           const { canvas } = cropFrameToCanvas(
             frame,
@@ -450,8 +667,16 @@ self.addEventListener('message', async (event) => {
             uvMatrix: { mat: [1, 0, 0, 1], shift: [0, 0] },
           }));
         }
+      } else if (gpuSession) {
+        const selected = alignmentPlan ? alignmentPlan.selectedIndices : [0];
+        const taken = gpuSession.takeSelectedTextures(selected);
+        if (taken.length === gpuSources.length) {
+          preUploadedTextures = taken;
+        }
       }
 
+      // Render Y-flipped directly when feeding gl.readPixels -> WASM AVIF so CPU row reversal is skipped
+      const flipOutputY = outputFormat === 'avif' && !nativeAvif;
       if (mode === 'hq') {
         webgl.processHQ(gpuSources, {
           outWidth: crop.outWidth,
@@ -461,6 +686,8 @@ self.addEventListener('message', async (event) => {
           exposureEv,
           frameAlignments,
           developProfile,
+          flipOutputY,
+          preUploadedTextures,
         });
       } else {
         webgl.processStandard(gpuSources[0], {
@@ -470,6 +697,8 @@ self.addEventListener('message', async (event) => {
           mirrorX: applyMirrorInShader,
           exposureEv,
           developProfile,
+          flipOutputY,
+          preUploadedTextures,
         });
       }
 
@@ -485,6 +714,7 @@ self.addEventListener('message', async (event) => {
         avifQuality,
         jpegQuality,
         engineBase: 'worker-webgl-pro',
+        nativeAvif,
       });
 
       self.postMessage({
@@ -547,6 +777,7 @@ self.addEventListener('message', async (event) => {
         avifQuality,
         jpegQuality,
         engineBase: 'worker-canvas2d',
+        nativeAvif,
       });
       self.postMessage({
         id,
@@ -612,6 +843,7 @@ self.addEventListener('message', async (event) => {
       error: err?.message || String(err),
     });
   } finally {
+    gpuSession?.dispose?.();
     releaseFrames(frames);
     shrinkCanvases(intermediates);
   }

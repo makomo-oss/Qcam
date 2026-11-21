@@ -160,7 +160,19 @@ export function supportsNativeCanvasAvif() {
 let compiledWasmPromise = null;
 let encoderModulePromise = null;
 
-async function getCompiledWasmModule() {
+/**
+ * Accept a pre-compiled WebAssembly.Module transferred from the main thread or another worker
+ * so auxiliary tile workers skip redundant fetch + compilation.
+ */
+export function primeCompiledWasmModule(wasmModule) {
+  if (wasmModule && typeof WebAssembly !== 'undefined' && wasmModule instanceof WebAssembly.Module) {
+    if (!compiledWasmPromise) {
+      compiledWasmPromise = Promise.resolve(wasmModule);
+    }
+  }
+}
+
+export async function getCompiledWasmModule() {
   if (compiledWasmPromise) return compiledWasmPromise;
 
   compiledWasmPromise = (async () => {
@@ -233,8 +245,11 @@ async function loadAvifEncoderModule() {
   return encoderModulePromise;
 }
 
-export async function warmupAvifEncoder() {
-  if (await supportsNativeCanvasAvif()) {
+export async function warmupAvifEncoder({ forceWasm = false, wasmModule = null } = {}) {
+  if (wasmModule) {
+    primeCompiledWasmModule(wasmModule);
+  }
+  if (!forceWasm && (await supportsNativeCanvasAvif())) {
     return 'native';
   }
   await loadAvifEncoderModule();
@@ -242,9 +257,25 @@ export async function warmupAvifEncoder() {
 }
 
 /**
- * Encode top-down RGBA8 pixel buffer into an AVIF Blob (`image/avif`).
+ * Compute full-frame adaptive AVIF encoder options once so single-frame and tiled-grid
+ * encoding preserve identical quantization, speed, and SharpYUV settings.
  */
-export async function encodeAvifFromRgba(rgbaPixels, width, height, options = {}) {
+export function resolveAdaptiveAvifOptions(width, height, options = {}) {
+  const pixelCount = Math.round(width) * Math.round(height);
+  const adaptiveOpts = { ...options };
+  if (adaptiveOpts.speed === undefined && pixelCount <= 2_100_000) {
+    adaptiveOpts.speed = 7;
+  }
+  if (adaptiveOpts.enableSharpYUV === undefined && pixelCount > 2_100_000) {
+    adaptiveOpts.enableSharpYUV = false;
+  }
+  return normalizeAvifOptions(adaptiveOpts);
+}
+
+/**
+ * Encode top-down RGBA8 pixel buffer into a detached AVIF Uint8Array.
+ */
+export async function encodeAvifBytesFromRgba(rgbaPixels, width, height, options = {}) {
   const safeW = Math.round(width);
   const safeH = Math.round(height);
   if (safeW < 2 || safeH < 2) {
@@ -279,15 +310,7 @@ export async function encodeAvifFromRgba(rgbaPixels, width, height, options = {}
     );
   }
 
-  const pixelCount = safeW * safeH;
-  const adaptiveOpts = { ...options };
-  if (adaptiveOpts.speed === undefined && pixelCount <= 2_100_000) {
-    adaptiveOpts.speed = 7;
-  }
-  if (adaptiveOpts.enableSharpYUV === undefined && pixelCount > 2_100_000) {
-    adaptiveOpts.enableSharpYUV = false;
-  }
-  const opts = normalizeAvifOptions(adaptiveOpts);
+  const opts = resolveAdaptiveAvifOptions(safeW, safeH, options);
   const mod = await loadAvifEncoderModule();
   const encoded = mod.encode(rgbaView, safeW, safeH, opts);
 
@@ -295,12 +318,17 @@ export async function encodeAvifFromRgba(rgbaPixels, width, height, options = {}
     throw new Error('AVIF エンコードに失敗しました。');
   }
 
-  const detached =
-    encoded.byteOffset === 0 &&
+  return encoded.byteOffset === 0 &&
     encoded.byteLength === encoded.buffer.byteLength &&
     encoded.buffer !== mod.HEAPU8?.buffer
-      ? encoded
-      : new Uint8Array(encoded);
+    ? encoded
+    : new Uint8Array(encoded);
+}
 
+/**
+ * Encode top-down RGBA8 pixel buffer into an AVIF Blob (`image/avif`).
+ */
+export async function encodeAvifFromRgba(rgbaPixels, width, height, options = {}) {
+  const detached = await encodeAvifBytesFromRgba(rgbaPixels, width, height, options);
   return new Blob([detached], { type: AVIF_MIME_TYPE });
 }

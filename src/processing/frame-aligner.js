@@ -27,6 +27,12 @@ export function normalizeColorProfile(value) {
   return COLOR_PROFILES.NATURAL;
 }
 
+const SRGB_TO_LINEAR_LUT = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  const c = i / 255;
+  SRGB_TO_LINEAR_LUT[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
 function srgbChannelToLinear(c) {
   const safe = Math.max(0, Math.min(1, c));
   return safe <= 0.04045 ? safe / 12.92 : Math.pow((safe + 0.055) / 1.055, 2.4);
@@ -58,7 +64,8 @@ export function analyzeRgbaScene(rgbaData, width, height) {
     };
   }
 
-  const lumaByte = new Uint8Array(width * height);
+  const totalCount = width * height;
+  const lumaByte = new Uint8Array(totalCount);
   const hist = new Uint32Array(256);
 
   let shadowCount = 0;
@@ -66,7 +73,6 @@ export function analyzeRgbaScene(rgbaData, width, height) {
   let clippedCount = 0;
   let midLumaSum = 0;
   let midLumaCount = 0;
-  let totalCount = 0;
 
   let neutralLinR = 0;
   let neutralLinG = 0;
@@ -74,33 +80,32 @@ export function analyzeRgbaScene(rgbaData, width, height) {
   let neutralCount = 0;
   let wbEligibleCount = 0;
 
-  for (let i = 0, p = 0; i < lumaByte.length; i++, p += 4) {
+  for (let i = 0, p = 0; i < totalCount; i++, p += 4) {
     const r = rgbaData[p];
     const g = rgbaData[p + 1];
     const b = rgbaData[p + 2];
     const yByte = (54 * r + 183 * g + 19 * b) >> 8;
     lumaByte[i] = yByte;
     hist[yByte] += 1;
-    totalCount += 1;
 
-    const yNorm = yByte / 255;
-    if (yNorm < 0.16) shadowCount += 1;
-    if (yNorm > 0.86) highlightCount += 1;
-    if (yNorm > 0.97) clippedCount += 1;
-    if (yNorm >= 0.08 && yNorm <= 0.90) {
-      midLumaSum += yNorm;
+    // Integer thresholds equivalent to yByte/255 < 0.16 (<=40), > 0.86 (>=220), > 0.97 (>=248), [0.08..0.90] ([21..229])
+    if (yByte <= 40) shadowCount += 1;
+    if (yByte >= 220) highlightCount += 1;
+    if (yByte >= 248) clippedCount += 1;
+    if (yByte >= 21 && yByte <= 229) {
+      midLumaSum += yByte;
       midLumaCount += 1;
     }
 
     // Subsample every 2nd pixel for linear-light gray-zone WB stats
     if ((i & 1) === 0 && r < 248 && g < 248 && b < 248 && (r > 22 || g > 22 || b > 22)) {
       wbEligibleCount += 1;
-      const lr = srgbChannelToLinear(r / 255);
-      const lg = srgbChannelToLinear(g / 255);
-      const lb = srgbChannelToLinear(b / 255);
-      const maxC = Math.max(lr, lg, lb);
-      const minC = Math.min(lr, lg, lb);
-      if (maxC > 0.015 && (maxC - minC) <= maxC * 0.24) {
+      const lr = SRGB_TO_LINEAR_LUT[r];
+      const lg = SRGB_TO_LINEAR_LUT[g];
+      const lb = SRGB_TO_LINEAR_LUT[b];
+      const maxC = lr > lg ? (lr > lb ? lr : lb) : lg > lb ? lg : lb;
+      const minC = lr < lg ? (lr < lb ? lr : lb) : lg < lb ? lg : lb;
+      if (maxC > 0.015 && maxC - minC <= maxC * 0.24) {
         neutralLinR += lr;
         neutralLinG += lg;
         neutralLinB += lb;
@@ -131,9 +136,18 @@ export function analyzeRgbaScene(rgbaData, width, height) {
   const dynamicRangeEv = Math.max(1.5, Math.min(11.0, Math.log2(lin99 / lin02)));
   const sceneMidLogL = Math.max(-7.5, Math.min(0.2, Math.log2(lin50)));
 
-  // Immerkaer 3x3 high-pass noise estimate restricted to structurally smooth blocks
+  // Immerkaer 3x3 high-pass noise estimate restricted to structurally smooth blocks.
+  // rawStructGrad = |boxR - boxL| + |boxB - boxT| is an exact integer in [0..2040],
+  // enabling an exact O(N) stable bucket selection with zero object allocations.
   const gridStep = Math.max(1, Math.floor(Math.min(width, height) / 140));
-  const candidates = [];
+  const rowsCount = Math.max(0, Math.ceil((height - 4) / gridStep));
+  const colsCount = Math.max(0, Math.ceil((width - 4) / gridStep));
+  const maxSamples = rowsCount * colsCount;
+  const sampleLap = new Uint16Array(maxSamples);
+  const sampleGrad = new Uint16Array(maxSamples);
+  const gradHist = new Uint32Array(2041);
+  let sampleCount = 0;
+
   for (let y = 2; y < height - 2; y += gridStep) {
     const row = y * width;
     const rowUp = (y - 1) * width;
@@ -145,7 +159,6 @@ export function analyzeRgbaScene(rgbaData, width, height) {
         4 * lumaByte[row + x] -
         2 * (lumaByte[row + x - 1] + lumaByte[row + x + 1] + lumaByte[rowUp + x] + lumaByte[rowDn + x]) +
         (lumaByte[rowUp + x - 1] + lumaByte[rowUp + x + 1] + lumaByte[rowDn + x - 1] + lumaByte[rowDn + x + 1]);
-      // Coarse 2x2 smoothed gradient suppresses real sharp edges without biasing noise variance
       const boxL =
         lumaByte[rowUp + x - 2] + lumaByte[rowUp + x - 1] + lumaByte[row + x - 2] + lumaByte[row + x - 1];
       const boxR =
@@ -154,18 +167,38 @@ export function analyzeRgbaScene(rgbaData, width, height) {
         lumaByte[rowUp2 + x] + lumaByte[rowUp2 + x + 1] + lumaByte[rowUp + x] + lumaByte[rowUp + x + 1];
       const boxB =
         lumaByte[rowDn + x] + lumaByte[rowDn + x + 1] + lumaByte[rowDn2 + x] + lumaByte[rowDn2 + x + 1];
-      const structGrad = (Math.abs(boxR - boxL) + Math.abs(boxB - boxT)) * 0.25;
-      candidates.push({ absLap: lap < 0 ? -lap : lap, structGrad });
+      const dH = boxR - boxL;
+      const dV = boxB - boxT;
+      const rawGrad = (dH < 0 ? -dH : dH) + (dV < 0 ? -dV : dV);
+      sampleLap[sampleCount] = lap < 0 ? -lap : lap;
+      sampleGrad[sampleCount] = rawGrad;
+      gradHist[rawGrad] += 1;
+      sampleCount += 1;
     }
   }
 
   let noiseSigma = 0.008;
-  if (candidates.length >= 16) {
-    candidates.sort((u, v) => u.structGrad - v.structGrad);
-    const flatCount = Math.max(8, Math.floor(candidates.length * 0.45));
+  if (sampleCount >= 16) {
+    const flatCount = Math.max(8, Math.floor(sampleCount * 0.45));
+    let cutoffGrad = 2040;
+    let prefixCount = 0;
+    for (let g = 0; g <= 2040; g++) {
+      if (prefixCount + gradHist[g] >= flatCount) {
+        cutoffGrad = g;
+        break;
+      }
+      prefixCount += gradHist[g];
+    }
+    let needAtCutoff = flatCount - prefixCount;
     let lapSum = 0;
-    for (let k = 0; k < flatCount; k++) {
-      lapSum += candidates[k].absLap;
+    for (let k = 0; k < sampleCount; k++) {
+      const g = sampleGrad[k];
+      if (g < cutoffGrad) {
+        lapSum += sampleLap[k];
+      } else if (g === cutoffGrad && needAtCutoff > 0) {
+        lapSum += sampleLap[k];
+        needAtCutoff -= 1;
+      }
     }
     const meanAbsLap = lapSum / flatCount;
     // Scale by sqrt(pi/2) / 6 to convert |K*I| mean to std dev in [0..1]
@@ -196,7 +229,7 @@ export function analyzeRgbaScene(rgbaData, width, height) {
 
   return {
     noiseSigma: Number(noiseSigma.toFixed(5)),
-    midtoneLuma: midLumaCount > 0 ? midLumaSum / midLumaCount : p50,
+    midtoneLuma: midLumaCount > 0 ? midLumaSum / (midLumaCount * 255) : p50,
     sceneMidLogL: Number(sceneMidLogL.toFixed(4)),
     p02,
     p10,
@@ -534,8 +567,48 @@ export function selectAnchorPoints(luma, width, height) {
 }
 
 /**
+ * Build a (width+1) x (height+1) Int32 summed-area table (integral image) for O(1) exact patch sums.
+ */
+function buildIntegralImage(luma, width, height) {
+  const stride = width + 1;
+  const sat = new Int32Array(stride * (height + 1));
+  for (let y = 0; y < height; y++) {
+    const srcRow = y * width;
+    const prevRow = y * stride;
+    const curRow = (y + 1) * stride;
+    let rowSum = 0;
+    for (let x = 0; x < width; x++) {
+      rowSum += luma[srcRow + x];
+      sat[curRow + x + 1] = sat[prevRow + x + 1] + rowSum;
+    }
+  }
+  return sat;
+}
+
+function rectSumIntegral(sat, width, x0, y0, x1, y1) {
+  const stride = width + 1;
+  const r0 = y0 * stride;
+  const r1 = (y1 + 1) * stride;
+  return sat[r1 + x1 + 1] - sat[r0 + x1 + 1] - sat[r1 + x0] + sat[r0 + x0];
+}
+
+function sumPatchSamples(plane, width, cx, cy, halfSize, stride) {
+  let sum = 0;
+  let count = 0;
+  for (let dy = -halfSize; dy <= halfSize; dy += stride) {
+    const row = (cy + dy) * width + cx;
+    for (let dx = -halfSize; dx <= halfSize; dx += stride) {
+      sum += plane[row + dx];
+      count++;
+    }
+  }
+  return { sum, count };
+}
+
+/**
  * Mean-removed Sum of Absolute Differences (ZSAD) for two patches within bounds.
  * Resistant to slight auto-exposure flicker across burst frames.
+ * Optional precomputed refSum, movIntegral (stride===1), and sadLimit enable exact early exit.
  */
 function computePatchZSAD(
   ref,
@@ -549,7 +622,10 @@ function computePatchZSAD(
   movCx,
   movCy,
   halfSize,
-  stride = 1
+  stride = 1,
+  refSumPre = -1,
+  movIntegral = null,
+  sadLimit = Infinity
 ) {
   const rx0 = refCx - halfSize;
   const ry0 = refCy - halfSize;
@@ -576,25 +652,56 @@ function computePatchZSAD(
   let refSum = 0;
   let movSum = 0;
   let count = 0;
-  for (let dy = -halfSize; dy <= halfSize; dy += stride) {
-    const rRow = (refCy + dy) * refW + refCx;
-    const mRow = (movCy + dy) * movW + movCx;
-    for (let dx = -halfSize; dx <= halfSize; dx += stride) {
-      refSum += ref[rRow + dx];
-      movSum += mov[mRow + dx];
-      count++;
+
+  if (stride === 1 && movIntegral && refSumPre >= 0) {
+    const side = halfSize * 2 + 1;
+    count = side * side;
+    refSum = refSumPre;
+    movSum = rectSumIntegral(movIntegral, movW, mx0, my0, mx1, my1);
+  } else if (refSumPre >= 0) {
+    refSum = refSumPre;
+    for (let dy = -halfSize; dy <= halfSize; dy += stride) {
+      const mRow = (movCy + dy) * movW + movCx;
+      for (let dx = -halfSize; dx <= halfSize; dx += stride) {
+        movSum += mov[mRow + dx];
+        count++;
+      }
+    }
+  } else {
+    for (let dy = -halfSize; dy <= halfSize; dy += stride) {
+      const rRow = (refCy + dy) * refW + refCx;
+      const mRow = (movCy + dy) * movW + movCx;
+      for (let dx = -halfSize; dx <= halfSize; dx += stride) {
+        refSum += ref[rRow + dx];
+        movSum += mov[mRow + dx];
+        count++;
+      }
     }
   }
   if (count === 0) return Infinity;
   const bias = Math.round((movSum - refSum) / count);
 
   let sad = 0;
-  for (let dy = -halfSize; dy <= halfSize; dy += stride) {
-    const rRow = (refCy + dy) * refW + refCx;
-    const mRow = (movCy + dy) * movW + movCx;
-    for (let dx = -halfSize; dx <= halfSize; dx += stride) {
-      const diff = mov[mRow + dx] - bias - ref[rRow + dx];
-      sad += diff < 0 ? -diff : diff;
+  if (stride === 1) {
+    const side = halfSize * 2 + 1;
+    for (let dy = 0; dy < side; dy++) {
+      const rRow = (ry0 + dy) * refW + rx0;
+      const mRow = (my0 + dy) * movW + mx0;
+      for (let dx = 0; dx < side; dx++) {
+        const diff = mov[mRow + dx] - bias - ref[rRow + dx];
+        sad += diff < 0 ? -diff : diff;
+      }
+      if (sad > sadLimit) return Infinity;
+    }
+  } else {
+    for (let dy = -halfSize; dy <= halfSize; dy += stride) {
+      const rRow = (refCy + dy) * refW + refCx;
+      const mRow = (movCy + dy) * movW + movCx;
+      for (let dx = -halfSize; dx <= halfSize; dx += stride) {
+        const diff = mov[mRow + dx] - bias - ref[rRow + dx];
+        sad += diff < 0 ? -diff : diff;
+      }
+      if (sad > sadLimit) return Infinity;
     }
   }
   return sad / count;
@@ -626,20 +733,69 @@ function matchPatch(
   initDy,
   searchRadius,
   halfSize,
-  priorWeight = 0
+  priorWeight = 0,
+  refIntegral = null,
+  movIntegral = null
 ) {
+  const rx0 = refCx - halfSize;
+  const ry0 = refCy - halfSize;
+  const rx1 = refCx + halfSize;
+  const ry1 = refCy + halfSize;
+  if (rx0 < 0 || ry0 < 0 || rx1 >= refW || ry1 >= refH) {
+    return { valid: false, dx: Math.round(initDx), dy: Math.round(initDy), err: Infinity };
+  }
+
   const baseDx = Math.round(initDx);
   const baseDy = Math.round(initDy);
   const step = searchRadius > 8 ? 2 : 1;
   const coarsePixelStride = searchRadius > 8 ? 2 : 1;
 
+  const side = halfSize * 2 + 1;
+  const fineCount = side * side;
+  const refSumFine = refIntegral
+    ? rectSumIntegral(refIntegral, refW, rx0, ry0, rx1, ry1)
+    : sumPatchSamples(ref, refW, refCx, refCy, halfSize, 1).sum;
+
+  let refSumCoarse = refSumFine;
+  let coarseCount = fineCount;
+  if (coarsePixelStride !== 1) {
+    const cs = sumPatchSamples(ref, refW, refCx, refCy, halfSize, coarsePixelStride);
+    refSumCoarse = cs.sum;
+    coarseCount = cs.count;
+  }
+
   let bestDx = baseDx;
   let bestDy = baseDy;
-  let bestErr = Infinity;
-  let bestScore = Infinity;
+  let bestErr = computePatchZSAD(
+    ref,
+    refW,
+    refH,
+    refCx,
+    refCy,
+    mov,
+    movW,
+    movH,
+    refCx + baseDx,
+    refCy + baseDy,
+    halfSize,
+    coarsePixelStride,
+    refSumCoarse,
+    coarsePixelStride === 1 ? movIntegral : null,
+    Infinity
+  );
+  let bestScore = bestErr;
 
   for (let dy = baseDy - searchRadius; dy <= baseDy + searchRadius; dy += step) {
     for (let dx = baseDx - searchRadius; dx <= baseDx + searchRadius; dx += step) {
+      if (dx === baseDx && dy === baseDy) continue;
+      const priorPenalty =
+        priorWeight > 0 ? priorWeight * Math.hypot(dx - baseDx, dy - baseDy) : 0;
+      const maxErrAllowed = bestScore - priorPenalty;
+      if (maxErrAllowed <= 0) continue;
+      const sadLimit = Number.isFinite(maxErrAllowed)
+        ? maxErrAllowed * coarseCount + 2
+        : Infinity;
+
       const err = computePatchZSAD(
         ref,
         refW,
@@ -652,10 +808,12 @@ function matchPatch(
         refCx + dx,
         refCy + dy,
         halfSize,
-        coarsePixelStride
+        coarsePixelStride,
+        refSumCoarse,
+        coarsePixelStride === 1 ? movIntegral : null,
+        sadLimit
       );
-      const score =
-        priorWeight > 0 ? err + priorWeight * Math.hypot(dx - baseDx, dy - baseDy) : err;
+      const score = err + priorPenalty;
       if (score < bestScore) {
         bestScore = score;
         bestErr = err;
@@ -669,13 +827,17 @@ function matchPatch(
     return { valid: false, dx: baseDx, dy: baseDy, err: Infinity };
   }
 
-  // Integer refinement +-1 around coarse match
+  // Integer refinement +-1 around coarse match, caching the 3x3 error grid for subpixel interpolation
   let fineDx = bestDx;
   let fineDy = bestDy;
   let fineErr = Infinity;
   let fineScore = Infinity;
-  for (let dy = bestDy - 1; dy <= bestDy + 1; dy++) {
-    for (let dx = bestDx - 1; dx <= bestDx + 1; dx++) {
+  const fineGrid = new Float64Array(9);
+
+  for (let oy = -1; oy <= 1; oy++) {
+    const dy = bestDy + oy;
+    for (let ox = -1; ox <= 1; ox++) {
+      const dx = bestDx + ox;
       const err = computePatchZSAD(
         ref,
         refW,
@@ -688,8 +850,12 @@ function matchPatch(
         refCx + dx,
         refCy + dy,
         halfSize,
-        1
+        1,
+        refSumFine,
+        movIntegral,
+        Infinity
       );
+      fineGrid[(oy + 1) * 3 + (ox + 1)] = err;
       const score =
         priorWeight > 0 ? err + priorWeight * Math.hypot(dx - baseDx, dy - baseDy) : err;
       if (score < fineScore) {
@@ -705,63 +871,36 @@ function matchPatch(
     return { valid: false, dx: baseDx, dy: baseDy, err: Infinity };
   }
 
+  const evalFineAt = (dx, dy) => {
+    const ox = dx - bestDx;
+    const oy = dy - bestDy;
+    if (ox >= -1 && ox <= 1 && oy >= -1 && oy <= 1) {
+      return fineGrid[(oy + 1) * 3 + (ox + 1)];
+    }
+    return computePatchZSAD(
+      ref,
+      refW,
+      refH,
+      refCx,
+      refCy,
+      mov,
+      movW,
+      movH,
+      refCx + dx,
+      refCy + dy,
+      halfSize,
+      1,
+      refSumFine,
+      movIntegral,
+      Infinity
+    );
+  };
+
   // Subpixel parabolic interpolation along X and Y independently
-  const errLeft = computePatchZSAD(
-    ref,
-    refW,
-    refH,
-    refCx,
-    refCy,
-    mov,
-    movW,
-    movH,
-    refCx + fineDx - 1,
-    refCy + fineDy,
-    halfSize,
-    1
-  );
-  const errRight = computePatchZSAD(
-    ref,
-    refW,
-    refH,
-    refCx,
-    refCy,
-    mov,
-    movW,
-    movH,
-    refCx + fineDx + 1,
-    refCy + fineDy,
-    halfSize,
-    1
-  );
-  const errUp = computePatchZSAD(
-    ref,
-    refW,
-    refH,
-    refCx,
-    refCy,
-    mov,
-    movW,
-    movH,
-    refCx + fineDx,
-    refCy + fineDy - 1,
-    halfSize,
-    1
-  );
-  const errDown = computePatchZSAD(
-    ref,
-    refW,
-    refH,
-    refCx,
-    refCy,
-    mov,
-    movW,
-    movH,
-    refCx + fineDx,
-    refCy + fineDy + 1,
-    halfSize,
-    1
-  );
+  const errLeft = evalFineAt(fineDx - 1, fineDy);
+  const errRight = evalFineAt(fineDx + 1, fineDy);
+  const errUp = evalFineAt(fineDx, fineDy - 1);
+  const errDown = evalFineAt(fineDx, fineDy + 1);
 
   const subX = fitParabolicSubpixel(errLeft, fineErr, errRight);
   const subY = fitParabolicSubpixel(errUp, fineErr, errDown);
@@ -1021,14 +1160,16 @@ export function estimateSimilarityAlignment(
   movLuma,
   width,
   height,
-  { maxShiftRatio = 0.12 } = {}
+  { maxShiftRatio = 0.12, precomputedRef = null } = {}
 ) {
   // Level C: ~100px anti-aliased macro frame (suppresses repeating fine textures & avoids stride aliasing)
-  const coarseScale = Math.max(1, Math.round(Math.max(width, height) / 100));
-  const cW = Math.max(24, Math.floor(width / coarseScale));
-  const cH = Math.max(24, Math.floor(height / coarseScale));
-  const refC = downsampleLuma(refLuma, width, height, cW, cH);
+  const coarseScale =
+    precomputedRef?.coarseScale ?? Math.max(1, Math.round(Math.max(width, height) / 100));
+  const cW = precomputedRef?.cW ?? Math.max(24, Math.floor(width / coarseScale));
+  const cH = precomputedRef?.cH ?? Math.max(24, Math.floor(height / coarseScale));
+  const refC = precomputedRef?.refC ?? downsampleLuma(refLuma, width, height, cW, cH);
   const movC = downsampleLuma(movLuma, width, height, cW, cH);
+  const movCIntegral = buildIntegralImage(movC, cW, cH);
 
   const coarseMaxShift = Math.max(
     4,
@@ -1040,45 +1181,48 @@ export function estimateSimilarityAlignment(
   const cCx = Math.floor(cW * 0.5);
   const cCy = Math.floor(cH * 0.5);
 
-  const evalCoarseRect = (dx, dy) => {
-    const rx0 = cCx - coarseHalfW;
-    const ry0 = cCy - coarseHalfH;
-    const mx0 = rx0 + dx;
-    const my0 = ry0 + dy;
-    const winW = coarseHalfW * 2 + 1;
-    const winH = coarseHalfH * 2 + 1;
-    if (mx0 < 0 || my0 < 0 || mx0 + winW > cW || my0 + winH > cH) return Infinity;
-    let refSum = 0;
-    let movSum = 0;
-    const count = winW * winH;
-    for (let yy = 0; yy < winH; yy++) {
-      const rRow = (ry0 + yy) * cW + rx0;
-      const mRow = (my0 + yy) * cW + mx0;
-      for (let xx = 0; xx < winW; xx++) {
-        refSum += refC[rRow + xx];
-        movSum += movC[mRow + xx];
-      }
+  const rx0C = cCx - coarseHalfW;
+  const ry0C = cCy - coarseHalfH;
+  const winW = coarseHalfW * 2 + 1;
+  const winH = coarseHalfH * 2 + 1;
+  const coarseCount = winW * winH;
+
+  let refCSum = 0;
+  for (let yy = 0; yy < winH; yy++) {
+    const rRow = (ry0C + yy) * cW + rx0C;
+    for (let xx = 0; xx < winW; xx++) {
+      refCSum += refC[rRow + xx];
     }
-    const bias = Math.round((movSum - refSum) / count);
+  }
+
+  const evalCoarseRect = (dx, dy, sadLimit = Infinity) => {
+    const mx0 = rx0C + dx;
+    const my0 = ry0C + dy;
+    if (mx0 < 0 || my0 < 0 || mx0 + winW > cW || my0 + winH > cH) return Infinity;
+    const movSum = rectSumIntegral(movCIntegral, cW, mx0, my0, mx0 + winW - 1, my0 + winH - 1);
+    const bias = Math.round((movSum - refCSum) / coarseCount);
     let sad = 0;
     for (let yy = 0; yy < winH; yy++) {
-      const rRow = (ry0 + yy) * cW + rx0;
+      const rRow = (ry0C + yy) * cW + rx0C;
       const mRow = (my0 + yy) * cW + mx0;
       for (let xx = 0; xx < winW; xx++) {
         const d = movC[mRow + xx] - bias - refC[rRow + xx];
         sad += d < 0 ? -d : d;
       }
+      if (sad > sadLimit) return Infinity;
     }
-    return sad / count;
+    return sad / coarseCount;
   };
 
   const coarseStep = coarseMaxShift > 18 ? 2 : 1;
   let bestCoarseDx = 0;
   let bestCoarseDy = 0;
-  let bestCoarseErr = Infinity;
+  let bestCoarseErr = evalCoarseRect(0, 0, Infinity);
   for (let dy = -coarseMaxShift; dy <= coarseMaxShift; dy += coarseStep) {
     for (let dx = -coarseMaxShift; dx <= coarseMaxShift; dx += coarseStep) {
-      const e = evalCoarseRect(dx, dy);
+      if (dx === 0 && dy === 0) continue;
+      const limit = Number.isFinite(bestCoarseErr) ? bestCoarseErr * coarseCount + 2 : Infinity;
+      const e = evalCoarseRect(dx, dy, limit);
       if (e < bestCoarseErr) {
         bestCoarseErr = e;
         bestCoarseDx = dx;
@@ -1092,7 +1236,8 @@ export function estimateSimilarityAlignment(
   if (coarseStep > 1 && Number.isFinite(bestCoarseErr)) {
     for (let dy = bestCoarseDy - 1; dy <= bestCoarseDy + 1; dy++) {
       for (let dx = bestCoarseDx - 1; dx <= bestCoarseDx + 1; dx++) {
-        const e = evalCoarseRect(dx, dy);
+        const limit = Number.isFinite(fineCoarseErr) ? fineCoarseErr * coarseCount + 2 : Infinity;
+        const e = evalCoarseRect(dx, dy, limit);
         if (e < fineCoarseErr) {
           fineCoarseErr = e;
           fineCoarseDx = dx;
@@ -1124,8 +1269,15 @@ export function estimateSimilarityAlignment(
   const initDy = coarseCenterMatch.valid ? coarseCenterMatch.dy * (height / cH) : 0;
 
   // Stage 2: multi-anchor fine matching on medium luminance frame
-  const anchors = selectAnchorPoints(refLuma, width, height).filter((a) => a.grad >= 2.0);
-  const effectiveAnchors = anchors.length ? anchors : selectAnchorPoints(refLuma, width, height);
+  let effectiveAnchors = precomputedRef?.effectiveAnchors || null;
+  if (!effectiveAnchors) {
+    const allAnchors = selectAnchorPoints(refLuma, width, height);
+    const filtered = allAnchors.filter((a) => a.grad >= 2.0);
+    effectiveAnchors = filtered.length ? filtered : allAnchors;
+  }
+
+  const refIntegral = precomputedRef?.refIntegral ?? buildIntegralImage(refLuma, width, height);
+  const movIntegral = buildIntegralImage(movLuma, width, height);
 
   const halfPatch = Math.max(10, Math.min(18, Math.floor(Math.min(width, height) * 0.045)));
   const pass1Search = Math.max(6, Math.min(10, Math.ceil(coarseScale) + 3));
@@ -1147,7 +1299,9 @@ export function estimateSimilarityAlignment(
       initDy,
       pass1Search,
       halfPatch,
-      pw1
+      pw1,
+      refIntegral,
+      movIntegral
     );
     if (m.valid && m.err < 42) {
       matchedPairs1.push({
@@ -1206,7 +1360,9 @@ export function estimateSimilarityAlignment(
       predDy,
       pass2Search,
       halfPatch,
-      pw2
+      pw2,
+      refIntegral,
+      movIntegral
     );
     if (m.valid && m.err < 38) {
       matchedPairs2.push({
@@ -1233,6 +1389,12 @@ export function estimateSimilarityAlignment(
     const py = pair.refY - cy;
     const mx = Math.round(cx + fit.a * px - fit.b * py + fit.tx);
     const my = Math.round(cy + fit.b * px + fit.a * py + fit.ty);
+    const rx0 = pair.refX - halfPatch;
+    const ry0 = pair.refY - halfPatch;
+    const refSumPre =
+      rx0 >= 0 && ry0 >= 0 && pair.refX + halfPatch < width && pair.refY + halfPatch < height
+        ? rectSumIntegral(refIntegral, width, rx0, ry0, pair.refX + halfPatch, pair.refY + halfPatch)
+        : -1;
     const e = computePatchZSAD(
       refLuma,
       width,
@@ -1245,7 +1407,10 @@ export function estimateSimilarityAlignment(
       mx,
       my,
       halfPatch,
-      1
+      1,
+      refSumPre,
+      movIntegral,
+      Infinity
     );
     zsadValues.push(Number.isFinite(e) ? e : pair.err);
   }
@@ -1285,7 +1450,9 @@ export function refineAlignmentWithNativePatches({
   medAlign,
   anchors = [],
   extractPatchFn,
+  extractPatchesBatchFn = null,
   patchSize = 84,
+  refPatchCache = null,
 }) {
   const rx = srcW / medW;
   const ry = srcH / medH;
@@ -1300,7 +1467,7 @@ export function refineAlignmentWithNativePatches({
 
   if (
     !fullAlign.valid ||
-    typeof extractPatchFn !== 'function' ||
+    (typeof extractPatchFn !== 'function' && typeof extractPatchesBatchFn !== 'function') ||
     Math.max(rx, ry) <= 1.15 ||
     !anchors.length
   ) {
@@ -1338,9 +1505,7 @@ export function refineAlignmentWithNativePatches({
     )
     .slice(0, 5);
 
-  const pairs = [];
-  const pMid = Math.floor(patchSize / 2);
-
+  const validItems = [];
   for (const anc of candidateAnchors) {
     const relX = anc.refX - cx;
     const relY = anc.refY - cy;
@@ -1355,14 +1520,88 @@ export function refineAlignmentWithNativePatches({
     ) {
       continue;
     }
+    validItems.push({ anc, predX, predY, cacheKey: `${anc.refX},${anc.refY},${patchSize}` });
+  }
 
-    const refPatch = extractPatchFn(refIndex, anc.refX, anc.refY, patchSize, 0, 1);
+  // Batch all uncached reference patches + moving patches into one GPU readPixels when available
+  const batchedMovPatches = new Array(validItems.length).fill(null);
+  if (typeof extractPatchesBatchFn === 'function' && validItems.length > 0) {
+    const batchReqs = [];
+    const reqMeta = [];
+    for (let idx = 0; idx < validItems.length; idx++) {
+      const item = validItems[idx];
+      if (!refPatchCache?.get(item.cacheKey)) {
+        batchReqs.push({
+          frameIdx: refIndex,
+          centerX: item.anc.refX,
+          centerY: item.anc.refY,
+          angleRad: 0,
+          srcScale: 1,
+        });
+        reqMeta.push({ kind: 'ref', idx, cacheKey: item.cacheKey });
+      }
+      batchReqs.push({
+        frameIdx: movIndex,
+        centerX: item.predX,
+        centerY: item.predY,
+        angleRad: theta,
+        srcScale: scale,
+      });
+      reqMeta.push({ kind: 'mov', idx });
+    }
+    const batchLumas = extractPatchesBatchFn(batchReqs, patchSize);
+    if (Array.isArray(batchLumas) && batchLumas.length === batchReqs.length) {
+      for (let k = 0; k < reqMeta.length; k++) {
+        const luma = batchLumas[k];
+        if (!luma) continue;
+        const meta = reqMeta[k];
+        if (meta.kind === 'ref') {
+          const entry = {
+            patch: luma,
+            integral: buildIntegralImage(luma, patchSize, patchSize),
+          };
+          if (refPatchCache) {
+            refPatchCache.set(meta.cacheKey, entry);
+          } else {
+            validItems[meta.idx].localRefEntry = entry;
+          }
+        } else {
+          batchedMovPatches[meta.idx] = luma;
+        }
+      }
+    }
+  }
+
+  const pairs = [];
+  const pMid = Math.floor(patchSize / 2);
+
+  for (let idx = 0; idx < validItems.length; idx++) {
+    const { anc, predX, predY, cacheKey, localRefEntry } = validItems[idx];
+    let refEntry = refPatchCache?.get(cacheKey) || localRefEntry || null;
+    if (!refEntry && typeof extractPatchFn === 'function') {
+      const refPatch = extractPatchFn(refIndex, anc.refX, anc.refY, patchSize, 0, 1);
+      if (!refPatch) continue;
+      refEntry = {
+        patch: refPatch,
+        integral: buildIntegralImage(refPatch, patchSize, patchSize),
+      };
+      if (refPatchCache) {
+        refPatchCache.set(cacheKey, refEntry);
+      }
+    }
+    if (!refEntry) continue;
+
     // Extract mov patch pre-derotated around predicted position so residual search is pure translation
-    const movPatch = extractPatchFn(movIndex, predX, predY, patchSize, theta, scale);
-    if (!refPatch || !movPatch) continue;
+    const movPatch =
+      batchedMovPatches[idx] ||
+      (typeof extractPatchFn === 'function'
+        ? extractPatchFn(movIndex, predX, predY, patchSize, theta, scale)
+        : null);
+    if (!movPatch) continue;
+    const movIntegral = buildIntegralImage(movPatch, patchSize, patchSize);
 
     const delta = matchPatch(
-      refPatch,
+      refEntry.patch,
       patchSize,
       patchSize,
       pMid,
@@ -1373,7 +1612,10 @@ export function refineAlignmentWithNativePatches({
       0,
       0,
       halfSearch,
-      innerHalf
+      innerHalf,
+      0,
+      refEntry.integral,
+      movIntegral
     );
 
     if (delta.valid && delta.err < 36) {
@@ -1514,8 +1756,10 @@ export function buildBurstAlignmentPlan({
   srcH,
   stabilizationMode = STABILIZATION_MODES.HIGH,
   extractPatchFn = null,
+  extractPatchesBatchFn = null,
   maxFrames = 4,
   noiseSigma = 0.012,
+  precomputedMetrics = null,
 }) {
   const mode = normalizeStabilizationMode(stabilizationMode);
   const total = lumaFrames.length;
@@ -1523,7 +1767,10 @@ export function buildBurstAlignmentPlan({
     return { refIndex: 0, selectedIndices: [], entries: [], safeCrop: { insetX: 0, insetY: 0 } };
   }
 
-  const metrics = lumaFrames.map((luma) => analyzeFrameMetrics(luma, medW, medH));
+  const metrics =
+    Array.isArray(precomputedMetrics) && precomputedMetrics.length === total
+      ? precomputedMetrics
+      : lumaFrames.map((luma) => analyzeFrameMetrics(luma, medW, medH));
 
   // Pick sharpest non-trivial frame as reference
   let refIndex = 0;
@@ -1559,12 +1806,56 @@ export function buildBurstAlignmentPlan({
     };
   }
 
+  // When capturing extra burst frames (e.g., 5 frames for HIGH stabilization), shed the weakest
+  // tap-shaken or exposure-drifted non-reference frame(s) before running expensive alignment.
+  const preExcluded = new Set();
+  if (total > maxFrames) {
+    const sortedLumas = metrics
+      .map((m) => m.trimmedMeanLuma ?? m.meanLuma ?? 128)
+      .sort((a, b) => a - b);
+    const medianLuma = sortedLumas[Math.floor(sortedLumas.length / 2)] || 128;
+
+    const scoredNonRef = [];
+    for (let i = 0; i < total; i++) {
+      if (i === refIndex) continue;
+      const m = metrics[i];
+      const lumaDiff = Math.abs((m.trimmedMeanLuma ?? m.meanLuma ?? medianLuma) - medianLuma);
+      const exposureConsistency = Math.max(0.76, 1 - Math.max(0, lumaDiff - 8) / 90);
+      const tapWeight = i === 0 ? 0.985 : 1.0;
+      scoredNonRef.push({
+        index: i,
+        weightedScore: m.sharpness * exposureConsistency * tapWeight,
+      });
+    }
+    scoredNonRef.sort((u, v) => u.weightedScore - v.weightedScore);
+    const dropCount = total - maxFrames;
+    for (let d = 0; d < dropCount && d < scoredNonRef.length; d++) {
+      preExcluded.add(scoredNonRef[d].index);
+    }
+  }
+
   const refLuma = lumaFrames[refIndex];
   const refMetric = metrics[refIndex];
   const refMidLuma = refMetric.trimmedMeanLuma ?? refMetric.meanLuma;
   const minSharpRatio = mode === STABILIZATION_MODES.HIGH ? 0.72 : 0.65;
   const noisePad = Math.min(8, Math.round((Number(noiseSigma) || 0) * 255 * 0.45));
   const maxResidualReject = (mode === STABILIZATION_MODES.HIGH ? 20 : 25) + noisePad;
+
+  // Precompute reference coarse pyramid, anchors, integral image, and native patch cache once across all burst frames
+  const coarseScale = Math.max(1, Math.round(Math.max(medW, medH) / 100));
+  const cW = Math.max(24, Math.floor(medW / coarseScale));
+  const cH = Math.max(24, Math.floor(medH / coarseScale));
+  const allAnchors = selectAnchorPoints(refLuma, medW, medH);
+  const filteredAnchors = allAnchors.filter((a) => a.grad >= 2.0);
+  const precomputedRef = {
+    coarseScale,
+    cW,
+    cH,
+    refC: downsampleLuma(refLuma, medW, medH, cW, cH),
+    effectiveAnchors: filteredAnchors.length ? filteredAnchors : allAnchors,
+    refIntegral: buildIntegralImage(refLuma, medW, medH),
+  };
+  const refPatchCache = new Map();
 
   const candidates = [];
   for (let i = 0; i < total; i++) {
@@ -1573,12 +1864,11 @@ export function buildBurstAlignmentPlan({
     const sharpRatio =
       bestSharpness > 1e-4 ? metrics[i].sharpness / bestSharpness : 1.0;
 
-    // Immediately skip heavily motion-blurred frames so they never smear the sharp reference
-    if (sharpRatio < minSharpRatio) {
+    if (preExcluded.has(i) || sharpRatio < minSharpRatio) {
       candidates.push({
         frameIndex: i,
         valid: false,
-        rejectedReason: 'motion-blur',
+        rejectedReason: preExcluded.has(i) ? 'pre-filter' : 'motion-blur',
         sharpRatio,
         a: 1,
         b: 0,
@@ -1594,6 +1884,7 @@ export function buildBurstAlignmentPlan({
 
     const medAlign = estimateSimilarityAlignment(refLuma, lumaFrames[i], medW, medH, {
       maxShiftRatio: mode === STABILIZATION_MODES.HIGH ? 0.14 : 0.1,
+      precomputedRef,
     });
 
     const nativeAlign = refineAlignmentWithNativePatches({
@@ -1606,6 +1897,8 @@ export function buildBurstAlignmentPlan({
       medAlign,
       anchors: medAlign.anchors,
       extractPatchFn,
+      extractPatchesBatchFn,
+      refPatchCache,
     });
 
     const residual = nativeAlign.residual ?? 99;
@@ -1758,8 +2051,8 @@ export function drawAlignedFrameToCanvas(ctx, bitmap, crop, mirrorX, alignEntry,
 /**
  * Analyze a single ImageBitmap on a lightweight probe canvas to collect noise, WB, and DR telemetry.
  */
-export function analyzeBitmapScene(bitmap, createCanvas) {
-  if (!bitmap || !bitmap.width || !bitmap.height || typeof createCanvas !== 'function') {
+export function analyzeBitmapScene(bitmap, createCanvas, { gpuSession = null, frameIndex = 0 } = {}) {
+  if (!bitmap || !bitmap.width || !bitmap.height) {
     return analyzeRgbaScene(null, 0, 0);
   }
   const srcW = bitmap.width;
@@ -1768,8 +2061,18 @@ export function analyzeBitmapScene(bitmap, createCanvas) {
   const scale = probeLong / Math.max(srcW, srcH);
   const probeW = Math.max(24, Math.round(srcW * scale));
   const probeH = Math.max(24, Math.round(srcH * scale));
+  if (gpuSession && typeof gpuSession.downsampleRgba === 'function') {
+    const rgba = gpuSession.downsampleRgba(frameIndex, probeW, probeH);
+    if (rgba) {
+      return analyzeRgbaScene(rgba, probeW, probeH);
+    }
+  }
+  if (typeof createCanvas !== 'function') {
+    return analyzeRgbaScene(null, 0, 0);
+  }
   const canvas = createCanvas(probeW, probeH);
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  // Keep GPU-accelerated 2D context so high-res ImageBitmap downscales on GPU before reading tiny probe pixels
+  const ctx = canvas.getContext('2d');
   ctx.drawImage(bitmap, 0, 0, srcW, srcH, 0, 0, probeW, probeH);
   const imgData = ctx.getImageData(0, 0, probeW, probeH);
   canvas.width = 1;
@@ -1787,14 +2090,27 @@ export function alignBitmapBurst({
   colorProfile = COLOR_PROFILES.NATURAL,
   createCanvas,
   maxFrames = 4,
+  gpuSession = null,
 }) {
   const mode = normalizeStabilizationMode(stabilizationMode);
   const safeProfile = normalizeColorProfile(colorProfile);
   const srcW = frames[0]?.width || 1;
   const srcH = frames[0]?.height || 1;
+  const hasGpuSampler = Boolean(
+    gpuSession &&
+      typeof gpuSession.downsampleRgba === 'function' &&
+      typeof gpuSession.extractPatchRgba === 'function'
+  );
 
-  if (frames.length <= 1 || mode === STABILIZATION_MODES.OFF || typeof createCanvas !== 'function') {
-    const sceneStats = analyzeBitmapScene(frames[0], createCanvas);
+  if (
+    frames.length <= 1 ||
+    mode === STABILIZATION_MODES.OFF ||
+    (!hasGpuSampler && typeof createCanvas !== 'function')
+  ) {
+    const sceneStats = analyzeBitmapScene(frames[0], createCanvas, {
+      gpuSession: hasGpuSampler ? gpuSession : null,
+      frameIndex: 0,
+    });
     const basePlan = buildBurstAlignmentPlan({
       lumaFrames: frames.map(() => new Uint8Array(0)),
       medW: 16,
@@ -1823,32 +2139,87 @@ export function alignBitmapBurst({
   const medW = Math.max(64, Math.round(srcW * scale));
   const medH = Math.max(64, Math.round(srcH * scale));
 
-  const medCanvas = createCanvas(medW, medH);
-  const medCtx = medCanvas.getContext('2d', { willReadFrequently: true });
+  let medCanvas = null;
+  let medCtx = null;
+  if (!hasGpuSampler) {
+    medCanvas = createCanvas(medW, medH);
+    // Avoid willReadFrequently:true when drawing full-res GPU ImageBitmaps so downscaling runs on GPU
+    medCtx = medCanvas.getContext('2d');
+  }
   const lumaFrames = [];
-  const rgbaFrames = [];
+  const metrics = [];
+  let bestSharpness = -1;
+  let refRgba = null;
+
+  const batchedRgbas =
+    hasGpuSampler && typeof gpuSession.downsampleAllRgba === 'function'
+      ? gpuSession.downsampleAllRgba(medW, medH)
+      : null;
 
   for (let i = 0; i < frames.length; i++) {
-    medCtx.setTransform(1, 0, 0, 1, 0, 0);
-    medCtx.clearRect(0, 0, medW, medH);
-    medCtx.drawImage(frames[i], 0, 0, srcW, srcH, 0, 0, medW, medH);
-    const imgData = medCtx.getImageData(0, 0, medW, medH);
-    rgbaFrames.push(imgData.data);
-    lumaFrames.push(rgbaToLuma(imgData.data, medW, medH));
+    let rgba = batchedRgbas?.[i] || null;
+    if (!rgba && hasGpuSampler) {
+      rgba = gpuSession.downsampleRgba(i, medW, medH);
+    }
+    if (!rgba) {
+      if (!medCanvas) {
+        medCanvas = createCanvas(medW, medH);
+        medCtx = medCanvas.getContext('2d');
+      }
+      medCtx.setTransform(1, 0, 0, 1, 0, 0);
+      medCtx.clearRect(0, 0, medW, medH);
+      medCtx.drawImage(frames[i], 0, 0, srcW, srcH, 0, 0, medW, medH);
+      rgba = medCtx.getImageData(0, 0, medW, medH).data;
+    }
+    const luma = rgbaToLuma(rgba, medW, medH);
+    const frameMetrics = analyzeFrameMetrics(luma, medW, medH);
+    lumaFrames.push(luma);
+    metrics.push(frameMetrics);
+    if (frameMetrics.sharpness > bestSharpness) {
+      bestSharpness = frameMetrics.sharpness;
+      refRgba = rgba;
+    }
   }
-  medCanvas.width = 1;
-  medCanvas.height = 1;
+  if (medCanvas) {
+    medCanvas.width = 1;
+    medCanvas.height = 1;
+  }
 
-  const probeNoiseStats = analyzeRgbaScene(rgbaFrames[0], medW, medH);
+  // Analyze only the sharpest reference frame once (reused for both noise padding and Pro ISP developProfile)
+  const sceneStats = analyzeRgbaScene(refRgba, medW, medH);
+  refRgba = null;
 
   let patchCanvas = null;
   let patchCtx = null;
+  const extractPatchesBatchFn =
+    hasGpuSampler && typeof gpuSession.extractPatchesBatch === 'function'
+      ? (requests, patchSize) => {
+          const rgbaPatches = gpuSession.extractPatchesBatch(requests, patchSize);
+          if (!Array.isArray(rgbaPatches)) return null;
+          return rgbaPatches.map((rgba) => (rgba ? rgbaToLuma(rgba, patchSize, patchSize) : null));
+        }
+      : null;
   const extractPatchFn = (frameIdx, centerX, centerY, patchSize, angleRad = 0, srcScale = 1) => {
     const bmp = frames[frameIdx];
     if (!bmp) return null;
+    if (hasGpuSampler) {
+      const gpuPatch = gpuSession.extractPatchRgba(
+        frameIdx,
+        centerX,
+        centerY,
+        patchSize,
+        angleRad,
+        srcScale
+      );
+      if (gpuPatch) {
+        return rgbaToLuma(gpuPatch, patchSize, patchSize);
+      }
+    }
+    if (typeof createCanvas !== 'function') return null;
     if (!patchCanvas || patchCanvas.width !== patchSize) {
       patchCanvas = createCanvas(patchSize, patchSize);
-      patchCtx = patchCanvas.getContext('2d', { willReadFrequently: true });
+      // Avoid willReadFrequently:true so extracting an 84x84 crop from a 12MP GPU bitmap never downloads the full 48MB frame
+      patchCtx = patchCanvas.getContext('2d');
     }
     const half = patchSize * 0.5;
     const r = Math.ceil(patchSize * 0.9 * (srcScale || 1));
@@ -1884,18 +2255,16 @@ export function alignBitmapBurst({
     srcH,
     stabilizationMode: mode,
     extractPatchFn,
+    extractPatchesBatchFn,
     maxFrames,
-    noiseSigma: probeNoiseStats.noiseSigma,
+    noiseSigma: sceneStats.noiseSigma,
+    precomputedMetrics: metrics,
   });
 
   if (patchCanvas) {
     patchCanvas.width = 1;
     patchCanvas.height = 1;
   }
-
-  const refIdx = Math.max(0, Math.min(rgbaFrames.length - 1, plan.refIndex || 0));
-  const sceneStats = refIdx === 0 ? probeNoiseStats : analyzeRgbaScene(rgbaFrames[refIdx], medW, medH);
-  rgbaFrames.length = 0;
 
   const developProfile = computeProDevelopProfile(sceneStats, {
     frameCount: frames.length,

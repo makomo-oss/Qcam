@@ -187,10 +187,11 @@ class QcamApp {
     this.ui.renderPermissionGuide(this.platform);
     this._refreshQualityControls();
 
+    // Warm up Worker WebGL shaders and AVIF WASM encoder in parallel with camera startup
+    this.pipeline.warmup();
     await this.startCamera();
     this._registerServiceWorker();
     this._setupLifecycleHandlers();
-    setTimeout(() => this.pipeline.warmup(), 120);
   }
 
   async startCamera() {

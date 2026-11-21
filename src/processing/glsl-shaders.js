@@ -21,17 +21,19 @@ export function buildShaderSource(body, { packedHdr = false } = {}) {
 }
 
 const COMMON_HDR_GLSL = `
+  // Exact-endpoint pow-free sRGB <-> linear transfer (256/256 bit-exact 8-bit roundtrip, <0.015 LSB error)
   vec3 srgbToLinear(vec3 c) {
-    vec3 safe = max(c, vec3(0.0));
-    vec3 low = safe / 12.92;
-    vec3 high = pow((safe + 0.055) / 1.055, vec3(2.4));
+    vec3 safe = clamp(c, 0.0, 1.0);
+    vec3 low = safe * (1.0 / 12.92);
+    vec3 high = ((((-0.0862608 * safe + 0.4691852) * safe + 0.5934534) * safe + 0.0223993) * safe + 0.0012229);
     return mix(low, high, step(vec3(0.04045), safe));
   }
 
   vec3 linearToSrgb(vec3 c) {
     vec3 safe = clamp(c, 0.0, 1.0);
     vec3 low = safe * 12.92;
-    vec3 high = 1.055 * pow(max(safe, vec3(1e-6)), vec3(1.0 / 2.4)) - 0.055;
+    vec3 q = sqrt(sqrt(max(safe, vec3(1e-8))));
+    vec3 high = ((((0.0793248 * q - 0.3313692) * q + 1.1199540) * q + 0.1966958) * q - 0.0646054);
     return clamp(mix(low, high, step(vec3(0.0031308), safe)), 0.0, 1.0);
   }
 
@@ -133,6 +135,7 @@ export const MERGE_FRAGMENT_SHADER = `
 
   uniform float uFrameCount;        // 1.0 .. 4.0
   uniform vec2 uTexelSize;          // (1.0 / srcW, 1.0 / srcH)
+  uniform vec2 uSrcSize;            // (srcW, srcH)
   uniform float uUseBicubic0;       // 1.0 when zoomed/scaled, 0.0 on 1:1 native grid
 
   uniform vec4 uAlignMat1;
@@ -143,7 +146,9 @@ export const MERGE_FRAGMENT_SHADER = `
   uniform vec2 uAlignShift3;
 
   uniform vec3 uFrameWeights;       // Confidence weights for frames 1, 2, 3
-  uniform vec3 uFrameGains;         // sRGB exposure ratio multipliers (converted to linear inside)
+  uniform vec3 uFrameGainsLin;      // Precomputed linear-light exposure multipliers for frames 1, 2, 3
+  uniform vec3 uFrameSqrtGains;     // Precomputed sqrt(uFrameGainsLin) for fast variance-stabilized YCoCg
+  uniform vec3 uUseBicubicFrames;   // 1.0 when frame k has subpixel shift/rotation/scale, 0.0 on exact integer grid
   uniform float uPatchTol2;         // Perceptual sqrt-YCoCg patch MSE tolerance
   uniform float uNoiseSigma;        // Estimated flat-region noise sigma [0..0.18]
   uniform float uPreMergedCoverage; // >= 0.0 when CPU pre-merged frames, else -1.0
@@ -164,8 +169,7 @@ export const MERGE_FRAGMENT_SHADER = `
            uv.y >= margin.y && uv.y <= (1.0 - margin.y);
   }
 
-  vec3 sampleBicubic5(sampler2D tex, vec2 uv, vec2 texelSize) {
-    vec2 texSize = 1.0 / max(texelSize, vec2(1e-6));
+  vec3 sampleBicubic5(sampler2D tex, vec2 uv, vec2 texelSize, vec2 texSize) {
     vec2 samplePos = uv * texSize;
     vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
     vec2 f = samplePos - texPos1;
@@ -188,7 +192,8 @@ export const MERGE_FRAGMENT_SHADER = `
     res += texture2D(tex, vec2(texPos12.x, texPos12.y)).rgb * (w12.x * w12.y);
     res += texture2D(tex, vec2(texPos3.x, texPos12.y)).rgb * (w3.x * w12.y);
     res += texture2D(tex, vec2(texPos12.x, texPos3.y)).rgb * (w12.x * w3.y);
-    float wSum = w12.x * w0.y + (w0.x + w12.x + w3.x) * w12.y + w12.x * w3.y;
+    // Exact Catmull-Rom identity: w0 + w12 + w3 == 1
+    float wSum = w12.y + w12.x * (w0.y + w3.y);
     return clamp(res / max(wSum, 1e-5), 0.0, 1.0);
   }
 
@@ -216,7 +221,9 @@ export const MERGE_FRAGMENT_SHADER = `
     vec2 dx,
     vec2 dy,
     float frameConf,
-    float gainSrgb,
+    float gainLin,
+    float sqrtGain,
+    float useBicubic,
     vec3 yc0,
     vec3 yc0N,
     vec3 yc0S,
@@ -229,25 +236,33 @@ export const MERGE_FRAGMENT_SHADER = `
       return vec4(0.0);
     }
 
-    float gainLin = abs(gainSrgb - 1.0) > 0.005 ? pow(max(gainSrgb, 0.05), 2.2) : 1.0;
-    float sqrtGain = abs(gainSrgb - 1.0) > 0.005 ? sqrt(gainLin) : 1.0;
-    vec3 linC = clamp(srgbToLinear(sampleBicubic5(frameTex, uvk, uTexelSize)) * gainLin, 0.0, 1.25);
+    vec3 sampledSrgb = useBicubic > 0.5
+      ? sampleBicubic5(frameTex, uvk, uTexelSize, uSrcSize)
+      : texture2D(frameTex, uvk).rgb;
 
-    vec3 ycC = linToSqrtYCoCg(linC);
-    vec3 ycN = fastSrgbToSqrtYCoCg(texture2D(frameTex, clamp(uvk - dy, 0.0, 1.0)).rgb, sqrtGain);
-    vec3 ycS = fastSrgbToSqrtYCoCg(texture2D(frameTex, clamp(uvk + dy, 0.0, 1.0)).rgb, sqrtGain);
-    vec3 ycW = fastSrgbToSqrtYCoCg(texture2D(frameTex, clamp(uvk - dx, 0.0, 1.0)).rgb, sqrtGain);
-    vec3 ycE = fastSrgbToSqrtYCoCg(texture2D(frameTex, clamp(uvk + dx, 0.0, 1.0)).rgb, sqrtGain);
+    vec3 ycC = fastSrgbToSqrtYCoCg(sampledSrgb, sqrtGain);
+    float centerErr2 = ycErr2(yc0, ycC);
+    if (centerErr2 >= tol2 * 6.6) {
+      return vec4(0.0);
+    }
+    vec3 ycN = fastSrgbToSqrtYCoCg(texture2D(frameTex, uvk - dy).rgb, sqrtGain);
+    vec3 ycS = fastSrgbToSqrtYCoCg(texture2D(frameTex, uvk + dy).rgb, sqrtGain);
+    vec3 ycW = fastSrgbToSqrtYCoCg(texture2D(frameTex, uvk - dx).rgb, sqrtGain);
+    vec3 ycE = fastSrgbToSqrtYCoCg(texture2D(frameTex, uvk + dx).rgb, sqrtGain);
 
     float patchErr2 = (
-      ycErr2(yc0, ycC) * 2.0 +
+      centerErr2 * 2.0 +
       ycErr2(yc0N, ycN) +
       ycErr2(yc0S, ycS) +
       ycErr2(yc0W, ycW) +
       ycErr2(yc0E, ycE)
-    ) / 6.0;
+    ) * (1.0 / 6.0);
 
     float ratio = patchErr2 / max(tol2, 1e-5);
+    if (ratio >= 2.2) {
+      return vec4(0.0);
+    }
+    vec3 linC = min(srgbToLinear(sampledSrgb) * gainLin, vec3(1.25));
     float w = exp(-ratio * 1.4) * smoothstep(2.2, 0.65, ratio) * frameConf;
     return vec4(linC * w, w);
   }
@@ -255,7 +270,7 @@ export const MERGE_FRAGMENT_SHADER = `
   void main() {
     vec2 safeUv = clamp(vTexCoord, 0.0, 1.0);
     vec3 p0Srgb = uUseBicubic0 > 0.5
-      ? sampleBicubic5(uFrame0, safeUv, uTexelSize)
+      ? sampleBicubic5(uFrame0, safeUv, uTexelSize, uSrcSize)
       : texture2D(uFrame0, safeUv).rgb;
     vec3 lin0 = srgbToLinear(p0Srgb);
 
@@ -268,11 +283,11 @@ export const MERGE_FRAGMENT_SHADER = `
     vec2 dx = vec2(uTexelSize.x, 0.0);
     vec2 dy = vec2(0.0, uTexelSize.y);
 
-    vec3 yc0  = linToSqrtYCoCg(lin0);
-    vec3 yc0N = fastSrgbToSqrtYCoCg(texture2D(uFrame0, clamp(safeUv - dy, 0.0, 1.0)).rgb, 1.0);
-    vec3 yc0S = fastSrgbToSqrtYCoCg(texture2D(uFrame0, clamp(safeUv + dy, 0.0, 1.0)).rgb, 1.0);
-    vec3 yc0W = fastSrgbToSqrtYCoCg(texture2D(uFrame0, clamp(safeUv - dx, 0.0, 1.0)).rgb, 1.0);
-    vec3 yc0E = fastSrgbToSqrtYCoCg(texture2D(uFrame0, clamp(safeUv + dx, 0.0, 1.0)).rgb, 1.0);
+    vec3 yc0  = fastSrgbToSqrtYCoCg(p0Srgb, 1.0);
+    vec3 yc0N = fastSrgbToSqrtYCoCg(texture2D(uFrame0, safeUv - dy).rgb, 1.0);
+    vec3 yc0S = fastSrgbToSqrtYCoCg(texture2D(uFrame0, safeUv + dy).rgb, 1.0);
+    vec3 yc0W = fastSrgbToSqrtYCoCg(texture2D(uFrame0, safeUv - dx).rgb, 1.0);
+    vec3 yc0E = fastSrgbToSqrtYCoCg(texture2D(uFrame0, safeUv + dx).rgb, 1.0);
 
     float localEdge2 = 0.25 * (
       ycErr2(yc0, yc0N) + ycErr2(yc0, yc0S) + ycErr2(yc0, yc0W) + ycErr2(yc0, yc0E)
@@ -285,7 +300,7 @@ export const MERGE_FRAGMENT_SHADER = `
 
     vec2 uv1 = mapAlignUv(safeUv, uAlignMat1, uAlignShift1);
     vec4 s1 = evaluateAlignedSample(
-      uFrame1, uv1, dx, dy, uFrameWeights.x, uFrameGains.x,
+      uFrame1, uv1, dx, dy, uFrameWeights.x, uFrameGainsLin.x, uFrameSqrtGains.x, uUseBicubicFrames.x,
       yc0, yc0N, yc0S, yc0W, yc0E, tol2
     );
     accumLin += s1.rgb;
@@ -294,7 +309,7 @@ export const MERGE_FRAGMENT_SHADER = `
     if (uFrameCount > 2.5) {
       vec2 uv2 = mapAlignUv(safeUv, uAlignMat2, uAlignShift2);
       vec4 s2 = evaluateAlignedSample(
-        uFrame2, uv2, dx, dy, uFrameWeights.y, uFrameGains.y,
+        uFrame2, uv2, dx, dy, uFrameWeights.y, uFrameGainsLin.y, uFrameSqrtGains.y, uUseBicubicFrames.y,
         yc0, yc0N, yc0S, yc0W, yc0E, tol2
       );
       accumLin += s2.rgb;
@@ -304,7 +319,7 @@ export const MERGE_FRAGMENT_SHADER = `
     if (uFrameCount > 3.5) {
       vec2 uv3 = mapAlignUv(safeUv, uAlignMat3, uAlignShift3);
       vec4 s3 = evaluateAlignedSample(
-        uFrame3, uv3, dx, dy, uFrameWeights.z, uFrameGains.z,
+        uFrame3, uv3, dx, dy, uFrameWeights.z, uFrameGainsLin.z, uFrameSqrtGains.z, uUseBicubicFrames.z,
         yc0, yc0N, yc0S, yc0W, yc0E, tol2
       );
       accumLin += s3.rgb;
@@ -317,6 +332,51 @@ export const MERGE_FRAGMENT_SHADER = `
       : clamp((totalW - 1.0) / 3.0, 0.0, 1.0);
 
     gl_FragColor = encodeHdr(vec4(mergedLin, coverage));
+  }
+`;
+
+/**
+ * Lightweight GPU sampler for alignment downsampling (<=560px) and derotated native patch extraction (84x84).
+ * Renders directly in top-down FBO row order (vTexCoord.y=0 -> source top row) so gl.readPixels needs no flip.
+ */
+export const ALIGN_SAMPLE_FRAGMENT_SHADER = `
+  precision highp float;
+
+  uniform sampler2D uSrcTex;
+  uniform vec2 uCenterNorm;
+  uniform vec2 uSrcSize;
+  uniform vec2 uDstSize;
+  uniform vec4 uAffineMat;
+  uniform float uFullFrame;
+
+  varying vec2 vTexCoord;
+
+  void main() {
+    if (uFullFrame > 0.5) {
+      if (uSrcSize.x <= uDstSize.x * 1.5 && uSrcSize.y <= uDstSize.y * 1.5) {
+        gl_FragColor = texture2D(uSrcTex, vTexCoord);
+        return;
+      }
+      vec2 q = (1.0 / max(uDstSize, vec2(1.0))) * 0.25;
+      vec4 sum =
+        texture2D(uSrcTex, vTexCoord + vec2(-q.x, -q.y)) +
+        texture2D(uSrcTex, vTexCoord + vec2( q.x, -q.y)) +
+        texture2D(uSrcTex, vTexCoord + vec2(-q.x,  q.y)) +
+        texture2D(uSrcTex, vTexCoord + vec2( q.x,  q.y));
+      gl_FragColor = sum * 0.25;
+      return;
+    }
+    vec2 dstPx = (vTexCoord - 0.5) * uDstSize;
+    vec2 srcOffPx = vec2(
+      uAffineMat.x * dstPx.x + uAffineMat.y * dstPx.y,
+      uAffineMat.z * dstPx.x + uAffineMat.w * dstPx.y
+    );
+    vec2 srcUv = uCenterNorm + srcOffPx / uSrcSize;
+    if (srcUv.x < 0.0 || srcUv.x > 1.0 || srcUv.y < 0.0 || srcUv.y > 1.0) {
+      gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+      return;
+    }
+    gl_FragColor = texture2D(uSrcTex, srcUv);
   }
 `;
 
@@ -490,7 +550,7 @@ export const TONEMAP_FRAGMENT_SHADER = `
   uniform sampler2D uLumTex;
 
   uniform vec3 uWbGains;
-  uniform float uExposureEv;
+  uniform float uExposureScale;
   uniform float uAutoExposureEv;
   uniform float uSceneMidLogL;
   uniform float uLocalHdrStrength;
@@ -517,11 +577,7 @@ export const TONEMAP_FRAGMENT_SHADER = `
 
   void main() {
     vec3 lin = decodeHdr(texture2D(uHdrTex, vTexCoord)).rgb;
-    lin *= uWbGains;
-
-    if (abs(uExposureEv) > 0.001) {
-      lin *= exp2(uExposureEv);
-    }
+    lin *= uWbGains * uExposureScale;
 
     float baseY = getLinearLuma(lin);
     if (uAutoExposureEv > 0.001) {
@@ -538,7 +594,8 @@ export const TONEMAP_FRAGMENT_SHADER = `
     float dodgeStops = clamp(-relLocal * 0.24 * uLocalHdrStrength, -0.45, 0.72);
 
     // 2) Black-point anchored shadow toe lift (keeps true 0 black clean)
-    float toeMask = smoothstep(0.0002, 0.0025, pixelY) * pow(1.0 - smoothstep(0.0, 0.28, pixelY), 2.0);
+    float toeRamp = 1.0 - smoothstep(0.0, 0.28, pixelY);
+    float toeMask = smoothstep(0.0002, 0.0025, pixelY) * (toeRamp * toeRamp);
     float toeStops = uShadowLift * 0.65 * toeMask;
 
     // 3) Halo-free micro-contrast clarity on bilateral high-pass log luminance
@@ -606,6 +663,8 @@ export const OUTPUT_CAS_FRAGMENT_SHADER = `
   uniform vec2 uTexelSize;   // (1.0 / outW, 1.0 / outH)
   uniform float uSharpen;    // 0.0 .. 1.0
   uniform float uNoiseSigma; // Prevents amplifying residual ISO noise
+  uniform float uFlipY;      // 1.0 renders top-down directly for gl.readPixels (zero CPU row flip)
+  uniform float uOutHeight;  // Output height in pixels for orientation-invariant IGN dither
 
   varying vec2 vTexCoord;
 
@@ -619,19 +678,20 @@ export const OUTPUT_CAS_FRAGMENT_SHADER = `
   }
 
   void main() {
-    vec3 c  = texture2D(uSrgbTex, vTexCoord).rgb;
+    vec2 uv = uFlipY > 0.5 ? vec2(vTexCoord.x, 1.0 - vTexCoord.y) : vTexCoord;
+    vec3 c  = texture2D(uSrgbTex, uv).rgb;
     vec2 dx = vec2(uTexelSize.x, 0.0);
     vec2 dy = vec2(0.0, uTexelSize.y);
 
-    vec3 n  = texture2D(uSrgbTex, clamp(vTexCoord - dy, 0.0, 1.0)).rgb;
-    vec3 s  = texture2D(uSrgbTex, clamp(vTexCoord + dy, 0.0, 1.0)).rgb;
-    vec3 w  = texture2D(uSrgbTex, clamp(vTexCoord - dx, 0.0, 1.0)).rgb;
-    vec3 e  = texture2D(uSrgbTex, clamp(vTexCoord + dx, 0.0, 1.0)).rgb;
+    vec3 n  = texture2D(uSrgbTex, uv - dy).rgb;
+    vec3 s  = texture2D(uSrgbTex, uv + dy).rgb;
+    vec3 w  = texture2D(uSrgbTex, uv - dx).rgb;
+    vec3 e  = texture2D(uSrgbTex, uv + dx).rgb;
 
-    vec3 nw = texture2D(uSrgbTex, clamp(vTexCoord - dx - dy, 0.0, 1.0)).rgb;
-    vec3 ne = texture2D(uSrgbTex, clamp(vTexCoord + dx - dy, 0.0, 1.0)).rgb;
-    vec3 sw = texture2D(uSrgbTex, clamp(vTexCoord - dx + dy, 0.0, 1.0)).rgb;
-    vec3 se = texture2D(uSrgbTex, clamp(vTexCoord + dx + dy, 0.0, 1.0)).rgb;
+    vec3 nw = texture2D(uSrgbTex, uv - dx - dy).rgb;
+    vec3 ne = texture2D(uSrgbTex, uv + dx - dy).rgb;
+    vec3 sw = texture2D(uSrgbTex, uv - dx + dy).rgb;
+    vec3 se = texture2D(uSrgbTex, uv + dx + dy).rgb;
 
     vec3 mnCross = min(c, min(min(n, s), min(w, e)));
     vec3 mxCross = max(c, max(max(n, s), max(w, e)));
@@ -660,8 +720,9 @@ export const OUTPUT_CAS_FRAGMENT_SHADER = `
     sharpened = clamp(sharpened, 0.0, 1.0);
 
     float ditherMask = smoothstep(0.004, 0.025, lC) * (1.0 - smoothstep(0.975, 0.996, lC));
-    float n1 = ign(gl_FragCoord.xy);
-    float n2 = ign(gl_FragCoord.xy + vec2(37.0, 17.0));
+    vec2 ditherPos = uFlipY > 0.5 ? vec2(gl_FragCoord.x, uOutHeight - gl_FragCoord.y) : gl_FragCoord.xy;
+    float n1 = ign(ditherPos);
+    float n2 = ign(ditherPos + vec2(37.0, 17.0));
     float tpdf = (n1 - n2) * (0.7 / 255.0) * ditherMask;
 
     gl_FragColor = vec4(clamp(sharpened + vec3(tpdf), 0.0, 1.0), 1.0);

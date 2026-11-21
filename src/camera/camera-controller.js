@@ -1135,7 +1135,7 @@ export class CameraController {
         c.width = w;
         c.height = h;
         this._sharpnessCanvas = c;
-        this._sharpnessCtx = c.getContext('2d', { willReadFrequently: true });
+        this._sharpnessCtx = c.getContext('2d');
       }
       if (!this._sharpnessCtx) {
         return { sharpness: 1, meanLuma: 128, trimmedMeanLuma: 128 };
@@ -1155,9 +1155,9 @@ export class CameraController {
   }
 
   /**
-   * Capture N frames consecutively across ~0.22s for multi-frame stabilization and HDR stacking.
-   * In 'high' stabilization mode, samples 5 frames rapidly and sheds the weakest/tap-shaken
-   * or exposure-drifted frame immediately so <= 4 crisp frames advance to the Pro ISP pipeline.
+   * Capture N frames consecutively as fast as distinct camera frames arrive.
+   * In 'high' stabilization mode, captures 5 rapid frames and defers best-4 selection
+   * to the Worker's higher-resolution 560px alignBitmapBurst pass (zero main-thread readback).
    */
   async captureBurstFrames(
     frameCount = 4,
@@ -1168,61 +1168,19 @@ export class CameraController {
     const keepCount = Math.max(1, frameCount);
     const captureCount =
       mode === STABILIZATION_MODES.HIGH && keepCount === 4 ? 5 : keepCount;
-    const intervalMs = Math.max(32, Math.floor(targetDurationMs / captureCount));
-    const minWaitMs = mode === STABILIZATION_MODES.HIGH ? 24 : 28;
-    const candidates = [];
+    const maxWaitMs = Math.max(28, Math.floor(targetDurationMs / captureCount));
+    const minWaitMs = 8;
+    const frames = [];
 
     this._lastVideoFrameMeta = null;
 
     for (let i = 0; i < captureCount; i++) {
       if (i > 0) {
-        await this._waitNextFrameOrInterval(intervalMs, minWaitMs);
+        await this._waitNextFrameOrInterval(maxWaitMs, minWaitMs, i === 1);
       }
       const bitmap = await this._grabStreamBitmap();
-      const metrics =
-        captureCount > keepCount
-          ? this._scoreBitmapMetrics(bitmap)
-          : { sharpness: 1, meanLuma: 128, trimmedMeanLuma: 128 };
-      candidates.push({
-        bitmap,
-        score: metrics.sharpness,
-        trimmedMeanLuma: metrics.trimmedMeanLuma ?? metrics.meanLuma ?? 128,
-        index: i,
-      });
+      frames.push(bitmap);
     }
-
-    // Drop lowest sharpness + exposure-consistent candidate(s) so peak live bitmaps stay <= keepCount
-    while (candidates.length > keepCount) {
-      const sortedLumas = candidates
-        .map((c) => c.trimmedMeanLuma)
-        .sort((a, b) => a - b);
-      const medianLuma = sortedLumas[Math.floor(sortedLumas.length / 2)] || 128;
-
-      const weightedScoreFor = (c) => {
-        const lumaDiff = Math.abs((c.trimmedMeanLuma ?? medianLuma) - medianLuma);
-        const exposureConsistency = Math.max(0.76, 1 - Math.max(0, lumaDiff - 8) / 90);
-        const tapWeight = c.index === 0 ? 0.985 : 1.0;
-        return c.score * exposureConsistency * tapWeight;
-      };
-
-      let worstPos = 0;
-      let worstWeightedScore = weightedScoreFor(candidates[0]);
-      for (let k = 1; k < candidates.length; k++) {
-        const ws = weightedScoreFor(candidates[k]);
-        if (ws < worstWeightedScore) {
-          worstWeightedScore = ws;
-          worstPos = k;
-        }
-      }
-      const [dropped] = candidates.splice(worstPos, 1);
-      try {
-        dropped?.bitmap?.close?.();
-      } catch {
-        // ignore
-      }
-    }
-
-    const frames = candidates.map((c) => c.bitmap);
 
     return {
       sourceType: 'burstStream',
@@ -1233,11 +1191,12 @@ export class CameraController {
     };
   }
 
-  async _waitNextFrameOrInterval(maxWaitMs, minWaitMs = 22) {
+  async _waitNextFrameOrInterval(maxWaitMs, minWaitMs = 8, isFirstWait = false) {
     if (typeof this.video.requestVideoFrameCallback === 'function') {
       const waitStart = performance.now();
       await new Promise((resolve) => {
         let settled = false;
+        let sawInitialPresentedFrame = false;
         const finish = (meta = null) => {
           if (settled) return;
           settled = true;
@@ -1256,6 +1215,21 @@ export class CameraController {
         const onFrame = (_now, metadata) => {
           if (settled) return;
           const waited = performance.now() - waitStart;
+
+          // After capturing frame 0 synchronously, the very first rVFC may fire immediately (<10ms)
+          // for the already-presented frame 0; record its metadata and wait for the next distinct frame.
+          if (isFirstWait && !this._lastVideoFrameMeta && !sawInitialPresentedFrame && waited < 10) {
+            sawInitialPresentedFrame = true;
+            if (metadata) {
+              this._lastVideoFrameMeta = {
+                presentedFrames: metadata.presentedFrames,
+                mediaTime: metadata.mediaTime,
+              };
+            }
+            this.video.requestVideoFrameCallback(onFrame);
+            return;
+          }
+
           const isDuplicate =
             Boolean(this._lastVideoFrameMeta) &&
             Boolean(metadata) &&
@@ -1278,7 +1252,34 @@ export class CameraController {
   }
 
   async _grabStreamBitmap() {
-    // Try ImageCapture.grabFrame() first on Chrome/Android if stream is active
+    // Prefer zero-stall GPU createImageBitmap(<video>) (~1ms) whenever the live <video> element
+    // already holds the full track resolution; fall back to ImageCapture.grabFrame() otherwise.
+    if (
+      typeof createImageBitmap === 'function' &&
+      this.video.readyState >= 2 &&
+      this.video.videoWidth > 0 &&
+      this.video.videoHeight > 0
+    ) {
+      const trackSettings =
+        this.track && typeof this.track.getSettings === 'function'
+          ? this.track.getSettings()
+          : null;
+      const trackW = trackSettings?.width || 0;
+      const trackH = trackSettings?.height || 0;
+      const matchesTrackRes =
+        !trackW ||
+        !trackH ||
+        (this.video.videoWidth >= trackW * 0.99 && this.video.videoHeight >= trackH * 0.99);
+      if (matchesTrackRes) {
+        try {
+          return await createImageBitmap(this.video);
+        } catch {
+          // Fall through to grabFrame / Canvas2D fallback
+        }
+      }
+    }
+
+    // Fallback to ImageCapture.grabFrame() on Chrome/Android if video element isn't at full track res yet
     if (
       !this.platform.isIOS &&
       this.imageCapture &&
